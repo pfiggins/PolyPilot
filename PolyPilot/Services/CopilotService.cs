@@ -41,6 +41,7 @@ public partial class CopilotService : IAsyncDisposable
     private readonly IServiceProvider? _serviceProvider;
     private readonly UsageStatsService? _usageStats;
     private CopilotClient? _client;
+    private ConnectionSettings? _currentSettings;
     private string? _activeSessionName;
     private SynchronizationContext? _syncContext;
     
@@ -407,6 +408,7 @@ public partial class CopilotService : IAsyncDisposable
         Debug($"SyncContext captured: {_syncContext?.GetType().Name ?? "null"}");
 
         var settings = ConnectionSettings.Load();
+        _currentSettings = settings;
         CurrentMode = settings.Mode;
         ChatLayout = settings.ChatLayout;
         ChatStyle = settings.ChatStyle;
@@ -572,6 +574,7 @@ public partial class CopilotService : IAsyncDisposable
     public async Task ReconnectAsync(ConnectionSettings settings, CancellationToken cancellationToken = default)
     {
         Debug($"Reconnecting with mode: {settings.Mode}...");
+        _currentSettings = settings;
 
         StopConnectivityMonitoring();
 
@@ -1509,6 +1512,100 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         {
             copilotSession = await _client.CreateSessionAsync(config, cancellationToken);
         }
+        catch (OperationCanceledException)
+        {
+            _sessions.TryRemove(name, out _);
+            Organization.Sessions.RemoveAll(m => m.SessionName == name);
+            _activeSessionName = previousActiveSessionName;
+            OnStateChanged?.Invoke();
+            throw;
+        }
+        catch (Exception ex) when (IsConnectionError(ex))
+        {
+            Debug($"CreateSessionAsync connection error, attempting recovery: {ex.Message}");
+
+            // In persistent mode, restart the server if it's not running
+            if (CurrentMode == ConnectionMode.Persistent)
+            {
+                if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
+                {
+                    Debug("Persistent server not running, restarting...");
+                    var started = await _serverManager.StartServerAsync(settings.Port);
+                    if (!started)
+                    {
+                        Debug("Failed to restart persistent server");
+                        try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                        _client = null;
+                        IsInitialized = false;
+                        _sessions.TryRemove(name, out _);
+                        Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                        _activeSessionName = previousActiveSessionName;
+                        OnStateChanged?.Invoke();
+                        throw;
+                    }
+                }
+            }
+
+            // Recreate the client connection
+            try
+            {
+                if (_client != null)
+                {
+                    try { await _client.DisposeAsync(); } catch { }
+                }
+                _client = CreateClient(settings);
+                await _client.StartAsync(cancellationToken);
+                Debug("Connection recovered, retrying session creation...");
+            }
+            catch (OperationCanceledException)
+            {
+                try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                _client = null;
+                IsInitialized = false;
+                _sessions.TryRemove(name, out _);
+                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                _activeSessionName = previousActiveSessionName;
+                OnStateChanged?.Invoke();
+                throw;
+            }
+            catch (Exception clientEx)
+            {
+                Debug($"Failed to recreate client during recovery: {clientEx.Message}");
+                try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                _client = null;
+                IsInitialized = false;
+                _sessions.TryRemove(name, out _);
+                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                _activeSessionName = previousActiveSessionName;
+                OnStateChanged?.Invoke();
+                throw;
+            }
+
+            // Retry once with the new client
+            try
+            {
+                copilotSession = await _client.CreateSessionAsync(config, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                _sessions.TryRemove(name, out _);
+                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                _activeSessionName = previousActiveSessionName;
+                OnStateChanged?.Invoke();
+                throw;
+            }
+            catch
+            {
+                try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                _client = null;
+                IsInitialized = false;
+                _sessions.TryRemove(name, out _);
+                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                _activeSessionName = previousActiveSessionName;
+                OnStateChanged?.Invoke();
+                throw;
+            }
+        }
         catch
         {
             // SDK creation failed — remove the optimistic placeholder and restore prior state
@@ -1923,6 +2020,50 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     try { await state.Session.DisposeAsync(); } catch { /* session may already be disposed */ }
                     if (_client == null)
                         throw new InvalidOperationException("Client is not initialized");
+
+                    // If the underlying connection is broken, recreate the client first
+                    if (IsConnectionError(ex))
+                    {
+                        Debug("Connection error detected, recreating client before session reconnect...");
+                        var connSettings = _currentSettings ?? ConnectionSettings.Load();
+                        if (CurrentMode == ConnectionMode.Persistent &&
+                            !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
+                        {
+                            Debug("Persistent server not running, restarting...");
+                            var started = await _serverManager.StartServerAsync(connSettings.Port);
+                            if (!started)
+                            {
+                                Debug("Failed to restart persistent server");
+                                try { await _client.DisposeAsync(); } catch { }
+                                _client = null;
+                                IsInitialized = false;
+                                throw;
+                            }
+                        }
+                        try { await _client.DisposeAsync(); } catch { }
+                        try
+                        {
+                            _client = CreateClient(connSettings);
+                            await _client.StartAsync(cancellationToken);
+                            Debug("Client recreated successfully");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                            _client = null;
+                            IsInitialized = false;
+                            throw;
+                        }
+                        catch (Exception clientEx)
+                        {
+                            Debug($"Failed to recreate client: {clientEx.Message}");
+                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                            _client = null;
+                            IsInitialized = false;
+                            throw;
+                        }
+                    }
+
                     var reconnectModel = Models.ModelHelper.NormalizeToSlug(state.Info.Model);
                     var reconnectConfig = new ResumeSessionConfig();
                     reconnectConfig.Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() };
