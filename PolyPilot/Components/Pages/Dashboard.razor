@@ -1233,9 +1233,9 @@
         }
 
         var session = sessions.FirstOrDefault(s => s.Name == sessionName);
-        if (session?.IsProcessing == true || session?.IsCreating == true)
+        if (session?.IsCreating == true)
         {
-            CopilotService.LogDispatchRoute(sessionName, true, session.IsCreating ? "QUEUED_CREATING" : "QUEUED", null, null, null, false);
+            CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_CREATING", null, null, null, false);
             List<string>? queueImagePaths = null;
             if (hasImages)
             {
@@ -1243,6 +1243,23 @@
                 pendingImagesBySession.Remove(sessionName);
             }
             CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
+            return;
+        }
+
+        if (session?.IsProcessing == true)
+        {
+            CopilotService.LogDispatchRoute(sessionName, true, "STEER", null, null, null, false);
+            List<string>? steerImagePaths = null;
+            if (hasImages)
+            {
+                steerImagePaths = pendingSendImages!.Select(i => i.TempPath).ToList();
+                pendingImagesBySession.Remove(sessionName);
+            }
+            _ = CopilotService.SteerSessionAsync(sessionName, finalPrompt, steerImagePaths, agentMode).ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                    InvokeAsync(() => Console.WriteLine($"Error steering {sessionName}: {t.Exception?.InnerException?.Message}"));
+            });
             return;
         }
 
