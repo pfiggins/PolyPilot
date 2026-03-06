@@ -31,6 +31,13 @@ public interface ISessionProvider
     IReadOnlyList<ProviderMember> GetMembers();
     event Action? OnMembersChanged;
 
+    /// <summary>
+    /// Sends a message to a specific member session.
+    /// Default routes to SendMessageAsync (leader).
+    /// </summary>
+    Task<string> SendToMemberAsync(string memberId, string message, CancellationToken ct = default)
+        => SendMessageAsync(message, ct);
+
     // ── Custom Actions (optional, default implementations) ──
     IReadOnlyList<ProviderAction> GetActions() => [];
     Task<string?> ExecuteActionAsync(string actionId, CancellationToken ct = default)
@@ -51,7 +58,7 @@ public interface ISessionProvider
     Task<string> SendToModeAsync(string modeId, string message, CancellationToken ct = default)
         => SendMessageAsync(message, ct);
 
-    // ── Streaming Events ────────────────────────────────────
+    // ── Streaming Events (leader session) ───────────────────
     event Action<string>? OnContentReceived;
     event Action<string, string>? OnReasoningReceived;
     event Action<string>? OnReasoningComplete;
@@ -62,4 +69,14 @@ public interface ISessionProvider
     event Action? OnTurnEnd;
     event Action<string>? OnError;
     event Action? OnStateChanged;
+
+    // ── Member Streaming Events (per-member, include memberId) ──
+    /// <summary>Fires when a member session receives content. Args: (memberId, content)</summary>
+    event Action<string, string>? OnMemberContentReceived;
+    /// <summary>Fires when a member session starts a turn. Args: (memberId)</summary>
+    event Action<string>? OnMemberTurnStart;
+    /// <summary>Fires when a member session ends a turn. Args: (memberId)</summary>
+    event Action<string>? OnMemberTurnEnd;
+    /// <summary>Fires when a member session encounters an error. Args: (memberId, error)</summary>
+    event Action<string, string>? OnMemberError;
 }

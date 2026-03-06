@@ -2237,7 +2237,7 @@ Important conventions:
     {
         try
         {
-            await provider.ExecuteActionAsync(actionId);
+            await CopilotService.ExecuteProviderActionAsync(provider, actionId);
         }
         catch (Exception ex)
         {

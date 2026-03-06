@@ -94,8 +94,11 @@ public partial class CopilotService
             _sessionToProviderId[leaderName] = provider.ProviderId;
         }
 
-        // Wire streaming events
+        // Wire streaming events for leader
         WireProviderEvents(provider, leaderName);
+
+        // Wire member-scoped streaming events
+        WireProviderMemberEvents(provider);
 
         // Wire member changes
         provider.OnMembersChanged += () => InvokeOnUI(() =>
@@ -207,6 +210,76 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Subscribes to a provider's member-scoped streaming events.
+    /// Member events include the memberId, which maps to session name __providerId_memberId__.
+    /// </summary>
+    private void WireProviderMemberEvents(ISessionProvider provider)
+    {
+        var prefix = $"__{provider.ProviderId}_";
+        var suffix = "__";
+
+        provider.OnMemberContentReceived += (memberId, content) => InvokeOnUI(() =>
+        {
+            var sessionName = $"{prefix}{memberId}{suffix}";
+            if (_sessions.TryGetValue(sessionName, out var state))
+            {
+                state.CurrentResponse.Append(content);
+                state.Info.MessageCount = state.Info.History.Count;
+            }
+            OnContentReceived?.Invoke(sessionName, content);
+            OnStateChanged?.Invoke();
+        });
+
+        provider.OnMemberTurnStart += memberId => InvokeOnUI(() =>
+        {
+            var sessionName = $"{prefix}{memberId}{suffix}";
+            if (_sessions.TryGetValue(sessionName, out var state))
+            {
+                state.Info.IsProcessing = true;
+                state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                state.Info.ToolCallCount = 0;
+                state.Info.ProcessingPhase = 2;
+                state.CurrentResponse.Clear();
+            }
+            OnTurnStart?.Invoke(sessionName);
+            OnStateChanged?.Invoke();
+        });
+
+        provider.OnMemberTurnEnd += memberId => InvokeOnUI(() =>
+        {
+            var sessionName = $"{prefix}{memberId}{suffix}";
+            if (_sessions.TryGetValue(sessionName, out var state))
+            {
+                if (state.CurrentResponse.Length > 0)
+                {
+                    var responseText = state.CurrentResponse.ToString();
+                    state.Info.History.Add(ChatMessage.AssistantMessage(responseText));
+                    state.Info.MessageCount = state.Info.History.Count;
+                    state.CurrentResponse.Clear();
+                }
+                state.Info.IsProcessing = false;
+                state.Info.ProcessingStartedAt = null;
+                state.Info.ProcessingPhase = 0;
+            }
+            OnTurnEnd?.Invoke(sessionName);
+            OnStateChanged?.Invoke();
+        });
+
+        provider.OnMemberError += (memberId, error) => InvokeOnUI(() =>
+        {
+            var sessionName = $"{prefix}{memberId}{suffix}";
+            if (_sessions.TryGetValue(sessionName, out var state))
+            {
+                state.Info.IsProcessing = false;
+                state.Info.ProcessingStartedAt = null;
+                state.Info.ProcessingPhase = 0;
+            }
+            OnError?.Invoke(sessionName, error);
+            OnStateChanged?.Invoke();
+        });
+    }
+
+    /// <summary>
     /// Creates/removes member sessions based on the provider's current member list.
     /// </summary>
     private void SyncProviderMembers(ISessionProvider provider, string groupId)
@@ -266,7 +339,8 @@ public partial class CopilotService
     }
 
     /// <summary>
-    /// Routes a user message to the appropriate provider's SendMessageAsync.
+    /// Routes a user message to the appropriate provider method.
+    /// Leader sessions use SendMessageAsync, member sessions use SendToMemberAsync.
     /// </summary>
     public async Task<string?> SendToProviderAsync(
         string sessionName, string message, CancellationToken ct = default)
@@ -283,7 +357,38 @@ public partial class CopilotService
             OnStateChanged?.Invoke();
         }
 
+        // Check if this is a member session
+        var leaderName = $"__{providerId}__";
+        if (sessionName != leaderName)
+        {
+            var prefix = $"__{providerId}_";
+            var suffix = "__";
+            if (sessionName.StartsWith(prefix) && sessionName.EndsWith(suffix))
+            {
+                var memberId = sessionName[prefix.Length..^suffix.Length];
+                return await provider.SendToMemberAsync(memberId, message, ct);
+            }
+        }
+
         return await provider.SendMessageAsync(message, ct);
+    }
+
+    /// <summary>
+    /// Executes a provider action and posts the result as a message in the leader's chat.
+    /// </summary>
+    public async Task ExecuteProviderActionAsync(ISessionProvider provider, string actionId)
+    {
+        var result = await provider.ExecuteActionAsync(actionId, default);
+        if (!string.IsNullOrEmpty(result))
+        {
+            var leaderName = $"__{provider.ProviderId}__";
+            if (_sessions.TryGetValue(leaderName, out var state))
+            {
+                state.Info.History.Add(ChatMessage.AssistantMessage($"⚡ **{actionId}**: {result}"));
+                state.Info.MessageCount = state.Info.History.Count;
+                InvokeOnUI(() => OnStateChanged?.Invoke());
+            }
+        }
     }
 
     // ── Provider Helpers ────────────────────────────────────
