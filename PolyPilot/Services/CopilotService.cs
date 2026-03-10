@@ -440,6 +440,11 @@ public partial class CopilotService : IAsyncDisposable
         /// Cleared on CompleteResponse and SendPromptAsync.
         /// </summary>
         public ConcurrentDictionary<string, ChatMessage> PendingReasoningMessages { get; } = new();
+        /// <summary>Number of consecutive times the watchdog's Case A (tool active + server alive)
+        /// has reset the inactivity timer without any real SDK events arriving. Capped by
+        /// WatchdogMaxToolAliveResets to prevent infinite resets when the session's JSON-RPC
+        /// connection is dead but the shared persistent server is still alive.</summary>
+        public int WatchdogCaseAResets;
     }
 
     private void Debug(string message)
@@ -2632,8 +2637,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // orphaned old state can't pass generation checks on the new state.
                     Interlocked.Exchange(ref newState.ProcessingGeneration,
                         Interlocked.Read(ref state.ProcessingGeneration));
-                    newState.HasUsedToolsThisTurn = state.HasUsedToolsThisTurn;
-                    Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, Volatile.Read(ref state.SuccessfulToolCountThisTurn));
+                    // Reset tool tracking for the NEW connection. The old connection's
+                    // tool state is stale — no tools have run on this connection yet.
+                    // Without this, HasUsedToolsThisTurn=true from the dead connection
+                    // inflates the watchdog timeout from 120s to 600s, making stuck
+                    // sessions wait 5x longer than necessary to recover.
+                    newState.HasUsedToolsThisTurn = false;
+                    Interlocked.Exchange(ref newState.ActiveToolCallCount, 0);
+                    Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, 0);
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
                     newSession.On(evt => HandleSessionEvent(newState, evt));
                     _sessions[sessionName] = newState;
@@ -2645,6 +2656,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // replayed IDLE from clearing IsProcessing before the retry completes.
                     Interlocked.Increment(ref state.ProcessingGeneration);
                     state.Info.IsProcessing = true;
+                    // Reset ProcessingStartedAt so the watchdog's max-time safety net
+                    // measures from the reconnect, not the original send. Without this,
+                    // the 60-min absolute max is measured from the first attempt and
+                    // the reconnected session inherits a stale deadline.
+                    state.Info.ProcessingStartedAt = DateTime.UtcNow;
                     state.CurrentResponse.Clear();
                     state.FlushedResponse.Clear();
                     state.PendingReasoningMessages.Clear();
