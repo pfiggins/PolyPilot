@@ -639,8 +639,26 @@ public partial class CopilotService
                 // KEY FIX: Check if the server reports active background tasks (sub-agents, shells).
                 // session.idle with background tasks means "foreground quiesced, background still running."
                 // Do NOT treat this as terminal — flush text and wait for the real idle.
+                // BUT: enforce a maximum deferral time to prevent orchestrator hangs when the
+                // SDK never sends a clean idle after background tasks finish (observed in multi-agent groups).
                 if (HasActiveBackgroundTasks(idle))
                 {
+                    // Track when we first started deferring
+                    var firstDefer = Interlocked.Read(ref state.FirstIdleDeferAtTicks);
+                    if (firstDefer == 0)
+                        Interlocked.CompareExchange(ref state.FirstIdleDeferAtTicks, DateTime.UtcNow.Ticks, 0);
+                    else
+                    {
+                        var deferredSeconds = (DateTime.UtcNow - new DateTime(firstDefer)).TotalSeconds;
+                        if (deferredSeconds >= BackgroundTaskIdleMaxDeferSeconds)
+                        {
+                            Debug($"[IDLE-DEFER-FORCE] '{sessionName}' background tasks deferred for {deferredSeconds:F0}s " +
+                                  $"(max={BackgroundTaskIdleMaxDeferSeconds}s) — force-completing to prevent orchestrator hang");
+                            Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
+                            goto forceComplete;
+                        }
+                    }
+
                     Debug($"[IDLE-DEFER] '{sessionName}' session.idle received with active background tasks — " +
                           $"deferring completion (IsProcessing={state.Info.IsProcessing}, " +
                           $"response={state.CurrentResponse.Length}+{state.FlushedResponse.Length} chars)");
@@ -654,6 +672,10 @@ public partial class CopilotService
                     break; // Don't complete — wait for next idle without background tasks
                 }
 
+                // Normal idle (no background tasks) — clear the deferral tracker
+                Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
+
+                forceComplete:
                 try { CompleteReasoningMessages(state, sessionName); }
                 catch (Exception ex)
                 {
@@ -1024,6 +1046,7 @@ public partial class CopilotService
         CancelTurnEndFallback(state);
         CancelToolHealthCheck(state);
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
+        Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
         state.HasUsedToolsThisTurn = false;
         state.IsReconnectedSend = false; // Clear reconnect flag on turn completion (defense-in-depth)
         state.FallbackCanceledByTurnStart = false;
@@ -1577,6 +1600,10 @@ public partial class CopilotService
     /// sibling re-resume). Shorter than the normal 120s so the reconnect triggers sooner and the user
     /// gets a second retry attempt, rather than waiting the full 2 minutes for the watchdog kill.</summary>
     internal const int WatchdogReconnectInactivityTimeoutSeconds = 35;
+    /// <summary>Maximum time in seconds to defer session completion for active background tasks.
+    /// If background tasks keep the session alive beyond this limit, force-complete anyway.
+    /// Prevents orchestrator hangs when the SDK never sends a final idle without background tasks.</summary>
+    internal const int BackgroundTaskIdleMaxDeferSeconds = 300; // 5 minutes
     /// <summary>Absolute maximum processing time in seconds. Even if events keep arriving,
     /// no single turn should run longer than this. This is a safety net for scenarios where
     /// non-progress events (like repeated SessionUsageInfoEvent) keep arriving without a terminal event.</summary>
