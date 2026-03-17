@@ -736,6 +736,10 @@ else
                                     </div>
                                 }
                                 <button class="save-preset-btn" @onclick="() => PromptSaveAsPreset(maGroupId)" @onclick:stopPropagation="true" title="Save this group as a reusable preset">💾 Save as Preset</button>
+                                @if (!string.IsNullOrEmpty(group.SourcePresetName))
+                                {
+                                    <button class="save-preset-btn" @onclick="() => RefreshFromPreset(maGroupId)" @onclick:stopPropagation="true" title="Refresh settings from preset '@group.SourcePresetName'">🔄 Refresh from Preset</button>
+                                }
                             </div>
                         }
                     }
@@ -2493,6 +2497,28 @@ else
                 var session = CopilotService.GetSession(orchestratorName);
                 if (session != null)
                     session.History.Add(ChatMessage.SystemMessage($"💾 Group saved as preset: \"{preset.Name}\" (🎯 {preset.OrchestratorModel} + 👷 {string.Join(", ", preset.WorkerModels)})"));
+            }
+        }
+        StateHasChanged();
+    }
+
+    private void RefreshFromPreset(string groupId)
+    {
+        var group = CopilotService.Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+        if (group == null) return;
+
+        var worktreeRoot = string.IsNullOrEmpty(group.WorktreeId) ? null
+            : RepoManager.Worktrees.FirstOrDefault(w => w.Id == group.WorktreeId)?.Path;
+
+        var success = CopilotService.RefreshGroupFromPreset(groupId, worktreeRoot);
+        if (success)
+        {
+            var orchestratorName = CopilotService.GetOrchestratorSession(groupId);
+            if (orchestratorName != null)
+            {
+                var session = CopilotService.GetSession(orchestratorName);
+                if (session != null)
+                    session.History.Add(ChatMessage.SystemMessage($"🔄 Group settings refreshed from preset \"{group.SourcePresetName}\"."));
             }
         }
         StateHasChanged();
