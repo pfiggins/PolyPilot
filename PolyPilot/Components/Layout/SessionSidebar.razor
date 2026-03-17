@@ -809,10 +809,15 @@ else
                             var workerCount = workerSessions.Count;
                             if (workerCount > 0)
                             {
+                                var activeWorkerCount = workerSessions.Count(s => s.IsProcessing);
                                 var wToggleGroupId = group.Id;
                                 <div class="unpinned-toggle worker-toggle" @onclick="() => CopilotService.ToggleUnpinnedCollapsed(wToggleGroupId)" @onclick:stopPropagation="true">
                                     <span class="unpinned-chevron">@(group.UnpinnedCollapsed ? "▶" : "▼")</span>
                                     <span class="unpinned-label">👷 @workerCount @(workerCount != 1 ? "workers" : "worker")</span>
+                                    @if (activeWorkerCount > 0)
+                                    {
+                                        <span class="worker-active-badge" title="@activeWorkerCount @(activeWorkerCount != 1 ? "workers" : "worker") currently processing">⚡ @activeWorkerCount active</span>
+                                    }
                                 </div>
                                 @if (!group.UnpinnedCollapsed)
                                 {

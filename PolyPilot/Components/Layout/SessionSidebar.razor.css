@@ -313,6 +313,14 @@
     font-weight: 500;
 }
 
+.worker-active-badge {
+    font-size: var(--type-caption2);
+    color: #fbbf24;
+    font-weight: 600;
+    margin-left: auto;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
 .group-name {
     font-size: var(--type-callout);
     font-weight: 600;
