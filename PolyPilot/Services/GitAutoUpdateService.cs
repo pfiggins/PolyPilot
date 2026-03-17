@@ -113,10 +113,27 @@ public class GitAutoUpdateService : IDisposable
                 return;
             }
 
-            await RunGit("fetch origin main --quiet");
+            // Determine which remote to track. If an 'upstream' remote exists,
+            // this is a fork — fetch and compare against upstream directly.
+            // Otherwise use origin (standard non-fork setup).
+            string updateRemote;
+            try
+            {
+                var remotes = (await RunGit("remote")).Trim();
+                var hasUpstream = remotes
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Any(r => r.Trim().Equals("upstream", StringComparison.OrdinalIgnoreCase));
+                updateRemote = hasUpstream ? "upstream" : "origin";
+            }
+            catch
+            {
+                updateRemote = "origin";
+            }
+
+            await RunGit($"fetch {updateRemote} main --quiet");
 
             var local = (await RunGit("rev-parse HEAD")).Trim();
-            var remote = (await RunGit("rev-parse origin/main")).Trim();
+            var remote = (await RunGit($"rev-parse {updateRemote}/main")).Trim();
 
             if (local == remote)
             {
@@ -129,13 +146,40 @@ public class GitAutoUpdateService : IDisposable
                 return;
             }
 
-            // Count commits behind
-            var behindCount = (await RunGit("rev-list --count HEAD..origin/main")).Trim();
+            // Only update if local is strictly behind (not diverged).
+            // merge-base --is-ancestor returns 0 if local is an ancestor of remote.
+            try
+            {
+                await RunGit($"merge-base --is-ancestor HEAD {updateRemote}/main");
+            }
+            catch
+            {
+                // Local has diverged (local commits not on remote) — don't pull
+                _status = $"Diverged from {updateRemote}/main — skipping";
+                NotifyChanged();
+                return;
+            }
+
+            var behindCount = (await RunGit($"rev-list --count HEAD..{updateRemote}/main")).Trim();
             _status = $"Updating ({behindCount} new commit{(behindCount == "1" ? "" : "s")})...";
             NotifyChanged();
 
-            var pullResult = await RunGit("pull origin main --ff-only");
+            var pullResult = await RunGit($"pull {updateRemote} main --ff-only");
             _logger.LogInformation("Pulled updates: {Result}", pullResult.Trim());
+
+            // If pulling from upstream on a fork, also push to origin to keep fork in sync
+            if (updateRemote == "upstream")
+            {
+                try
+                {
+                    await RunGit("push origin main --quiet");
+                    _logger.LogDebug("Fork synced: pushed to origin after upstream pull");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to push to fork origin — fork may be out of sync");
+                }
+            }
 
             _status = "Rebuilding & relaunching...";
             NotifyChanged();
