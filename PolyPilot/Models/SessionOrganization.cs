@@ -73,6 +73,12 @@ public class SessionGroup
     /// <summary>When true, this group operates as a multi-agent orchestration group.</summary>
     public bool IsMultiAgent { get; set; }
 
+    /// <summary>
+    /// Name of the preset this group was created from, if any.
+    /// Used to refresh group settings when the preset is updated.
+    /// </summary>
+    public string? SourcePresetName { get; set; }
+
     /// <summary>The orchestration mode for multi-agent groups.</summary>
     public MultiAgentMode OrchestratorMode { get; set; } = MultiAgentMode.Broadcast;
 
