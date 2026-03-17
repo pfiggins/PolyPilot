@@ -161,4 +161,160 @@ public class PermissionDenialDetectionTests
         Assert.True(CopilotService.IsShellEnvironmentFailure(text));
         Assert.False(CopilotService.IsPermissionDenialText(text));
     }
+
+    // ===== MCP server failure detection =====
+
+    [Fact]
+    public void IsMcpError_Null_ReturnsFalse()
+    {
+        Assert.False(CopilotService.IsMcpError(null));
+    }
+
+    [Fact]
+    public void IsMcpError_Empty_ReturnsFalse()
+    {
+        Assert.False(CopilotService.IsMcpError(""));
+    }
+
+    [Theory]
+    // Unambiguously MCP-specific patterns — match unconditionally
+    [InlineData("MCP server 'workiq' failed to start")]
+    [InlineData("Error connecting to MCP server: connection refused")]
+    [InlineData("mcp_server_workiq: connection failed")]
+    // Generic patterns — require "mcp" context
+    [InlineData("connection refused while connecting to MCP")]
+    [InlineData("Failed to start MCP process")]
+    [InlineData("mcp server disconnected unexpectedly")]
+    [InlineData("MCP transport error: connection reset")]
+    [InlineData("mcp server process exited with code 1")]
+    [InlineData("mcp_server_workiq: ECONNREFUSED 127.0.0.1:3000")]
+    [InlineData("mcp server spawn ENOENT: npx not found")]
+    public void IsMcpError_McpFailureVariants_ReturnsTrue(string text)
+    {
+        Assert.True(CopilotService.IsMcpError(text));
+    }
+
+    [Theory]
+    [InlineData("Permission denied")]
+    [InlineData("posix_spawn failed")]
+    [InlineData("File not found")]
+    [InlineData("Session not found")]
+    [InlineData("Timeout waiting for response")]
+    // Generic network/process errors without MCP context — must NOT trigger MCP recovery
+    [InlineData("Connection refused")]
+    [InlineData("ECONNREFUSED")]
+    [InlineData("connect ECONNREFUSED 127.0.0.1:3000")]
+    [InlineData("server disconnected unexpectedly")]
+    [InlineData("transport error: connection reset")]
+    [InlineData("server process exited with code 1")]
+    [InlineData("failed to start")]
+    [InlineData("spawn ENOENT: npx not found")]
+    [InlineData("SSH connection refused")]
+    [InlineData("docker container failed to start")]
+    [InlineData("kubectl: connection refused to 10.0.0.1:6443")]
+    [InlineData("git: spawn ENOENT: no such file or directory")]
+    public void IsMcpError_UnrelatedErrors_ReturnsFalse(string text)
+    {
+        Assert.False(CopilotService.IsMcpError(text));
+    }
+
+    [Fact]
+    public void IsMcpError_NotConfusedWithPermissionDenialOrShellFailure()
+    {
+        // MCP errors should be detected by IsMcpError, not by the other detectors
+        var text = "MCP server 'workiq' failed to start: ECONNREFUSED";
+        Assert.True(CopilotService.IsMcpError(text));
+        Assert.False(CopilotService.IsPermissionDenialText(text));
+        Assert.False(CopilotService.IsShellEnvironmentFailure(text));
+    }
+
+    // ===== Structural: MCP errors are recoverable =====
+
+    [Fact]
+    public void RecoverableError_IncludesMcpFailure()
+    {
+        // STRUCTURAL REGRESSION GUARD: isRecoverableError must include isMcpFailure
+        // so that repeated MCP errors trigger auto-recovery (session reconnect).
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Events.cs"));
+        Assert.Contains("var isRecoverableError = isPermissionDenial || isShellFailure || isMcpFailure;", source);
+    }
+
+    [Fact]
+    public void McpRecoveryMessage_IncludesReloadHint()
+    {
+        // When MCP recovery triggers, the user message must mention /mcp reload
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Events.cs"));
+        Assert.Contains("/mcp reload", source);
+    }
+
+    [Fact]
+    public void ReloadMcpServersAsync_ExistsOnService_WithSessionNameParam()
+    {
+        // STRUCTURAL: The public API must accept a session name, not create a new session
+        var method = typeof(CopilotService).GetMethod(
+            "ReloadMcpServersAsync",
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+        var parameters = method.GetParameters();
+        Assert.Single(parameters);
+        Assert.Equal(typeof(string), parameters[0].ParameterType);
+        Assert.Equal("sessionName", parameters[0].Name);
+    }
+
+    [Fact]
+    public void ReloadMcpServersAsync_PreservesHistoryInPlace()
+    {
+        // STRUCTURAL REGRESSION GUARD: ReloadMcpServersAsync must replace the SDK session
+        // in-place using _sessions.TryUpdate (preserving AgentSessionInfo/history).
+        // It must NOT call CreateSessionAsync with a renamed session (which loses history).
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+        Assert.Contains("_sessions.TryUpdate(sessionName, newState, state)", source);
+        Assert.Contains("Info = state.Info", source);
+    }
+
+    [Fact]
+    public void ReloadMcpServersAsync_ThrowsOnConcurrentReload()
+    {
+        // STRUCTURAL: Concurrent reload must throw (not silently succeed) so the Dashboard
+        // can display an honest error message instead of a false "✅ reloaded" confirmation.
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+        // The guard must throw, not return silently
+        Assert.Contains("throw new InvalidOperationException(\"MCP reload is already in progress", source);
+    }
+
+    [Fact]
+    public void ReloadMcpServersAsync_ClearsPermissionDenials_Unconditionally()
+    {
+        // STRUCTURAL: Reload must clear the sliding-window denial count UNCONDITIONALLY —
+        // i.e. regardless of whether IsProcessing is true or false. The typical /mcp reload
+        // scenario has the session idle when the user types the command, so any check gated
+        // on IsProcessing would silently skip the clear and let stale denials carry into the
+        // fresh SDK session, triggering an immediate TryRecoverPermissionAsync cascade.
+        //
+        // We verify the unconditional clear by checking for the unique marker comment that
+        // accompanies the out-of-if-block call. If ClearPermissionDenials() were moved back
+        // inside the if-block, this comment would not be present and the test would fail.
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+
+        // The unconditional call is preceded by a comment that is unique to that call site.
+        Assert.Contains("Always clear the sliding-window denial queue regardless of processing state", source);
+
+        // Verify the actual call follows that comment (not just the comment without the fix).
+        var markerIdx = source.IndexOf("Always clear the sliding-window denial queue regardless of processing state", StringComparison.Ordinal);
+        var snippetAfterMarker = source.Substring(markerIdx, Math.Min(500, source.Length - markerIdx));
+        Assert.Contains("ClearPermissionDenials()", snippetAfterMarker);
+    }
+
+    private static string GetRepoRoot()
+    {
+        var dir = AppContext.BaseDirectory;
+        while (dir != null && !File.Exists(Path.Combine(dir, "PolyPilot.slnx")))
+            dir = Path.GetDirectoryName(dir);
+        return dir ?? throw new InvalidOperationException("Could not find repo root");
+    }
 }
