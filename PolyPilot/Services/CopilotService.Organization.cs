@@ -2458,6 +2458,7 @@ public partial class CopilotService
         var group = CreateMultiAgentGroup(teamName, preset.Mode, worktreeId: worktreeId, repoId: repoId);
         if (group == null) return null;
         group.WorktreeStrategy = strategy;
+        group.SourcePresetName = preset.Name;
 
         // Sanitize team name for use in git branch names (no spaces or special chars)
         var branchPrefix = System.Text.RegularExpressions.Regex.Replace(teamName, @"[^a-zA-Z0-9_-]", "-").Trim('-');
@@ -3442,6 +3443,51 @@ public partial class CopilotService
 
         return Models.UserPresets.SaveGroupAsPreset(PolyPilotBaseDir, name, description, emoji,
             group, members!, GetEffectiveModel, worktreeRoot);
+    }
+
+    /// <summary>
+    /// Refreshes a multi-agent group's settings from its source preset (if any).
+    /// Updates group-level settings (mode, shared/routing context, max iterations) and
+    /// per-session models and system prompts for existing sessions.
+    /// Does NOT add or remove sessions — only updates settings on what's already there.
+    /// Returns false if the group has no source preset or if the preset cannot be found.
+    /// </summary>
+    public bool RefreshGroupFromPreset(string groupId, string? repoWorkingDirectory = null)
+    {
+        var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId && g.IsMultiAgent);
+        if (group == null || string.IsNullOrEmpty(group.SourcePresetName)) return false;
+
+        var preset = Models.UserPresets.GetAll(PolyPilotBaseDir, repoWorkingDirectory)
+            .FirstOrDefault(p => string.Equals(p.Name, group.SourcePresetName, StringComparison.OrdinalIgnoreCase));
+        if (preset == null) return false;
+
+        // Refresh group-level settings
+        group.OrchestratorMode = preset.Mode;
+        group.SharedContext = preset.SharedContext;
+        group.RoutingContext = preset.RoutingContext;
+        if (preset.MaxReflectIterations.HasValue)
+            group.MaxReflectIterations = preset.MaxReflectIterations;
+
+        // Refresh orchestrator session model
+        var orchestratorName = GetOrchestratorSession(groupId);
+        if (orchestratorName != null)
+            SetSessionPreferredModel(orchestratorName, preset.OrchestratorModel);
+
+        // Refresh worker sessions (in existing order, matched by position against preset slots)
+        var workers = Organization.Sessions
+            .Where(m => m.GroupId == groupId && m.Role == MultiAgentRole.Worker)
+            .ToList();
+        for (int i = 0; i < workers.Count && i < preset.WorkerModels.Length; i++)
+        {
+            SetSessionPreferredModel(workers[i].SessionName, preset.WorkerModels[i]);
+            if (preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length)
+                workers[i].SystemPrompt = preset.WorkerSystemPrompts[i];
+        }
+
+        SaveOrganization();
+        FlushSaveOrganization();
+        OnStateChanged?.Invoke();
+        return true;
     }
 
     /// <summary>
