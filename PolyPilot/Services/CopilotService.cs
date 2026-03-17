@@ -34,6 +34,8 @@ public partial class CopilotService : IAsyncDisposable
     private Timer? _saveUiStateDebounce;
     private UiState? _pendingUiState;
     private readonly object _uiStateLock = new();
+    // Keepalive ping to prevent the headless server from killing idle sessions (~35 min timeout)
+    private CancellationTokenSource? _keepaliveCts;
     private readonly IChatDatabase _chatDb;
     private readonly IServerManager _serverManager;
     private readonly IWsBridgeClient _bridgeClient;
@@ -522,6 +524,60 @@ public partial class CopilotService : IAsyncDisposable
         try { state?.PrematureIdleSignal?.Dispose(); } catch { }
     }
 
+    /// <summary>Ping interval to prevent the headless server from killing idle sessions.
+    /// The server has a ~35 minute idle timeout; pinging every 15 minutes keeps sessions alive.</summary>
+    internal const int KeepalivePingIntervalSeconds = 15 * 60; // 15 minutes
+
+    private void StartKeepalivePing()
+    {
+        var cts = new CancellationTokenSource();
+        var prev = Interlocked.Exchange(ref _keepaliveCts, cts);
+        if (prev != null)
+        {
+            try { prev.Cancel(); } catch { }
+            prev.Dispose();
+        }
+        _ = RunKeepalivePingAsync(cts.Token);
+    }
+
+    private void StopKeepalivePing()
+    {
+        var prev = Interlocked.Exchange(ref _keepaliveCts, null);
+        if (prev != null)
+        {
+            try { prev.Cancel(); } catch { }
+            prev.Dispose();
+        }
+    }
+
+    private async Task RunKeepalivePingAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(KeepalivePingIntervalSeconds), ct);
+                if (ct.IsCancellationRequested) break;
+
+                var client = _client;
+                if (client == null || IsDemoMode || IsRemoteMode) continue;
+
+                try
+                {
+                    await client.PingAsync("keepalive", ct);
+                    Debug($"[KEEPALIVE] Ping sent to headless server");
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    Debug($"[KEEPALIVE] Ping failed: {ex.Message}");
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Debug($"[KEEPALIVE] Loop exited: {ex.Message}"); }
+    }
+
     private void Debug(string message)
     {
         LastDebugMessage = message;
@@ -536,6 +592,7 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
             message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
             message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
+            message.StartsWith("[KEEPALIVE") ||
             message.Contains("watchdog"))
         {
             try
@@ -834,6 +891,10 @@ public partial class CopilotService : IAsyncDisposable
 
         // Initialize any registered providers (from DI / plugin loader)
         await InitializeProvidersAsync(cancellationToken);
+
+        // Start keepalive pinging to prevent server idle timeout
+        if (!IsDemoMode && !IsRemoteMode && _client != null)
+            StartKeepalivePing();
     }
 
     /// <summary>
@@ -897,6 +958,7 @@ public partial class CopilotService : IAsyncDisposable
         _currentSettings = settings;
 
         StopConnectivityMonitoring();
+        StopKeepalivePing();
         await StopCodespaceHealthCheckAsync();
 
         // Dispose existing sessions and client
@@ -996,6 +1058,10 @@ public partial class CopilotService : IAsyncDisposable
 
         // Re-initialize providers after reconnect
         await InitializeProvidersAsync(cancellationToken);
+
+        // Start keepalive pinging to prevent server idle timeout
+        if (!IsDemoMode && !IsRemoteMode && _client != null)
+            StartKeepalivePing();
     }
 
     /// <summary>
@@ -1030,6 +1096,7 @@ public partial class CopilotService : IAsyncDisposable
             Debug("[SERVER-RECOVERY] Attempting persistent server recovery (auth/connectivity failure suspected)...");
 
             // Stop the old server — it's running but broken (e.g., expired auth token cached in-process)
+            StopKeepalivePing();
             _serverManager.StopServer();
 
             // Wait for the old server to fully release the port
@@ -1063,6 +1130,7 @@ public partial class CopilotService : IAsyncDisposable
             FallbackNotice = "Persistent server was automatically restarted due to repeated failures. Your sessions should work again.";
             Interlocked.Exchange(ref _consecutiveWatchdogTimeouts, 0);
             _lastRecoveryCompletedAt = DateTime.UtcNow;
+            StartKeepalivePing();
             InvokeOnUI(() => OnStateChanged?.Invoke());
             return true;
         }
@@ -1100,6 +1168,7 @@ public partial class CopilotService : IAsyncDisposable
         {
             Debug("[SERVER-RESTART] Restarting headless server due to native module failure...");
             ServerHealthNotice = null;
+            StopKeepalivePing();
 
             // 1. Dispose all existing sessions (they hold broken connections)
             foreach (var state in _sessions.Values)
@@ -1169,6 +1238,7 @@ public partial class CopilotService : IAsyncDisposable
             await RestorePreviousSessionsAsync(cancellationToken);
             FlushSaveActiveSessionsToDisk();
             ReconcileOrganization();
+            StartKeepalivePing();
             OnStateChanged?.Invoke();
 
             Debug("[SERVER-RESTART] Server restart complete, all sessions restored");
@@ -4013,6 +4083,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
     public async ValueTask DisposeAsync()
     {
         StopConnectivityMonitoring();
+        StopKeepalivePing();
         await StopCodespaceHealthCheckAsync();
 
         // Flush any pending debounced writes immediately
