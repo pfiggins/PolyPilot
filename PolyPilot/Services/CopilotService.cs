@@ -608,6 +608,10 @@ public partial class CopilotService : IAsyncDisposable
         /// all its tool rounds. This prevents the orchestrator from doing all the work itself
         /// when it has tool access and ignores "dispatcher only" instructions.</summary>
         public bool EarlyDispatchOnWorkerBlocks;
+        /// <summary>UTC ticks when the first background-tasks idle deferral occurred this turn.
+        /// If deferred completion exceeds BackgroundTaskIdleMaxDeferSeconds, CompleteResponse
+        /// is forced to prevent orchestrator hangs when the SDK never sends a final idle.</summary>
+        public long FirstIdleDeferAtTicks;
         /// <summary>Timer that fires shortly after a tool starts to verify the connection is still alive.
         /// If no tool completion event arrives within ToolHealthCheckIntervalMs, we do an active health
         /// check to detect dead connections early (instead of waiting for the 600s watchdog timeout).</summary>
