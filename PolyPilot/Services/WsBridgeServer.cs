@@ -62,12 +62,33 @@ public class WsBridgeServer : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
+
+            // On Windows, wildcard binding requires a URL ACL reservation.
+            // Attempt to register one automatically so LAN/mobile connections work.
+            if (OperatingSystem.IsWindows() && TryRegisterUrlAcl(bridgePort))
+            {
+                try
+                {
+                    _listener = new HttpListener();
+                    _listener.Prefixes.Add($"http://+:{bridgePort}/");
+                    _listener.Start();
+                    Console.WriteLine($"[WsBridge] Listening on port {bridgePort} after URL ACL registration (state-sync mode)");
+                    _acceptTask = AcceptLoopAsync(_cts.Token);
+                    OnStateChanged?.Invoke();
+                    return;
+                }
+                catch (Exception ex3)
+                {
+                    Console.WriteLine($"[WsBridge] Wildcard still failed after URL ACL: {ex3.Message}");
+                }
+            }
+
             try
             {
                 _listener = new HttpListener();
                 _listener.Prefixes.Add($"http://localhost:{bridgePort}/");
                 _listener.Start();
-                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode)");
+                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode) — LAN/mobile connections will NOT work");
                 _acceptTask = AcceptLoopAsync(_cts.Token);
                 OnStateChanged?.Invoke();
             }
@@ -75,6 +96,40 @@ public class WsBridgeServer : IDisposable
             {
                 Console.WriteLine($"[WsBridge] Failed to start on localhost: {ex2.Message}");
             }
+        }
+    }
+
+    /// <summary>
+    /// Attempts to register a URL ACL for the wildcard prefix on the given port.
+    /// This allows HttpListener to bind to all interfaces without running as admin.
+    /// Requires elevation — launches netsh via runas and returns true if successful.
+    /// </summary>
+    private static bool TryRegisterUrlAcl(int port)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"http add urlacl url=http://+:{port}/ user=Everyone",
+                Verb = "runas",
+                UseShellExecute = true,
+                CreateNoWindow = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+            };
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            proc.WaitForExit(10_000);
+            var success = proc.ExitCode == 0;
+            Console.WriteLine(success
+                ? $"[WsBridge] URL ACL registered for http://+:{port}/"
+                : $"[WsBridge] URL ACL registration failed (exit code {proc.ExitCode})");
+            return success;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] URL ACL registration skipped: {ex.Message}");
+            return false;
         }
     }
 
