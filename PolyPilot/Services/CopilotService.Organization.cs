@@ -3784,23 +3784,31 @@ public partial class CopilotService
                 else
                 {
                     // Later iterations: orchestrator decided no more work needed —
-                    // but only declare GoalMet if all workers have been dispatched
+                    // but only declare GoalMet if all workers have been dispatched or accounted for
                     var allDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
                     var allAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
-                    if (queuedAssignments.Count == 0 && (allDispatched || allAttempted))
+                    // Workers mentioned by name in the plan response are "accounted for"
+                    var allAccountedFor = allAttempted || workerNames.All(w =>
+                        attemptedWorkers.Contains(w) ||
+                        planResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+                    if (queuedAssignments.Count == 0 && (allDispatched || allAccountedFor))
                     {
                         reflectState.GoalMet = true;
                         AddOrchestratorSystemMessage(orchestratorName, $"✅ Orchestrator completed without delegation (iteration {reflectState.CurrentIteration}).");
                         break;
                     }
-                    if (!allDispatched && queuedAssignments.Count == 0)
+                    if (!allDispatched && !allAccountedFor && queuedAssignments.Count == 0)
                     {
-                        // Not all workers dispatched — force dispatch remaining workers
-                        var remaining = workerNames.Where(w => !dispatchedWorkers.Contains(w) && !attemptedWorkers.Contains(w)).ToList();
-                        Debug($"[DISPATCH] Iteration {reflectState.CurrentIteration}: 0 assignments but {remaining.Count} workers never dispatched — forcing: {string.Join(", ", remaining)}");
-                        AddOrchestratorSystemMessage(orchestratorName,
-                            $"⚡ Forcing dispatch to {remaining.Count} remaining worker(s): {string.Join(", ", remaining)}");
-                        assignments = remaining.Select(w => new TaskAssignment(w, prompt)).ToList();
+                        // Not all workers dispatched or accounted for — force dispatch remaining
+                        var remaining = workerNames.Where(w => !dispatchedWorkers.Contains(w) && !attemptedWorkers.Contains(w)
+                            && !planResponse.Contains(w, StringComparison.OrdinalIgnoreCase)).ToList();
+                        if (remaining.Count > 0)
+                        {
+                            Debug($"[DISPATCH] Iteration {reflectState.CurrentIteration}: 0 assignments but {remaining.Count} workers never dispatched — forcing: {string.Join(", ", remaining)}");
+                            AddOrchestratorSystemMessage(orchestratorName,
+                                $"⚡ Forcing dispatch to {remaining.Count} remaining worker(s): {string.Join(", ", remaining)}");
+                            assignments = remaining.Select(w => new TaskAssignment(w, prompt)).ToList();
+                        }
                         // Fall through to dispatch below
                     }
                     // Fall through to merge and dispatch queued work
@@ -3885,22 +3893,28 @@ public partial class CopilotService
 
                 // Check if evaluator says complete
                 var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+                // Workers mentioned by name in the orchestrator's synthesis are "accounted for"
+                var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+                    attemptedWorkers.Contains(w) ||
+                    synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
                 if ((evalResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase) || score >= 0.9)
-                    && (allWorkersDispatched || allWorkersAttempted))
+                    && (allWorkersDispatched || allWorkersAccountedFor))
                 {
-                    var partial = !allWorkersDispatched && allWorkersAttempted;
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
-                    var suffix = partial ? " (some workers failed but all were attempted)" : "";
+                    var suffix = allWorkersDispatched ? ""
+                        : allWorkersAttempted ? " (some workers failed but all were attempted)"
+                        : " (some workers intentionally skipped)";
                     AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()} (score: {score:F1}){suffix}");
                     break;
                 }
 
-                if (!allWorkersDispatched)
+                if (!allWorkersDispatched && !allWorkersAccountedFor)
                 {
                     var missing = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
                     var failedButAttempted = missing.Where(w => attemptedWorkers.Contains(w)).ToList();
-                    var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w)).ToList();
+                    var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w))
+                        .Where(w => !synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase)).ToList();
                     var detail = neverDispatched.Count > 0
                         ? $"Not yet dispatched: {string.Join(", ", neverDispatched)}."
                         : $"Dispatched but failed: {string.Join(", ", failedButAttempted)}. Will retry next iteration.";
@@ -3922,24 +3936,31 @@ public partial class CopilotService
 
                 // Check completion sentinel
                 var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+                // Workers explicitly mentioned by name in the synthesis are "accounted for"
+                // even if never dispatched — the orchestrator is signaling awareness (e.g., "no work needed")
+                var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+                    attemptedWorkers.Contains(w) ||
+                    synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && (allWorkersDispatched || allWorkersAttempted))
+                    && (allWorkersDispatched || allWorkersAccountedFor))
                 {
-                    var partial = !allWorkersDispatched && allWorkersAttempted;
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
-                    var suffix = partial ? " (some workers failed but all were attempted)" : "";
+                    var suffix = allWorkersDispatched ? ""
+                        : allWorkersAttempted ? " (some workers failed but all were attempted)"
+                        : " (some workers intentionally skipped)";
                     AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()}{suffix}");
                     break;
                 }
 
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && !allWorkersAttempted)
+                    && !allWorkersAccountedFor)
                 {
-                    // Override premature completion — not all workers have participated
+                    // Override premature completion — not all workers have participated or been addressed
                     var missing = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
                     var failedButAttempted = missing.Where(w => attemptedWorkers.Contains(w)).ToList();
-                    var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w)).ToList();
+                    var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w))
+                        .Where(w => !synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase)).ToList();
                     var detail = neverDispatched.Count > 0
                         ? $"Not yet dispatched: {string.Join(", ", neverDispatched)}."
                         : $"Dispatched but failed: {string.Join(", ", failedButAttempted)}. Retry or address errors.";
