@@ -302,6 +302,23 @@
     {
         "Worker Results",
         "Previous Iteration Feedback",
+        "Previous Iteration Evaluation",
+        "User Request",
+        "Original Request",
+        "Your Task",
+        "Evaluation Check",
+    };
+
+    // Section headers characteristic of orchestrator-generated prompts
+    private static readonly string[] OrchestratorMarkers = new[]
+    {
+        "## Work Routing",
+        "## Worker Results",
+        "## Instructions",
+        "## Your Task",
+        "## Original Request",
+        "## Evaluation Check",
+        "## Previous Iteration",
     };
 
     /// <summary>
@@ -311,9 +328,10 @@
     internal static bool IsOrchestratorPrompt(string? content)
     {
         if (string.IsNullOrEmpty(content)) return false;
-        // Orchestrator prompts always contain "## Worker Results" or "## Instructions" + "## Work Routing"
-        return content.Contains("## Worker Results") ||
-               (content.Contains("## Instructions") && content.Contains("## Work Routing"));
+        int matches = 0;
+        foreach (var marker in OrchestratorMarkers)
+            if (content.Contains(marker)) matches++;
+        return matches >= 2;
     }
 
     /// <summary>
