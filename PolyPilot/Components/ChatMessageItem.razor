@@ -28,10 +28,7 @@
                 @if (!string.IsNullOrEmpty(Message.OriginalContent))
                 {
                     <div class="chat-msg-text">@((MarkupString)ChatMessageList.FormatUserMessage(Message.OriginalContent))</div>
-                    <details class="orchestration-prompt-details">
-                        <summary>Full orchestration prompt</summary>
-                        <div class="orchestration-prompt-content">@((MarkupString)ChatMessageList.FormatUserMessage(Message.Content))</div>
-                    </details>
+                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content))
                 }
                 else
                 {
