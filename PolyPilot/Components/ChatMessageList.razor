@@ -305,6 +305,18 @@
     };
 
     /// <summary>
+    /// Detects if content is an orchestrator prompt (synthesis, replan, etc.)
+    /// by looking for characteristic section headers.
+    /// </summary>
+    internal static bool IsOrchestratorPrompt(string? content)
+    {
+        if (string.IsNullOrEmpty(content)) return false;
+        // Orchestrator prompts always contain "## Worker Results" or "## Instructions" + "## Work Routing"
+        return content.Contains("## Worker Results") ||
+               (content.Contains("## Instructions") && content.Contains("## Work Routing"));
+    }
+
+    /// <summary>
     /// Renders an orchestrator prompt with section-aware collapsing.
     /// Dynamic sections (Worker Results, Feedback) are shown expanded;
     /// boilerplate sections (Instructions, Work Routing, etc.) are collapsed.

@@ -30,6 +30,10 @@
                     <div class="chat-msg-text">@((MarkupString)ChatMessageList.FormatUserMessage(Message.OriginalContent))</div>
                     @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content))
                 }
+                else if (ChatMessageList.IsOrchestratorPrompt(Message.Content))
+                {
+                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content))
+                }
                 else
                 {
                     <div class="chat-msg-text">@((MarkupString)ChatMessageList.FormatUserMessage(Message.Content))</div>
