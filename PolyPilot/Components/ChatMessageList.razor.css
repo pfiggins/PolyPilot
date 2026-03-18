@@ -183,6 +183,26 @@
     word-break: break-word;
 }
 
+::deep .orchestrator-dynamic-section {
+    margin: 0.5rem 0;
+    padding: 0.5rem 0.75rem;
+    background: rgba(0, 150, 255, 0.06);
+    border: 1px solid rgba(0, 150, 255, 0.15);
+    border-radius: 6px;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+::deep .orchestrator-dynamic-section .orchestrator-section-header {
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+::deep .orchestrator-dynamic-section p {
+    margin: 0.2rem 0;
+}
+
 .chat-message-list.full ::deep .chat-msg.assistant .chat-msg-content {
     background: rgba(0, 195, 91, 0.06);
     border: 1px solid rgba(0, 195, 91, 0.12);
