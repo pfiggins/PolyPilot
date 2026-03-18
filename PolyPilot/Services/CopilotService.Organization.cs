@@ -4404,10 +4404,10 @@ public partial class CopilotService
     /// Refreshes a multi-agent group's settings from its source preset (if any).
     /// Updates group-level settings (mode, shared/routing context, max iterations) and
     /// per-session models and system prompts for existing sessions.
-    /// Does NOT add or remove sessions — only updates settings on what's already there.
+    /// Creates new worker sessions if the preset has more workers than the group.
     /// Returns false if the group has no source preset or if the preset cannot be found.
     /// </summary>
-    public bool RefreshGroupFromPreset(string groupId, string? repoWorkingDirectory = null)
+    public async Task<bool> RefreshGroupFromPresetAsync(string groupId, string? repoWorkingDirectory = null, CancellationToken ct = default)
     {
         var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId && g.IsMultiAgent);
         if (group == null || string.IsNullOrEmpty(group.SourcePresetName)) return false;
@@ -4429,6 +4429,114 @@ public partial class CopilotService
             SetSessionPreferredModel(orchestratorName, preset.OrchestratorModel);
 
         // Refresh worker sessions (in existing order, matched by position against preset slots)
+        var workers = Organization.Sessions
+            .Where(m => m.GroupId == groupId && m.Role == MultiAgentRole.Worker)
+            .ToList();
+        for (int i = 0; i < workers.Count && i < preset.WorkerModels.Length; i++)
+        {
+            SetSessionPreferredModel(workers[i].SessionName, preset.WorkerModels[i]);
+            if (preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length)
+                workers[i].SystemPrompt = preset.WorkerSystemPrompts[i];
+        }
+
+        // Create new worker sessions if the preset has more workers than exist in the group
+        if (preset.WorkerModels.Length > workers.Count)
+        {
+            var teamName = group.Name;
+            // Determine orchestrator worktree (new workers share it if no repo-level isolation)
+            var orchMeta = orchestratorName != null ? GetSessionMeta(orchestratorName) : null;
+            var orchWtId = orchMeta?.WorktreeId ?? group.WorktreeId;
+            var orchWorkDir = orchWtId != null
+                ? _repoManager?.Worktrees.FirstOrDefault(w => w.Id == orchWtId)?.Path
+                : null;
+            var repoId = group.RepoId;
+
+            for (int i = workers.Count; i < preset.WorkerModels.Length; i++)
+            {
+                var displayName = preset.WorkerDisplayNames != null && i < preset.WorkerDisplayNames.Length && preset.WorkerDisplayNames[i] != null
+                    ? preset.WorkerDisplayNames[i]!
+                    : $"worker-{i + 1}";
+                var workerName = $"{teamName}-{displayName}";
+                { int suffix = 1;
+                  while (_sessions.ContainsKey(workerName) || Organization.Sessions.Any(s => s.SessionName == workerName))
+                      workerName = $"{teamName}-{displayName}-{suffix++}";
+                }
+                var workerModel = preset.WorkerModels[i];
+
+                // Create worktree for new worker if strategy is FullyIsolated
+                string? workerWtId = null;
+                string? workerWorkDir = orchWorkDir;
+                if (repoId != null && group.WorktreeStrategy == WorktreeStrategy.FullyIsolated)
+                {
+                    try
+                    {
+                        var branchPrefix = System.Text.RegularExpressions.Regex.Replace(teamName, @"[^a-zA-Z0-9_-]", "-").Trim('-');
+                        var wt = await CreateWorktreeLocalOrRemoteAsync(repoId, $"{branchPrefix}-worker-{i + 1}-{Guid.NewGuid().ToString()[..4]}", ct);
+                        workerWorkDir = wt.Path;
+                        workerWtId = wt.Id;
+                        group.CreatedWorktreeIds.Add(wt.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug($"Failed to create worktree for new worker '{workerName}': {ex.Message}");
+                    }
+                }
+
+                try
+                {
+                    await CreateSessionAsync(workerName, workerModel, workerWorkDir, ct);
+                }
+                catch (Exception ex)
+                {
+                    Debug($"Failed to create new worker session '{workerName}': {ex.Message}");
+                }
+                MoveSession(workerName, group.Id);
+                SetSessionPreferredModel(workerName, workerModel);
+                var systemPrompt = preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length
+                    ? preset.WorkerSystemPrompts[i] : null;
+                var meta = GetSessionMeta(workerName);
+                if (meta != null)
+                {
+                    meta.WorktreeId = workerWtId ?? orchWtId;
+                    if (systemPrompt != null) meta.SystemPrompt = systemPrompt;
+                }
+                if ((workerWtId ?? orchWtId) != null && _sessions.TryGetValue(workerName, out var workerState))
+                    workerState.Info.WorktreeId = workerWtId ?? orchWtId;
+
+                Debug($"[PresetRefresh] Created new worker '{workerName}' (model={workerModel}, wtId={workerWtId ?? orchWtId ?? "(none)"})");
+            }
+        }
+
+        SaveOrganization();
+        FlushSaveOrganization();
+        FlushSaveActiveSessionsToDisk();
+        OnStateChanged?.Invoke();
+        return true;
+    }
+
+    /// <summary>
+    /// Sync version of RefreshGroupFromPresetAsync — updates settings on existing sessions
+    /// but does NOT create new worker sessions. Used by tests and non-async callers.
+    /// </summary>
+    public bool RefreshGroupFromPreset(string groupId, string? repoWorkingDirectory = null)
+    {
+        var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId && g.IsMultiAgent);
+        if (group == null || string.IsNullOrEmpty(group.SourcePresetName)) return false;
+
+        var preset = Models.UserPresets.GetAll(PolyPilotBaseDir, repoWorkingDirectory)
+            .FirstOrDefault(p => string.Equals(p.Name, group.SourcePresetName, StringComparison.OrdinalIgnoreCase));
+        if (preset == null) return false;
+
+        group.OrchestratorMode = preset.Mode;
+        group.SharedContext = preset.SharedContext;
+        group.RoutingContext = preset.RoutingContext;
+        if (preset.MaxReflectIterations.HasValue)
+            group.MaxReflectIterations = preset.MaxReflectIterations;
+
+        var orchestratorName = GetOrchestratorSession(groupId);
+        if (orchestratorName != null)
+            SetSessionPreferredModel(orchestratorName, preset.OrchestratorModel);
+
         var workers = Organization.Sessions
             .Where(m => m.GroupId == groupId && m.Role == MultiAgentRole.Worker)
             .ToList();
