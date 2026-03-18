@@ -380,6 +380,38 @@
         }
 
         var sb = new System.Text.StringBuilder();
+        // Group consecutive boilerplate sections into a single collapsible panel
+        var boilerplateBuffer = new List<(string label, string body)>();
+
+        void FlushBoilerplate()
+        {
+            if (boilerplateBuffer.Count == 0) return;
+            if (boilerplateBuffer.Count == 1)
+            {
+                sb.Append("<details class=\"orchestration-prompt-details\">");
+                sb.Append($"<summary>{System.Net.WebUtility.HtmlEncode(boilerplateBuffer[0].label)}</summary>");
+                sb.Append("<div class=\"orchestration-prompt-content\">");
+                sb.Append(System.Net.WebUtility.HtmlEncode(boilerplateBuffer[0].body).Replace("\n", "<br/>"));
+                sb.Append("</div></details>");
+            }
+            else
+            {
+                var labels = string.Join(", ", boilerplateBuffer.Select(b => b.label));
+                sb.Append("<details class=\"orchestration-prompt-details\">");
+                sb.Append($"<summary>Orchestration context ({boilerplateBuffer.Count} sections)</summary>");
+                sb.Append("<div class=\"orchestration-prompt-content\">");
+                foreach (var (label, body) in boilerplateBuffer)
+                {
+                    sb.Append($"<div class=\"orchestration-boilerplate-section\">");
+                    sb.Append($"<strong>{System.Net.WebUtility.HtmlEncode(label)}</strong><br/>");
+                    sb.Append(System.Net.WebUtility.HtmlEncode(body).Replace("\n", "<br/>"));
+                    sb.Append("</div>");
+                }
+                sb.Append("</div></details>");
+            }
+            boilerplateBuffer.Clear();
+        }
+
         foreach (var (header, body) in sections)
         {
             if (string.IsNullOrEmpty(header) && string.IsNullOrWhiteSpace(body))
@@ -390,7 +422,7 @@
 
             if (isDynamic)
             {
-                // Dynamic sections: render with markdown, visible by default
+                FlushBoilerplate();
                 sb.Append("<div class=\"orchestrator-dynamic-section\">");
                 sb.Append($"<div class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</div>");
                 sb.Append(MarkdownRenderer.ToHtml(body));
@@ -398,15 +430,11 @@
             }
             else
             {
-                // Boilerplate sections: collapsed by default
                 var label = !string.IsNullOrEmpty(header) ? header : "Preamble";
-                sb.Append("<details class=\"orchestration-prompt-details\">");
-                sb.Append($"<summary>{System.Net.WebUtility.HtmlEncode(label)}</summary>");
-                sb.Append("<div class=\"orchestration-prompt-content\">");
-                sb.Append(System.Net.WebUtility.HtmlEncode(body).Replace("\n", "<br/>"));
-                sb.Append("</div></details>");
+                boilerplateBuffer.Add((label, body));
             }
         }
+        FlushBoilerplate();
         return sb.ToString();
     }
 
