@@ -195,6 +195,10 @@
         @"(?<!\(|""|\w)((?:/[\w\-. ]+)+\.(?:png|jpg|jpeg|gif|webp|svg|bmp|tiff))(?!\)|""|\w)",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
 
+    private static readonly System.Text.RegularExpressions.Regex WorkerBlockRegex = new(
+        @"@worker:([^\n]+?)\s*\n([\s\S]*?)(?:@end|(?=@worker:)|$)",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
     internal static string RenderMarkdown(string content, string? repoUrl = null)
     {
         if (string.IsNullOrEmpty(content)) return "";
@@ -202,7 +206,32 @@
         if (_markdownCache.TryGetValue(cacheKey, out var cached)) return cached;
         try
         {
-            var html = MarkdownRenderer.ToHtml(content);
+            // Pre-process @worker:name...@end blocks into collapsible <details> elements.
+            // Extract them before markdown rendering, replace with placeholders, then restore.
+            var workerBlocks = new Dictionary<string, string>();
+            var processed = WorkerBlockRegex.Replace(content, match =>
+            {
+                var workerName = match.Groups[1].Value.Trim();
+                var taskBody = match.Groups[2].Value.Trim();
+                var id = $"__WORKER_BLOCK_{workerBlocks.Count}__";
+                // Render the task body as markdown for rich formatting
+                var bodyHtml = MarkdownRenderer.ToHtml(taskBody);
+                workerBlocks[id] = $"<details class=\"worker-dispatch-details\">" +
+                    $"<summary>📤 Task → <strong>{System.Net.WebUtility.HtmlEncode(workerName)}</strong></summary>" +
+                    $"<div class=\"worker-dispatch-content\">{bodyHtml}</div></details>";
+                return $"\n{id}\n";
+            });
+
+            var html = MarkdownRenderer.ToHtml(processed);
+
+            // Restore worker block placeholders with actual HTML
+            foreach (var (placeholder, detailsHtml) in workerBlocks)
+            {
+                // The placeholder may have been wrapped in <p> tags by the markdown engine
+                html = html.Replace($"<p>{placeholder}</p>", detailsHtml);
+                html = html.Replace(placeholder, detailsHtml);
+            }
+
             html = ImagePathRegex.Replace(html, match =>
             {
                 var path = match.Value;

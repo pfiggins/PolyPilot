@@ -151,6 +151,38 @@
     overflow-y: auto;
 }
 
+::deep .worker-dispatch-details {
+    margin: 0.5rem 0;
+    font-size: var(--type-callout);
+    border: 1px solid rgba(0, 195, 91, 0.15);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+::deep .worker-dispatch-details summary {
+    cursor: pointer;
+    padding: 0.4rem 0.75rem;
+    background: rgba(0, 195, 91, 0.06);
+    color: rgba(255, 255, 255, 0.65);
+    font-size: var(--type-callout);
+    user-select: none;
+}
+
+::deep .worker-dispatch-details summary:hover {
+    background: rgba(0, 195, 91, 0.1);
+    color: rgba(255, 255, 255, 0.85);
+}
+
+::deep .worker-dispatch-details .worker-dispatch-content {
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 255, 255, 0.02);
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.55);
+    max-height: 400px;
+    overflow-y: auto;
+    word-break: break-word;
+}
+
 .chat-message-list.full ::deep .chat-msg.assistant .chat-msg-content {
     background: rgba(0, 195, 91, 0.06);
     border: 1px solid rgba(0, 195, 91, 0.12);
