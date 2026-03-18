@@ -147,8 +147,17 @@
     color: rgba(255, 255, 255, 0.55);
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 300px;
+    max-height: 400px;
     overflow-y: auto;
+}
+
+::deep .orchestration-boilerplate-section {
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+::deep .orchestration-boilerplate-section:last-child {
+    border-bottom: none;
 }
 
 ::deep .worker-dispatch-details {
