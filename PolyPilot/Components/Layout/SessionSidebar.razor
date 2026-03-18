@@ -2507,7 +2507,7 @@ else
         StateHasChanged();
     }
 
-    private void RefreshFromPreset(string groupId)
+    private async Task RefreshFromPreset(string groupId)
     {
         var group = CopilotService.Organization.Groups.FirstOrDefault(g => g.Id == groupId);
         if (group == null) return;
@@ -2515,7 +2515,7 @@ else
         var worktreeRoot = string.IsNullOrEmpty(group.WorktreeId) ? null
             : RepoManager.Worktrees.FirstOrDefault(w => w.Id == group.WorktreeId)?.Path;
 
-        var success = CopilotService.RefreshGroupFromPreset(groupId, worktreeRoot);
+        var success = await CopilotService.RefreshGroupFromPresetAsync(groupId, worktreeRoot);
         if (success)
         {
             var orchestratorName = CopilotService.GetOrchestratorSession(groupId);
