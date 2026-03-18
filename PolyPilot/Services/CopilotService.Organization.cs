@@ -2577,11 +2577,20 @@ public partial class CopilotService
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && !cts.IsCancellationRequested)
             {
-                // The TCS was cancelled but our dispatch token is still alive — this is
-                // permission recovery cancelling the old TCS. Check if the session was
-                // reconnected (not orphaned) and retry with the new state.
+                // The TCS was cancelled but our dispatch token is still alive — this could be:
+                // (a) Permission recovery cancelling the old TCS, or
+                // (b) User clicking Stop (AbortSessionAsync cancels TCS directly).
+                // Distinguish by checking if recovery is in progress. If not, this is a user abort.
                 if (!_sessions.TryGetValue(sessionName, out var recoveredState) || recoveredState.IsOrphaned)
                     throw; // Session truly gone
+
+                // If the session is no longer processing and no recovery is in progress,
+                // this was a user-initiated abort — do NOT retry.
+                if (!recoveredState.Info.IsProcessing && !_recoveryInProgress.ContainsKey(sessionName))
+                {
+                    Debug($"[DISPATCH] '{sessionName}' TCS cancelled by user abort — not retrying");
+                    throw;
+                }
 
                 Debug($"[DISPATCH] Worker '{sessionName}' detected permission recovery cancellation — retrying (attempt {recoveryAttempt + 1}/{MaxPermissionRecoveryRetries})");
 
