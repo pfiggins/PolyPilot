@@ -2588,4 +2588,150 @@ public class MultiAgentRegressionTests
     }
 
     #endregion
+
+    #region Workers Accounted For — Intentional Skip Tests
+
+    /// <summary>
+    /// When the orchestrator's synthesis response contains [[GROUP_REFLECT_COMPLETE]] and
+    /// explicitly mentions all undispatched workers by name, completion should be accepted.
+    /// This prevents wasteful re-dispatch to workers the orchestrator intentionally skipped.
+    /// Regression test for the "Overriding completion — Not yet dispatched" loop bug.
+    /// </summary>
+    [Fact]
+    public void ReflectCompletion_WorkerMentionedInSynthesis_CountsAsAccountedFor()
+    {
+        var workerNames = new List<string> { "Elite Dev Squad-srdev-1", "Elite Dev Squad-srdev-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Elite Dev Squad-srdev-1" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Elite Dev Squad-srdev-1" };
+
+        // Synthesis mentions srdev-2 by name (orchestrator says "no work needed")
+        var synthesisResponse = "All tasks are complete. [[GROUP_REFLECT_COMPLETE]]\n" +
+            "@worker:Elite Dev Squad-srdev-2 No work needed for this task. Confirm receipt. @end";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+        var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.False(allWorkersDispatched, "srdev-2 was not dispatched");
+        Assert.False(allWorkersAttempted, "srdev-2 was not attempted");
+        Assert.True(allWorkersAccountedFor, "srdev-2 should be accounted for — mentioned by name in synthesis");
+
+        // The completion check should now pass
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && (allWorkersDispatched || allWorkersAccountedFor));
+    }
+
+    [Fact]
+    public void ReflectCompletion_WorkerNotMentionedInSynthesis_OverrideStillFires()
+    {
+        var workerNames = new List<string> { "Team-worker-1", "Team-worker-2", "Team-worker-3" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
+
+        // Synthesis does NOT mention worker-2 or worker-3
+        var synthesisResponse = "Task done. [[GROUP_REFLECT_COMPLETE]]";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+        var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.False(allWorkersAccountedFor, "worker-2 and worker-3 are not mentioned — override should fire");
+
+        // The override should still trigger
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && !allWorkersAccountedFor);
+    }
+
+    [Fact]
+    public void ReflectCompletion_CaseInsensitiveWorkerMatch()
+    {
+        var workerNames = new List<string> { "Squad-worker-1", "Squad-Worker-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Squad-worker-1" };
+
+        // Synthesis mentions worker-2 with different casing
+        var synthesisResponse = "[[GROUP_REFLECT_COMPLETE]] squad-worker-2 had no applicable tasks.";
+
+        var allWorkersAccountedFor = workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(allWorkersAccountedFor, "Case-insensitive match should work");
+    }
+
+    [Fact]
+    public void ReflectCompletion_AllWorkersDispatched_StillAccepted()
+    {
+        // When all workers were dispatched and succeeded, completion should work as before
+        var workerNames = new List<string> { "Team-w1", "Team-w2" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-w1", "Team-w2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-w1", "Team-w2" };
+
+        var synthesisResponse = "[[GROUP_REFLECT_COMPLETE]] Great work by all.";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+
+        Assert.True(allWorkersDispatched);
+        Assert.True(allWorkersAttempted);
+        Assert.True(allWorkersDispatched || allWorkersAttempted);
+    }
+
+    [Fact]
+    public void ReflectCompletion_ZeroAssignments_PlanMentionsWorkers_GoalMet()
+    {
+        // When the orchestrator returns 0 assignments but mentions remaining workers
+        // by name in the plan response, GoalMet should be set
+        var workerNames = new List<string> { "Team-srdev-1", "Team-srdev-2" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-srdev-1" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-srdev-1" };
+
+        var planResponse = "All work is complete. Team-srdev-2 does not need any changes for this task.";
+
+        var allDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+        var allAccountedFor = allAttempted || workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            planResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.False(allDispatched);
+        Assert.False(allAttempted);
+        Assert.True(allAccountedFor, "Worker mentioned in plan should count as accounted for");
+    }
+
+    /// <summary>
+    /// Structural test: Organization.cs must use allWorkersAccountedFor (not just allWorkersAttempted)
+    /// when evaluating [[GROUP_REFLECT_COMPLETE]] in the self-eval path. This prevents the
+    /// override-and-redispatch loop when workers are intentionally skipped.
+    /// </summary>
+    [Fact]
+    public void OrganizationReflectPath_UsesAccountedForCheck()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath), $"Organization.cs not found at {orgPath}");
+        var source = File.ReadAllText(orgPath);
+
+        // The self-eval path must compute allWorkersAccountedFor
+        Assert.Contains("allWorkersAccountedFor", source);
+
+        // The completion check must use allWorkersAccountedFor (not just allWorkersAttempted)
+        // Find the self-eval GROUP_REFLECT_COMPLETE check and verify it uses allWorkersAccountedFor
+        var sentinelIdx = source.IndexOf("[[GROUP_REFLECT_COMPLETE]]");
+        Assert.True(sentinelIdx >= 0);
+
+        var accountedForIdx = source.IndexOf("allWorkersAccountedFor", sentinelIdx);
+        Assert.True(accountedForIdx >= 0,
+            "The [[GROUP_REFLECT_COMPLETE]] check must use allWorkersAccountedFor to allow " +
+            "completion when workers are intentionally skipped by the orchestrator.");
+    }
+
+    #endregion
 }
