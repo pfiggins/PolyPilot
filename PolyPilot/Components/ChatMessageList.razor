@@ -207,13 +207,14 @@
         {
             // Pre-process @worker:name...@end blocks into collapsible <details> elements.
             // Extract them before markdown rendering, replace with placeholders, then restore.
+            // Placeholders use alphanumeric-only names to avoid markdown interpretation
+            // (e.g., __X__ would become <strong>X</strong>).
             var workerBlocks = new Dictionary<string, string>();
             var processed = WorkerBlockRegex.Replace(content, match =>
             {
                 var workerName = match.Groups[1].Value.Trim();
                 var taskBody = match.Groups[2].Value.Trim();
-                var id = $"__WORKER_BLOCK_{workerBlocks.Count}__";
-                // Render the task body as markdown for rich formatting
+                var id = $"PPWORKERBLK{workerBlocks.Count}ENDBLK";
                 var bodyHtml = MarkdownRenderer.ToHtml(taskBody);
                 workerBlocks[id] = $"<details class=\"worker-dispatch-details\">" +
                     $"<summary>📤 Task → <strong>{System.Net.WebUtility.HtmlEncode(workerName)}</strong></summary>" +
@@ -226,7 +227,6 @@
             // Restore worker block placeholders with actual HTML
             foreach (var (placeholder, detailsHtml) in workerBlocks)
             {
-                // The placeholder may have been wrapped in <p> tags by the markdown engine
                 html = html.Replace($"<p>{placeholder}</p>", detailsHtml);
                 html = html.Replace(placeholder, detailsHtml);
             }
@@ -294,6 +294,89 @@
         var count = 1;
         foreach (var c in text) { if (c == '\n') count++; }
         return count;
+    }
+
+    // Sections that contain dynamic/novel content — shown expanded
+    private static readonly HashSet<string> DynamicSectionPrefixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Worker Results",
+        "Previous Iteration Feedback",
+    };
+
+    /// <summary>
+    /// Renders an orchestrator prompt with section-aware collapsing.
+    /// Dynamic sections (Worker Results, Feedback) are shown expanded;
+    /// boilerplate sections (Instructions, Work Routing, etc.) are collapsed.
+    /// </summary>
+    internal static string RenderOrchestratorPromptSections(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+
+        // Split content into sections by ## headers
+        var sections = new List<(string? header, string body)>();
+        var lines = content.Split('\n');
+        string? currentHeader = null;
+        var currentBody = new System.Text.StringBuilder();
+        bool hasAnySections = false;
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("## "))
+            {
+                hasAnySections = true;
+                if (currentHeader != null || currentBody.Length > 0)
+                    sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
+                currentHeader = trimmed.Substring(3).Trim();
+                currentBody.Clear();
+            }
+            else
+            {
+                currentBody.AppendLine(line);
+            }
+        }
+        if (currentHeader != null || currentBody.Length > 0)
+            sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
+
+        // If no ## sections found, fall back to a single collapsed panel
+        if (!hasAnySections)
+        {
+            return "<details class=\"orchestration-prompt-details\">" +
+                "<summary>Full orchestration prompt</summary>" +
+                "<div class=\"orchestration-prompt-content\">" +
+                System.Net.WebUtility.HtmlEncode(content).Replace("\n", "<br/>") +
+                "</div></details>";
+        }
+
+        var sb = new System.Text.StringBuilder();
+        foreach (var (header, body) in sections)
+        {
+            if (string.IsNullOrEmpty(header) && string.IsNullOrWhiteSpace(body))
+                continue;
+
+            bool isDynamic = header != null &&
+                DynamicSectionPrefixes.Any(p => header.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+
+            if (isDynamic)
+            {
+                // Dynamic sections: render with markdown, visible by default
+                sb.Append("<div class=\"orchestrator-dynamic-section\">");
+                sb.Append($"<div class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</div>");
+                sb.Append(MarkdownRenderer.ToHtml(body));
+                sb.Append("</div>");
+            }
+            else
+            {
+                // Boilerplate sections: collapsed by default
+                var label = !string.IsNullOrEmpty(header) ? header : "Preamble";
+                sb.Append("<details class=\"orchestration-prompt-details\">");
+                sb.Append($"<summary>{System.Net.WebUtility.HtmlEncode(label)}</summary>");
+                sb.Append("<div class=\"orchestration-prompt-content\">");
+                sb.Append(System.Net.WebUtility.HtmlEncode(body).Replace("\n", "<br/>"));
+                sb.Append("</div></details>");
+            }
+        }
+        return sb.ToString();
     }
 
     internal static string FirstLines(string? text, int lines)
