@@ -146,18 +146,65 @@ public class GitAutoUpdateService : IDisposable
                 return;
             }
 
-            // Only update if local is strictly behind (not diverged).
-            // merge-base --is-ancestor returns 0 if local is an ancestor of remote.
+            // Only update if there are new upstream commits to incorporate.
+            // For forks: local may have commits beyond upstream — that's fine as long as
+            // upstream/main is an ancestor of HEAD (we already have all upstream changes).
+            var isLocalBehind = false;
             try
             {
                 await RunGit($"merge-base --is-ancestor HEAD {updateRemote}/main");
+                // HEAD is an ancestor of remote — we're strictly behind, fast-forward is possible
+                isLocalBehind = true;
             }
             catch
             {
-                // Local has diverged (local commits not on remote) — don't pull
-                _status = $"Diverged from {updateRemote}/main — skipping";
-                NotifyChanged();
-                return;
+                // HEAD is NOT an ancestor of remote — check the reverse: is remote an ancestor of us?
+                try
+                {
+                    await RunGit($"merge-base --is-ancestor {updateRemote}/main HEAD");
+                    // Remote is already contained in our history — we're ahead, nothing to pull
+                    _status = $"Up to date (ahead of {updateRemote}/main)";
+                    NotifyChanged();
+                    return;
+                }
+                catch
+                {
+                    // True divergence: both sides have unique commits. Try rebase for forks.
+                    if (updateRemote == "upstream")
+                    {
+                        _status = $"Rebasing onto {updateRemote}/main...";
+                        NotifyChanged();
+                        try
+                        {
+                            await RunGit($"rebase {updateRemote}/main");
+                            // Rebase succeeded — force-push to keep fork in sync
+                            try
+                            {
+                                await RunGit("push origin main --force-with-lease --quiet");
+                                _logger.LogInformation("Fork rebased and force-pushed to origin");
+                            }
+                            catch (Exception pushEx)
+                            {
+                                _logger.LogWarning(pushEx, "Rebase succeeded but force-push to origin failed");
+                            }
+                            // Continue to rebuild below
+                            goto rebuild;
+                        }
+                        catch (Exception rebaseEx)
+                        {
+                            // Rebase had conflicts — abort and skip
+                            _logger.LogWarning(rebaseEx, "Rebase onto upstream/main failed — aborting");
+                            try { await RunGit("rebase --abort"); } catch { }
+                            _status = $"Rebase conflict with {updateRemote}/main — skipping";
+                            NotifyChanged();
+                            return;
+                        }
+                    }
+
+                    _status = $"Diverged from {updateRemote}/main — skipping";
+                    NotifyChanged();
+                    return;
+                }
             }
 
             var behindCount = (await RunGit($"rev-list --count HEAD..{updateRemote}/main")).Trim();
@@ -180,6 +227,8 @@ public class GitAutoUpdateService : IDisposable
                     _logger.LogWarning(ex, "Failed to push to fork origin — fork may be out of sync");
                 }
             }
+
+            rebuild:
 
             _status = "Rebuilding & relaunching...";
             NotifyChanged();
