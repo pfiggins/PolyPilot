@@ -308,7 +308,8 @@
         "Evaluation Check",
     };
 
-    // Section headers characteristic of orchestrator-generated prompts
+    // Section headers characteristic of orchestrator-generated prompts.
+    // Any single match is sufficient — normal user messages never contain these headers.
     private static readonly string[] OrchestratorMarkers = new[]
     {
         "## Work Routing",
@@ -318,19 +319,22 @@
         "## Original Request",
         "## Evaluation Check",
         "## Previous Iteration",
+        "## User Request",
+        "@worker:",
+        "[[GROUP_REFLECT_COMPLETE]]",
     };
 
     /// <summary>
     /// Detects if content is an orchestrator prompt (synthesis, replan, etc.)
-    /// by looking for characteristic section headers.
+    /// by looking for characteristic section headers or orchestrator markers.
+    /// A single marker match is enough — these strings never appear in normal user messages.
     /// </summary>
     internal static bool IsOrchestratorPrompt(string? content)
     {
         if (string.IsNullOrEmpty(content)) return false;
-        int matches = 0;
         foreach (var marker in OrchestratorMarkers)
-            if (content.Contains(marker)) matches++;
-        return matches >= 2;
+            if (content.Contains(marker)) return true;
+        return false;
     }
 
     /// <summary>
