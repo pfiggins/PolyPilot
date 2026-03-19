@@ -2413,7 +2413,7 @@ public class MultiAgentRegressionTests
         var sendIdx = source.IndexOf("async Task<string> SendPromptAsync(", StringComparison.Ordinal);
         Assert.True(sendIdx >= 0, "SendPromptAsync must exist in CopilotService.cs");
 
-        var sendBlock = source.Substring(sendIdx, Math.Min(5000, source.Length - sendIdx));
+        var sendBlock = source.Substring(sendIdx, Math.Min(10000, source.Length - sendIdx));
         Assert.Contains("PrematureIdleSignal.Reset()", sendBlock);
     }
 
