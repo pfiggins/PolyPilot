@@ -42,6 +42,12 @@ public class WsBridgeServer : IDisposable
     public event Action? OnStateChanged;
 
     /// <summary>
+    /// When true, Start() binds to localhost only, skipping wildcard binding
+    /// and URL ACL registration. Used in tests to avoid UAC prompts.
+    /// </summary>
+    public bool LocalhostOnly { get; set; }
+
+    /// <summary>
     /// Start the bridge server. Now only needs the port — connects to CopilotService directly.
     /// The targetPort parameter is kept for API compat but ignored.
     /// </summary>
@@ -63,53 +69,58 @@ public class WsBridgeServer : IDisposable
             _bridgePort = bridgePort;
             _cts = new CancellationTokenSource();
 
-            _listener = new HttpListener();
-            _listener.Prefixes.Add($"http://+:{bridgePort}/");
-
-            try
+            if (!LocalhostOnly)
             {
-                _listener.Start();
-                Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode)");
-                _acceptTask = AcceptLoopAsync(_cts.Token);
-                OnStateChanged?.Invoke();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
-
-                // On Windows, wildcard binding requires a URL ACL reservation.
-                // Attempt to register one automatically so LAN/mobile connections work.
-                if (OperatingSystem.IsWindows() && TryRegisterUrlAcl(bridgePort))
-                {
-                    try
-                    {
-                        _listener = new HttpListener();
-                        _listener.Prefixes.Add($"http://+:{bridgePort}/");
-                        _listener.Start();
-                        Console.WriteLine($"[WsBridge] Listening on port {bridgePort} after URL ACL registration (state-sync mode)");
-                        _acceptTask = AcceptLoopAsync(_cts.Token);
-                        OnStateChanged?.Invoke();
-                        return;
-                    }
-                    catch (Exception ex3)
-                    {
-                        Console.WriteLine($"[WsBridge] Wildcard still failed after URL ACL: {ex3.Message}");
-                    }
-                }
+                _listener = new HttpListener();
+                _listener.Prefixes.Add($"http://+:{bridgePort}/");
 
                 try
                 {
-                    _listener = new HttpListener();
-                    _listener.Prefixes.Add($"http://localhost:{bridgePort}/");
                     _listener.Start();
-                    Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode) — LAN/mobile connections will NOT work");
+                    Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode)");
                     _acceptTask = AcceptLoopAsync(_cts.Token);
                     OnStateChanged?.Invoke();
+                    return;
                 }
-                catch (Exception ex2)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"[WsBridge] Failed to start on localhost: {ex2.Message}");
+                    Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
+
+                    // On Windows, wildcard binding requires a URL ACL reservation.
+                    // Attempt to register one automatically so LAN/mobile connections work.
+                    if (OperatingSystem.IsWindows() && TryRegisterUrlAcl(bridgePort))
+                    {
+                        try
+                        {
+                            _listener = new HttpListener();
+                            _listener.Prefixes.Add($"http://+:{bridgePort}/");
+                            _listener.Start();
+                            Console.WriteLine($"[WsBridge] Listening on port {bridgePort} after URL ACL registration (state-sync mode)");
+                            _acceptTask = AcceptLoopAsync(_cts.Token);
+                            OnStateChanged?.Invoke();
+                            return;
+                        }
+                        catch (Exception ex3)
+                        {
+                            Console.WriteLine($"[WsBridge] Wildcard still failed after URL ACL: {ex3.Message}");
+                        }
+                    }
                 }
+            }
+
+            // Localhost-only fallback (also used when LocalhostOnly is set)
+            try
+            {
+                _listener = new HttpListener();
+                _listener.Prefixes.Add($"http://localhost:{bridgePort}/");
+                _listener.Start();
+                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode){(LocalhostOnly ? "" : " — LAN/mobile connections will NOT work")}");
+                _acceptTask = AcceptLoopAsync(_cts.Token);
+                OnStateChanged?.Invoke();
+            }
+            catch (Exception ex2)
+            {
+                Console.WriteLine($"[WsBridge] Failed to start on localhost: {ex2.Message}");
             }
         }
         finally
