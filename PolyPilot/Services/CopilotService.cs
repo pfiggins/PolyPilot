@@ -3156,8 +3156,22 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     if (!string.IsNullOrEmpty(m)) cfg.Model = m;
                                                     if (!string.IsNullOrEmpty(capturedOtherState.Info.WorkingDirectory))
                                                         cfg.WorkingDirectory = capturedOtherState.Info.WorkingDirectory;
-                                                    var resumed = await newClient.ResumeSessionAsync(
-                                                        capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    CopilotSession resumed;
+                                                    try
+                                                    {
+                                                        resumed = await newClient.ResumeSessionAsync(
+                                                            capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    }
+                                                    catch (Exception toolEx) when (
+                                                        toolEx.Message.Contains("tool name clash", StringComparison.OrdinalIgnoreCase) ||
+                                                        toolEx.Message.Contains("already registered", StringComparison.OrdinalIgnoreCase))
+                                                    {
+                                                        // Stale connection still holds tool registration — retry without external tools
+                                                        Debug($"[RECONNECT] Sibling '{capturedKey}' tool clash, retrying without external tools");
+                                                        cfg.Tools = new List<Microsoft.Extensions.AI.AIFunction>();
+                                                        resumed = await newClient.ResumeSessionAsync(
+                                                            capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    }
                                                     // Re-check after await — a concurrent SendPromptAsync
                                                     // may have started processing while we were resuming.
                                                     // Orphan the just-resumed session rather than cancel a live turn.
@@ -3337,6 +3351,25 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             CancelTurnEndFallback(state);
                             CancelToolHealthCheck(state);
                             throw;
+                        }
+                    }
+                    catch (Exception resumeEx) when (
+                        resumeEx.Message.Contains("tool name clash", StringComparison.OrdinalIgnoreCase) ||
+                        resumeEx.Message.Contains("already registered", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // A stale connection still holds the external tool registration on the server.
+                        // Retry without external tools — the session will work, just without show_image
+                        // until the next clean reconnect re-registers it.
+                        Debug($"[RECONNECT] '{sessionName}' tool name clash on resume, retrying without external tools: {resumeEx.Message}");
+                        reconnectConfig.Tools = new List<Microsoft.Extensions.AI.AIFunction>();
+                        newSession = await client.ResumeSessionAsync(state.Info.SessionId, reconnectConfig, cancellationToken);
+                        var actualId = newSession.SessionId;
+                        if (!string.IsNullOrEmpty(actualId) && actualId != state.Info.SessionId)
+                        {
+                            Debug($"[RECONNECT] Session ID changed on resume: '{state.Info.SessionId}' → '{actualId}' for '{sessionName}'");
+                            CopyEventsToNewSession(state.Info.SessionId, actualId);
+                            state.Info.SessionId = actualId;
+                            FlushSaveActiveSessionsToDisk();
                         }
                     }
                     // CRITICAL: Mark the old state as orphaned FIRST — any already-queued
