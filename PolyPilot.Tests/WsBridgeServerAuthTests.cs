@@ -258,7 +258,7 @@ public class WsBridgeServerAuthTests
     {
         // Verifies that the HTTP probe endpoint requires auth even from loopback when a token is set
         var port = GetFreePort();
-        using var server = new WsBridgeServer();
+        using var server = new WsBridgeServer { LocalhostOnly = true };
         server.AccessToken = "some-secret-token";
         server.Start(port, 0);
         await Task.Delay(100);
