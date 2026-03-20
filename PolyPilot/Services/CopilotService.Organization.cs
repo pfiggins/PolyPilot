@@ -2942,6 +2942,25 @@ public partial class CopilotService
                 }
             }
         }
+        else if (repoId != null && strategy == WorktreeStrategy.SelectiveIsolated)
+        {
+            for (int i = 0; i < preset.WorkerModels.Length; i++)
+            {
+                var needsWorktree = preset.WorkerUseWorktree != null && i < preset.WorkerUseWorktree.Length && preset.WorkerUseWorktree[i];
+                if (!needsWorktree) continue;
+                try
+                {
+                    var wt = await CreateWorktreeLocalOrRemoteAsync(repoId, $"{branchPrefix}-worker-{i + 1}-{Guid.NewGuid().ToString()[..4]}", ct);
+                    workerWorkDirs[i] = wt.Path;
+                    workerWtIds[i] = wt.Id;
+                    group.CreatedWorktreeIds.Add(wt.Id);
+                }
+                catch (Exception ex)
+                {
+                    Debug($"Failed to create worker-{i + 1} worktree (falling back to shared): {ex.Message}");
+                }
+            }
+        }
         else if (repoId != null && strategy == WorktreeStrategy.OrchestratorIsolated)
         {
             try
@@ -3391,12 +3410,16 @@ public partial class CopilotService
 
                 // Check if evaluator says complete
                 var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+                var anyWorkerDispatched = dispatchedWorkers.Count > 0;
                 // Workers mentioned by name in the orchestrator's synthesis are "accounted for"
                 var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
                     attemptedWorkers.Contains(w) ||
                     synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+                // Accept completion when the orchestrator signals done and at least one worker
+                // produced results. Teams with specialist workers (reviewer, architect, debugger)
+                // often only need a subset for any given request — don't force-dispatch to all.
                 if ((evalResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase) || score >= 0.9)
-                    && (allWorkersDispatched || allWorkersAccountedFor))
+                    && (allWorkersDispatched || allWorkersAccountedFor || anyWorkerDispatched))
                 {
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
@@ -3407,7 +3430,7 @@ public partial class CopilotService
                     break;
                 }
 
-                if (!allWorkersDispatched && !allWorkersAccountedFor)
+                if (!allWorkersDispatched && !allWorkersAccountedFor && !anyWorkerDispatched)
                 {
                     var missing = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
                     var failedButAttempted = missing.Where(w => attemptedWorkers.Contains(w)).ToList();
@@ -3434,13 +3457,17 @@ public partial class CopilotService
 
                 // Check completion sentinel
                 var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+                var anyWorkerDispatched = dispatchedWorkers.Count > 0;
                 // Workers explicitly mentioned by name in the synthesis are "accounted for"
                 // even if never dispatched — the orchestrator is signaling awareness (e.g., "no work needed")
                 var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
                     attemptedWorkers.Contains(w) ||
                     synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+                // Accept completion when at least one worker produced results.
+                // Don't force-dispatch to specialist workers (reviewer, architect, debugger)
+                // that the orchestrator intentionally skipped for this request.
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && (allWorkersDispatched || allWorkersAccountedFor))
+                    && (allWorkersDispatched || allWorkersAccountedFor || anyWorkerDispatched))
                 {
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
@@ -3452,9 +3479,10 @@ public partial class CopilotService
                 }
 
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && !allWorkersAccountedFor)
+                    && !anyWorkerDispatched)
                 {
-                    // Override premature completion — not all workers have participated or been addressed
+                    // Override only when zero workers were dispatched — the orchestrator
+                    // tried to complete without doing any work at all.
                     var missing = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
                     var failedButAttempted = missing.Where(w => attemptedWorkers.Contains(w)).ToList();
                     var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w))
@@ -3961,10 +3989,13 @@ public partial class CopilotService
                 }
                 var workerModel = preset.WorkerModels[i];
 
-                // Create worktree for new worker if strategy is FullyIsolated
+                // Create worktree for new worker if strategy requires it
                 string? workerWtId = null;
                 string? workerWorkDir = orchWorkDir;
-                if (repoId != null && group.WorktreeStrategy == WorktreeStrategy.FullyIsolated)
+                var needsWorktree = group.WorktreeStrategy == WorktreeStrategy.FullyIsolated
+                    || (group.WorktreeStrategy == WorktreeStrategy.SelectiveIsolated
+                        && preset.WorkerUseWorktree != null && i < preset.WorkerUseWorktree.Length && preset.WorkerUseWorktree[i]);
+                if (repoId != null && needsWorktree)
                 {
                     try
                     {

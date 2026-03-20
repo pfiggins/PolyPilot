@@ -191,6 +191,14 @@ public record GroupPreset(string Name, string Description, string Emoji, MultiAg
     /// </summary>
     public string?[]? WorkerDisplayNames { get; init; }
 
+    /// <summary>
+    /// Per-worker worktree flags, indexed to match WorkerModels.
+    /// true = this worker gets its own isolated worktree.
+    /// false/null = this worker shares the orchestrator's worktree.
+    /// Used with SelectiveIsolated strategy. Null array = all workers follow the group strategy.
+    /// </summary>
+    public bool[]? WorkerUseWorktree { get; init; }
+
     private const string WorkerReviewPrompt = """
         You are a PR reviewer. When assigned a PR, follow this process:
 

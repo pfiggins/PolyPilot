@@ -204,7 +204,10 @@ public enum WorktreeStrategy
     /// <summary>Orchestrator gets its own worktree; all workers share a separate one.</summary>
     OrchestratorIsolated,
     /// <summary>Every session (orchestrator + each worker) gets its own worktree.</summary>
-    FullyIsolated
+    FullyIsolated,
+    /// <summary>Only workers flagged in GroupPreset.WorkerUseWorktree get their own worktree;
+    /// others share the orchestrator's worktree.</summary>
+    SelectiveIsolated
 }
 
 /// <summary>Role of a session within a multi-agent group.</summary>

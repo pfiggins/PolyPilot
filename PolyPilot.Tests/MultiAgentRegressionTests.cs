@@ -2625,27 +2625,52 @@ public class MultiAgentRegressionTests
     }
 
     [Fact]
-    public void ReflectCompletion_WorkerNotMentionedInSynthesis_OverrideStillFires()
+    public void ReflectCompletion_WorkerNotMentionedButSomeDispatched_CompletionAccepted()
     {
         var workerNames = new List<string> { "Team-worker-1", "Team-worker-2", "Team-worker-3" };
         var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
         var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
 
-        // Synthesis does NOT mention worker-2 or worker-3
+        // Synthesis does NOT mention worker-2 or worker-3 but worker-1 was dispatched
         var synthesisResponse = "Task done. [[GROUP_REFLECT_COMPLETE]]";
 
         var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
-        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
-        var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+        var allWorkersAccountedFor = workerNames.All(w =>
             attemptedWorkers.Contains(w) ||
             synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+        var anyWorkerDispatched = dispatchedWorkers.Count > 0;
 
-        Assert.False(allWorkersAccountedFor, "worker-2 and worker-3 are not mentioned — override should fire");
+        Assert.False(allWorkersAccountedFor, "worker-2 and worker-3 are not mentioned");
+        Assert.True(anyWorkerDispatched, "worker-1 was dispatched — completion should be accepted");
 
-        // The override should still trigger
+        // Completion should be accepted because at least one worker produced results
         Assert.True(
             synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-            && !allWorkersAccountedFor);
+            && (allWorkersDispatched || allWorkersAccountedFor || anyWorkerDispatched));
+    }
+
+    [Fact]
+    public void ReflectCompletion_ZeroWorkersDispatched_OverrideFires()
+    {
+        var workerNames = new List<string> { "Team-worker-1", "Team-worker-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Orchestrator tried to complete without dispatching anything
+        var synthesisResponse = "Nothing to do. [[GROUP_REFLECT_COMPLETE]]";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAccountedFor = workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+        var anyWorkerDispatched = dispatchedWorkers.Count > 0;
+
+        Assert.False(anyWorkerDispatched, "no workers dispatched — override should fire");
+
+        // Override should trigger because zero workers were dispatched
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && !anyWorkerDispatched);
     }
 
     [Fact]
