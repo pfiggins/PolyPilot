@@ -1852,6 +1852,18 @@ public partial class CopilotService
             orchPlanning.EarlyDispatchOnWorkerBlocks = true;
         var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
 
+        // Early dispatch may return a truncated response — wait for idle and re-read full response
+        await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
+        if (_sessions.TryGetValue(orchestratorName, out var orchPostPlanning))
+        {
+            var lastMsg = orchPostPlanning.Info.History.LastOrDefault(m => m.Role == "assistant");
+            if (lastMsg != null && lastMsg.Content.Length > planResponse.Length)
+            {
+                Debug($"[DISPATCH] Post-idle response is longer than early dispatch response ({lastMsg.Content.Length} vs {planResponse.Length}) — using full response");
+                planResponse = lastMsg.Content;
+            }
+        }
+
         // Phase 2: Parse task assignments from orchestrator response.
         // If the orchestrator assigns fewer workers than available, respect that decision —
         // not every request needs all workers (e.g., "post a comment on PR #341" only needs
@@ -3763,6 +3775,21 @@ public partial class CopilotService
                 orchState.EarlyDispatchOnWorkerBlocks = true;
 
             var planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+
+            // Early dispatch may have resolved the TCS mid-turn with a partial response.
+            // Wait for the orchestrator to finish all tool rounds, then re-read from history
+            // to capture any @worker blocks emitted after the early dispatch point.
+            await WaitForSessionIdleAsync(orchestratorName, ct);
+            if (_sessions.TryGetValue(orchestratorName, out var orchPostIdle))
+            {
+                var lastMsg = orchPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
+                if (lastMsg != null && lastMsg.Content.Length > planResponse.Length)
+                {
+                    Debug($"[DISPATCH] Post-idle response is longer than early dispatch response ({lastMsg.Content.Length} vs {planResponse.Length}) — using full response");
+                    planResponse = lastMsg.Content;
+                }
+            }
+
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
             var assignments = DeduplicateAssignments(rawAssignments);
