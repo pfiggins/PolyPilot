@@ -981,8 +981,11 @@ public partial class CopilotService
                 // Build the full response the same way CompleteResponse does
                 var remaining = state.CurrentResponse.ToString();
                 var fullResponse = string.IsNullOrEmpty(remaining) ? flushed : flushed + "\n\n" + remaining;
-                state.FlushedResponse.Clear();
-                state.CurrentResponse.Clear();
+                // Do NOT clear FlushedResponse/CurrentResponse — the orchestrator may emit
+                // more @worker blocks in subsequent tool rounds. Clearing would lose them
+                // and CompleteResponse would write incomplete content to history.
+                // FlushedResponse keeps accumulating; CompleteResponse uses it for the
+                // history message (TCS TrySetResult is a no-op since we already resolved it).
                 state.ResponseCompletion.TrySetResult(fullResponse);
             }
         }
