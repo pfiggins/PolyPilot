@@ -296,16 +296,22 @@
         return count;
     }
 
-    // Sections that contain dynamic/novel content — shown expanded
-    private static readonly HashSet<string> DynamicSectionPrefixes = new(StringComparer.OrdinalIgnoreCase)
+    // Known orchestrator top-level section headers and whether they are dynamic (expanded)
+    // or boilerplate (collapsed). Only these headers trigger section splits — unknown ## headers
+    // within worker output or other content stay inside their parent section.
+    private static readonly Dictionary<string, bool> OrchestratorSectionMap = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Worker Results",
-        "Previous Iteration Feedback",
-        "Previous Iteration Evaluation",
-        "User Request",
-        "Original Request",
-        "Your Task",
-        "Evaluation Check",
+        // Dynamic sections — shown expanded (novel per-message content)
+        { "Worker Results", true },
+        { "Previous Iteration Feedback", true },
+        { "Previous Iteration Evaluation", true },
+        { "Your Task", true },
+        { "Evaluation Check", true },
+        // Boilerplate sections — collapsed (repetitive orchestrator scaffolding)
+        { "Work Routing", false },
+        { "Instructions", false },
+        { "Original Request", false },
+        { "User Request", false },
     };
 
     // Section headers characteristic of orchestrator-generated prompts.
@@ -325,6 +331,17 @@
     };
 
     /// <summary>
+    /// Returns true if the header matches a known orchestrator section.
+    /// </summary>
+    private static bool IsKnownOrchestratorHeader(string headerText)
+    {
+        foreach (var key in OrchestratorSectionMap.Keys)
+            if (headerText.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    /// <summary>
     /// Detects if content is an orchestrator prompt (synthesis, replan, etc.)
     /// by looking for characteristic section headers or orchestrator markers.
     /// A single marker match is enough — these strings never appear in normal user messages.
@@ -341,12 +358,14 @@
     /// Renders an orchestrator prompt with section-aware collapsing.
     /// Dynamic sections (Worker Results, Feedback) are shown expanded;
     /// boilerplate sections (Instructions, Work Routing, etc.) are collapsed.
+    /// Only known orchestrator headers trigger section splits — unknown ## headers
+    /// (e.g., from worker output) stay within their parent section.
     /// </summary>
     internal static string RenderOrchestratorPromptSections(string content)
     {
         if (string.IsNullOrEmpty(content)) return "";
 
-        // Split content into sections by ## headers
+        // Split content into sections by known orchestrator ## headers only
         var sections = new List<(string? header, string body)>();
         var lines = content.Split('\n');
         string? currentHeader = null;
@@ -358,16 +377,18 @@
             var trimmed = line.TrimStart();
             if (trimmed.StartsWith("## "))
             {
-                hasAnySections = true;
-                if (currentHeader != null || currentBody.Length > 0)
-                    sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
-                currentHeader = trimmed.Substring(3).Trim();
-                currentBody.Clear();
+                var headerText = trimmed.Substring(3).Trim();
+                if (IsKnownOrchestratorHeader(headerText))
+                {
+                    hasAnySections = true;
+                    if (currentHeader != null || currentBody.Length > 0)
+                        sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
+                    currentHeader = headerText;
+                    currentBody.Clear();
+                    continue;
+                }
             }
-            else
-            {
-                currentBody.AppendLine(line);
-            }
+            currentBody.AppendLine(line);
         }
         if (currentHeader != null || currentBody.Length > 0)
             sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
@@ -420,8 +441,17 @@
             if (string.IsNullOrEmpty(header) && string.IsNullOrWhiteSpace(body))
                 continue;
 
-            bool isDynamic = header != null &&
-                DynamicSectionPrefixes.Any(p => header.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+            // Preamble (null header) is always boilerplate. Known headers use the map.
+            // Unknown headers (shouldn't happen with the new splitter) default to dynamic.
+            bool isDynamic;
+            if (header == null)
+                isDynamic = false;
+            else
+            {
+                var matchingKey = OrchestratorSectionMap.Keys
+                    .FirstOrDefault(k => header.StartsWith(k, StringComparison.OrdinalIgnoreCase));
+                isDynamic = matchingKey != null ? OrchestratorSectionMap[matchingKey] : true;
+            }
 
             if (isDynamic)
             {
