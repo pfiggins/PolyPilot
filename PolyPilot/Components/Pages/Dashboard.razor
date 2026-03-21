@@ -1420,16 +1420,12 @@
 
     private void HandleReasoningReceived(string sessionName, string reasoningId, string content)
     {
-        if (!string.IsNullOrEmpty(sessionName) && !string.IsNullOrEmpty(content))
-            _needsScrollToBottom = true;
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
     }
 
     private void HandleReasoningComplete(string sessionName, string reasoningId)
     {
-        if (!string.IsNullOrEmpty(sessionName) && !string.IsNullOrEmpty(reasoningId))
-            _needsScrollToBottom = true;
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
     }
@@ -1653,9 +1649,10 @@
         streamingBySession.Remove(sessionName);
         activityBySession.Remove(sessionName);
 
-        // Force scroll to bottom immediately after sending
+        // Force scroll to bottom immediately after sending and reset scroll tracking
         await JS.InvokeVoidAsync("eval", @"
             document.querySelectorAll('.card-messages, .messages').forEach(function(el) {
+                el.__userScrolledAway = false;
                 el.scrollTop = el.scrollHeight;
             });
             setTimeout(function() {
