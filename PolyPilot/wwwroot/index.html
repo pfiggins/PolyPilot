@@ -642,26 +642,33 @@
             window.ensureFiestaMentionAutocomplete();
             window.ensureSlashCommandAutocomplete();
             function doScroll() {
-                // Expanded chat: auto-follow with near-bottom tracking
+                // Expanded chat: only auto-scroll if the user is already at the bottom
+                // or explicitly forced (e.g., session switch, user sent a message).
+                // A scroll event listener tracks whether the user has scrolled away.
                 document.querySelectorAll('.messages').forEach(function(el) {
                     if (!el.__scrollInit) {
                         el.__scrollInit = true;
-                        el.__wasAtBottom = true;
+                        el.__userScrolledAway = false;
                         el.scrollTop = el.scrollHeight;
+                        // Track user scroll to detect when they scroll away from the bottom
+                        el.addEventListener('scroll', function() {
+                            var threshold = 150;
+                            var distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+                            if (distFromBottom < threshold) {
+                                // User scrolled back to the bottom — re-enable auto-scroll
+                                el.__userScrolledAway = false;
+                            } else if (distFromBottom > threshold) {
+                                // User scrolled away — stop auto-scrolling
+                                el.__userScrolledAway = true;
+                            }
+                        });
                         return;
                     }
-                    var threshold = 300;
-                    var distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-                    var isNearBottom = distFromBottom < threshold;
                     
-                    if (isNearBottom) {
-                        el.__wasAtBottom = true;
-                    }
-                    if (distFromBottom > 500) {
-                        el.__wasAtBottom = false;
-                    }
-                    
-                    if (forceScroll || isNearBottom || el.__wasAtBottom) {
+                    if (forceScroll) {
+                        el.__userScrolledAway = false;
+                        el.scrollTop = el.scrollHeight;
+                    } else if (!el.__userScrolledAway) {
                         el.scrollTop = el.scrollHeight;
                     }
                 });
