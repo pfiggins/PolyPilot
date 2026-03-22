@@ -356,12 +356,14 @@
 
     /// <summary>
     /// Renders an orchestrator prompt with section-aware collapsing.
-    /// Dynamic sections (Worker Results, Feedback) are shown expanded;
+    /// Dynamic sections (Worker Results) are collapsible but start open;
     /// boilerplate sections (Instructions, Work Routing, etc.) are collapsed.
     /// Only known orchestrator headers trigger section splits — unknown ## headers
     /// (e.g., from worker output) stay within their parent section.
+    /// When originalContent is provided, it's shown as a brief user prompt label
+    /// instead of rendering the full original prompt text uncollapsed.
     /// </summary>
-    internal static string RenderOrchestratorPromptSections(string content)
+    internal static string RenderOrchestratorPromptSections(string content, string? originalContent = null)
     {
         if (string.IsNullOrEmpty(content)) return "";
 
@@ -396,14 +398,31 @@
         // If no ## sections found, fall back to a single collapsed panel
         if (!hasAnySections)
         {
-            return "<details class=\"orchestration-prompt-details\">" +
-                "<summary>Full orchestration prompt</summary>" +
-                "<div class=\"orchestration-prompt-content\">" +
-                System.Net.WebUtility.HtmlEncode(content).Replace("\n", "<br/>") +
-                "</div></details>";
+            var fallback = new System.Text.StringBuilder();
+            if (!string.IsNullOrEmpty(originalContent))
+            {
+                fallback.Append("<div class=\"chat-msg-text\">");
+                fallback.Append(FormatUserMessage(originalContent));
+                fallback.Append("</div>");
+            }
+            fallback.Append("<details class=\"orchestration-prompt-details\">");
+            fallback.Append("<summary>Full orchestration prompt</summary>");
+            fallback.Append("<div class=\"orchestration-prompt-content\">");
+            fallback.Append(System.Net.WebUtility.HtmlEncode(content).Replace("\n", "<br/>"));
+            fallback.Append("</div></details>");
+            return fallback.ToString();
         }
 
         var sb = new System.Text.StringBuilder();
+
+        // Show the original user prompt as a short label at the top
+        if (!string.IsNullOrEmpty(originalContent))
+        {
+            sb.Append("<div class=\"chat-msg-text\">");
+            sb.Append(FormatUserMessage(originalContent));
+            sb.Append("</div>");
+        }
+
         // Group consecutive boilerplate sections into a single collapsible panel
         var boilerplateBuffer = new List<(string label, string body)>();
 
@@ -420,7 +439,6 @@
             }
             else
             {
-                var labels = string.Join(", ", boilerplateBuffer.Select(b => b.label));
                 sb.Append("<details class=\"orchestration-prompt-details\">");
                 sb.Append($"<summary>Orchestration context ({boilerplateBuffer.Count} sections)</summary>");
                 sb.Append("<div class=\"orchestration-prompt-content\">");
@@ -456,10 +474,12 @@
             if (isDynamic)
             {
                 FlushBoilerplate();
-                sb.Append("<div class=\"orchestrator-dynamic-section\">");
-                sb.Append($"<div class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</div>");
+                // Dynamic sections are collapsible but start open
+                sb.Append("<details class=\"orchestrator-dynamic-details\" open>");
+                sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</summary>");
+                sb.Append("<div class=\"orchestrator-dynamic-content\">");
                 sb.Append(MarkdownRenderer.ToHtml(body));
-                sb.Append("</div>");
+                sb.Append("</div></details>");
             }
             else
             {
