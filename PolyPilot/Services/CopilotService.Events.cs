@@ -2484,6 +2484,7 @@ public partial class CopilotService
                         try { FlushCurrentResponse(state); }
                         catch (Exception flushEx) { Debug($"[WATCHDOG] '{sessionName}' flush failed during kill: {flushEx.Message}"); }
                         Debug($"[WATCHDOG] '{sessionName}' IsProcessing=false — watchdog timeout after {totalProcessingSeconds:F0}s total, elapsed={elapsed:F0}s, exceededMaxTime={exceededMaxTime}");
+                        state.WatchdogKilledThisTurn = true;
                         state.Info.IsProcessing = false;
                         Interlocked.Exchange(ref state.SendingFlag, 0);
                         if (state.Info.ProcessingStartedAt is { } wdStarted)
