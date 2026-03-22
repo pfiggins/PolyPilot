@@ -651,6 +651,12 @@ public partial class CopilotService : IAsyncDisposable
         /// for reconnected sends so a dead event stream (CLI event writer broken after re-resume)
         /// is detected in ~30s rather than waiting the full 120s.</summary>
         public volatile bool IsReconnectedSend;
+
+        /// <summary>Set to true when the watchdog kills this session's processing turn.
+        /// Cleared on the next SendPromptAsync call. The orchestrator reflect loop uses this
+        /// to distinguish "watchdog-killed truncated response" from "orchestrator refused to delegate"
+        /// — the former should retry the planning prompt, not send a nudge.</summary>
+        public volatile bool WatchdogKilledThisTurn;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)
@@ -3248,6 +3254,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Snapshot events.jsonl size so the watchdog can detect "dead sends" —
         // messages the SDK accepts but never writes any events for.
         state.WatchdogAbortAttempted = false;
+        state.WatchdogKilledThisTurn = false;
         try
         {
             var sid = state.Info.SessionId;
@@ -3796,6 +3803,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // (Case D) works correctly after reconnect. The stale snapshot from the
                     // failed primary send is no longer valid.
                     state.WatchdogAbortAttempted = false;
+                    state.WatchdogKilledThisTurn = false;
                     try
                     {
                         var sid = state.Info.SessionId;
