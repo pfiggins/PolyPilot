@@ -212,6 +212,36 @@
     margin: 0.2rem 0;
 }
 
+/* Collapsible dynamic sections (e.g., Worker Results) — starts open */
+::deep .orchestrator-dynamic-details {
+    margin: 0.5rem 0;
+    background: rgba(0, 150, 255, 0.06);
+    border: 1px solid rgba(0, 150, 255, 0.15);
+    border-radius: 6px;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+::deep .orchestrator-dynamic-details > summary.orchestrator-section-header {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.5rem 0.75rem;
+    color: rgba(255, 255, 255, 0.85);
+    user-select: none;
+}
+
+::deep .orchestrator-dynamic-details > summary.orchestrator-section-header:hover {
+    color: rgba(255, 255, 255, 1);
+}
+
+::deep .orchestrator-dynamic-details .orchestrator-dynamic-content {
+    padding: 0 0.75rem 0.5rem;
+}
+
+::deep .orchestrator-dynamic-details p {
+    margin: 0.2rem 0;
+}
+
 .chat-message-list.full ::deep .chat-msg.assistant .chat-msg-content {
     background: rgba(0, 195, 91, 0.06);
     border: 1px solid rgba(0, 195, 91, 0.12);

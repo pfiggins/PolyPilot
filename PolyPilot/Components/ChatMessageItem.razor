@@ -27,8 +27,7 @@
                 }
                 @if (!string.IsNullOrEmpty(Message.OriginalContent))
                 {
-                    <div class="chat-msg-text">@((MarkupString)ChatMessageList.FormatUserMessage(Message.OriginalContent))</div>
-                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content))
+                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content, Message.OriginalContent))
                 }
                 else if (ChatMessageList.IsOrchestratorPrompt(Message.Content))
                 {
