@@ -1491,6 +1491,31 @@ public partial class CopilotService
 
         if (iterAssignments.Count == 0)
         {
+            // Check if the response was truncated by a watchdog kill (connection death).
+            // Retry the full planning prompt first — nudge loses context after reconnect.
+            var wasWatchdogKilled = _sessions.TryGetValue(orchestratorName, out var wdState) && wdState.WatchdogKilledThisTurn;
+            if (wasWatchdogKilled)
+            {
+                Debug($"[DISPATCH] No assignments but response was watchdog-killed ({planResponse.Length} chars) — retrying full planning prompt");
+                AddOrchestratorSystemMessage(orchestratorName,
+                    "⚠️ Orchestrator response was interrupted (connection timeout). Retrying planning...");
+                if (_sessions.TryGetValue(orchestratorName, out var retryState))
+                    retryState.EarlyDispatchOnWorkerBlocks = true;
+                var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+                await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
+                if (_sessions.TryGetValue(orchestratorName, out var retryPostIdle))
+                {
+                    var lastRetryMsg = retryPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
+                    if (lastRetryMsg != null && lastRetryMsg.Content.Length > retryResponse.Length)
+                        retryResponse = lastRetryMsg.Content;
+                }
+                iterAssignments = DeduplicateAssignments(ParseTaskAssignments(retryResponse, workerNames), dispatchedWorkers);
+                Debug($"[DISPATCH] Watchdog-retry parsed: {iterAssignments.Count} assignments. Response length={retryResponse.Length}");
+            }
+        }
+
+        if (iterAssignments.Count == 0)
+        {
             // First pass produced nothing — send a single nudge (format failure recovery)
             Debug($"[DISPATCH] No assignments parsed. Sending delegation nudge.");
             var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
@@ -3296,33 +3321,71 @@ public partial class CopilotService
             {
                 if (reflectState.CurrentIteration == 1)
                 {
-                    // First iteration with no assignments = orchestrator failed to delegate.
-                    // Send a stronger nudge prompt instead of repeating the same planning prompt.
-                    Debug($"[DISPATCH] Reflect iteration 1: no assignments, sending delegation nudge");
-                    AddOrchestratorSystemMessage(orchestratorName,
-                        "⚠️ No @worker assignments parsed from orchestrator response. Retrying...");
-                    var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
-                    // Re-enable early dispatch for the nudge attempt too
-                    if (_sessions.TryGetValue(orchestratorName, out var nudgeState))
-                        nudgeState.EarlyDispatchOnWorkerBlocks = true;
-                    var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt);
-                    var nudgeAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
-                    Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {nudgeAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
-                    if (nudgeAssignments.Count > 0)
+                    // Check if the response was truncated by a watchdog kill (connection death).
+                    // In that case, the orchestrator never got to write @worker blocks — retrying
+                    // the full planning prompt is better than a nudge (which loses context and
+                    // tends to dispatch ALL workers indiscriminately).
+                    var wasWatchdogKilled = _sessions.TryGetValue(orchestratorName, out var wdState) && wdState.WatchdogKilledThisTurn;
+                    if (wasWatchdogKilled)
                     {
-                        assignments = DeduplicateAssignments(nudgeAssignments);
-                        // Fall through to dispatch below
-                    }
-                    else
-                    {
-                        // Nudge also failed — the orchestrator refuses to delegate (likely due to
-                        // stale history from a previous run). Force delegation by creating synthetic
-                        // @worker blocks that assign the original prompt to each worker.
-                        Debug($"[DISPATCH] Nudge failed, forcing delegation to all {workerNames.Count} workers");
+                        Debug($"[DISPATCH] Reflect iteration 1: no assignments but response was watchdog-killed ({planResponse.Length} chars) — retrying full planning prompt instead of nudge");
                         AddOrchestratorSystemMessage(orchestratorName,
-                            $"⚡ Orchestrator refused to delegate after nudge. Forcing dispatch to all {workerNames.Count} workers.");
-                        assignments = workerNames.Select(w => new TaskAssignment(w, prompt)).ToList();
-                        // Fall through to dispatch below
+                            "⚠️ Orchestrator response was interrupted (connection timeout). Retrying planning...");
+                        // Re-enable early dispatch for the retry
+                        if (_sessions.TryGetValue(orchestratorName, out var retryState))
+                            retryState.EarlyDispatchOnWorkerBlocks = true;
+                        var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                        // Post-idle re-read for the retry too
+                        await WaitForSessionIdleAsync(orchestratorName, ct);
+                        if (_sessions.TryGetValue(orchestratorName, out var retryPostIdle))
+                        {
+                            var lastRetryMsg = retryPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
+                            if (lastRetryMsg != null && lastRetryMsg.Content.Length > retryResponse.Length)
+                            {
+                                Debug($"[DISPATCH] Retry post-idle response is longer ({lastRetryMsg.Content.Length} vs {retryResponse.Length}) — using full response");
+                                retryResponse = lastRetryMsg.Content;
+                            }
+                        }
+                        var retryAssignments = ParseTaskAssignments(retryResponse, workerNames);
+                        Debug($"[DISPATCH] '{orchestratorName}' watchdog-retry parsed: {retryAssignments.Count} raw assignments. Response length={retryResponse.Length}");
+                        if (retryAssignments.Count > 0)
+                        {
+                            assignments = DeduplicateAssignments(retryAssignments);
+                            planResponse = retryResponse;
+                        }
+                        // If retry also yields 0, fall through to nudge below
+                    }
+
+                    if (assignments.Count == 0)
+                    {
+                        // First iteration with no assignments = orchestrator failed to delegate.
+                        // Send a stronger nudge prompt instead of repeating the same planning prompt.
+                        Debug($"[DISPATCH] Reflect iteration 1: no assignments, sending delegation nudge");
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            "⚠️ No @worker assignments parsed from orchestrator response. Retrying...");
+                        var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
+                        // Re-enable early dispatch for the nudge attempt too
+                        if (_sessions.TryGetValue(orchestratorName, out var nudgeState))
+                            nudgeState.EarlyDispatchOnWorkerBlocks = true;
+                        var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt);
+                        var nudgeAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
+                        Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {nudgeAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
+                        if (nudgeAssignments.Count > 0)
+                        {
+                            assignments = DeduplicateAssignments(nudgeAssignments);
+                            // Fall through to dispatch below
+                        }
+                        else
+                        {
+                            // Nudge also failed — the orchestrator refuses to delegate (likely due to
+                            // stale history from a previous run). Force delegation by creating synthetic
+                            // @worker blocks that assign the original prompt to each worker.
+                            Debug($"[DISPATCH] Nudge failed, forcing delegation to all {workerNames.Count} workers");
+                            AddOrchestratorSystemMessage(orchestratorName,
+                                $"⚡ Orchestrator refused to delegate after nudge. Forcing dispatch to all {workerNames.Count} workers.");
+                            assignments = workerNames.Select(w => new TaskAssignment(w, prompt)).ToList();
+                            // Fall through to dispatch below
+                        }
                     }
                 }
                 else

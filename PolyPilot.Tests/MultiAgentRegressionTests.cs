@@ -2759,4 +2759,125 @@ public class MultiAgentRegressionTests
     }
 
     #endregion
+
+    #region Watchdog-Kill Retry — Avoid Nudge-to-All-Workers Tests
+
+    /// <summary>
+    /// When the orchestrator's response is truncated by a watchdog kill (connection death),
+    /// the reflect loop should retry the full planning prompt instead of sending a nudge.
+    /// Nudges after reconnect lose context and dispatch ALL workers indiscriminately.
+    /// Regression test for the March 22 dispatch failure where watchdog-killed response
+    /// (1065 chars, 0 @worker blocks) triggered a nudge → 5/5 workers dispatched.
+    /// </summary>
+    [Fact]
+    public void WatchdogKilledResponse_ShouldRetryPlanBeforeNudge_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath), $"Organization.cs not found at {orgPath}");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the reflect iteration 1 zero-assignment handling
+        var reflectIter1Idx = source.IndexOf("reflectState.CurrentIteration == 1");
+        Assert.True(reflectIter1Idx >= 0, "Must have reflectState.CurrentIteration == 1 check");
+
+        // The watchdog-kill check must appear BEFORE the nudge in the reflect path
+        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", reflectIter1Idx);
+        Assert.True(watchdogCheckIdx >= 0,
+            "Reflect loop must check WatchdogKilledThisTurn before falling through to nudge");
+
+        var nudgeIdx = source.IndexOf("delegation nudge", reflectIter1Idx);
+        Assert.True(nudgeIdx >= 0, "Must still have nudge path as fallback");
+
+        Assert.True(watchdogCheckIdx < nudgeIdx,
+            "WatchdogKilledThisTurn check must appear BEFORE the nudge path — " +
+            "a watchdog-killed response should retry the planning prompt first, not nudge");
+    }
+
+    /// <summary>
+    /// The WatchdogKilledThisTurn flag must be set in the watchdog kill path
+    /// and cleared in SendPromptAsync, so it's available for the reflect loop
+    /// to detect truncated responses.
+    /// </summary>
+    [Fact]
+    public void WatchdogKilledFlag_SetInWatchdog_ClearedInSendPrompt_Structural()
+    {
+        // Check Events.cs sets the flag in watchdog kill
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var eventsSource = File.ReadAllText(eventsPath);
+
+        // The watchdog kill path sets the flag
+        var watchdogSetIdx = eventsSource.IndexOf("WatchdogKilledThisTurn = true");
+        Assert.True(watchdogSetIdx >= 0,
+            "Watchdog kill path must set WatchdogKilledThisTurn = true");
+
+        // Verify it's near the IsProcessing=false in watchdog
+        var isProcessingFalseIdx = eventsSource.IndexOf("state.Info.IsProcessing = false", watchdogSetIdx - 200);
+        Assert.True(isProcessingFalseIdx >= 0 && Math.Abs(isProcessingFalseIdx - watchdogSetIdx) < 200,
+            "WatchdogKilledThisTurn must be set near IsProcessing=false in watchdog kill");
+
+        // Check CopilotService.cs clears the flag in SendPromptAsync
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var csSource = File.ReadAllText(csPath);
+
+        var clearIdx = csSource.IndexOf("WatchdogKilledThisTurn = false");
+        Assert.True(clearIdx >= 0,
+            "SendPromptAsync must clear WatchdogKilledThisTurn = false before sending");
+    }
+
+    /// <summary>
+    /// The non-reflect orchestrator path should also check WatchdogKilledThisTurn
+    /// before falling back to the nudge mechanism.
+    /// </summary>
+    [Fact]
+    public void NonReflectPath_AlsoChecksWatchdogKill_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath));
+        var source = File.ReadAllText(orgPath);
+
+        // Find the non-reflect "iteration 0" dispatch path
+        var iter0Idx = source.IndexOf("iteration 0:");
+        Assert.True(iter0Idx >= 0, "Must have non-reflect 'iteration 0' path");
+
+        // The watchdog check must appear after iteration 0 and before the nudge
+        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", iter0Idx);
+        Assert.True(watchdogCheckIdx >= 0,
+            "Non-reflect path must also check WatchdogKilledThisTurn");
+
+        var nudgeIdx = source.IndexOf("Sending delegation nudge", iter0Idx);
+        Assert.True(nudgeIdx >= 0);
+        Assert.True(watchdogCheckIdx < nudgeIdx,
+            "Watchdog-kill retry must appear before nudge in the non-reflect orchestrator path");
+    }
+
+    /// <summary>
+    /// SessionState must declare the WatchdogKilledThisTurn field so it's available
+    /// for the watchdog and reflect loop to communicate through.
+    /// </summary>
+    [Fact]
+    public void SessionState_DeclaresWatchdogKilledField()
+    {
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var source = File.ReadAllText(csPath);
+
+        Assert.Contains("WatchdogKilledThisTurn", source);
+        Assert.Contains("volatile bool WatchdogKilledThisTurn", source);
+    }
+
+    #endregion
 }
