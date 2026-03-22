@@ -657,6 +657,11 @@ public partial class CopilotService : IAsyncDisposable
         /// to distinguish "watchdog-killed truncated response" from "orchestrator refused to delegate"
         /// — the former should retry the planning prompt, not send a nudge.</summary>
         public volatile bool WatchdogKilledThisTurn;
+
+        /// <summary>One-shot timer that fires after BackgroundTaskIdleMaxDeferSeconds when IDLE-DEFER
+        /// defers completion due to active background tasks. If no second session.idle arrives (SDK bug),
+        /// this timer force-completes the session to prevent indefinite orchestrator hangs.</summary>
+        public Timer? IdleDeferFallbackTimer;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)

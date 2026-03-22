@@ -2229,6 +2229,7 @@ public partial class CopilotService
         CancelProcessingWatchdog(state);
         CancelTurnEndFallback(state);
         CancelToolHealthCheck(state);
+        CancelIdleDeferFallback(state);
 
         var tcs = new TaskCompletionSource<bool>();
         InvokeOnUI(() =>
