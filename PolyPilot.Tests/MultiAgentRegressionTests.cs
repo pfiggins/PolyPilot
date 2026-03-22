@@ -2865,4 +2865,105 @@ public class MultiAgentRegressionTests
     }
 
     #endregion
+
+    #region IDLE-DEFER Fallback Timer Tests
+
+    /// <summary>
+    /// SessionState must declare the IdleDeferFallbackTimer field so the timer
+    /// can be stored and cancelled across event handler invocations.
+    /// </summary>
+    [Fact]
+    public void SessionState_DeclaresIdleDeferFallbackTimerField()
+    {
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var source = File.ReadAllText(csPath);
+
+        Assert.Contains("IdleDeferFallbackTimer", source);
+    }
+
+    /// <summary>
+    /// StartIdleDeferFallback must be called inside the IDLE-DEFER handler
+    /// so the fallback timer is armed when background tasks prevent completion.
+    /// </summary>
+    [Fact]
+    public void IdleDeferHandler_CallsStartIdleDeferFallback_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        // Find the IDLE-DEFER block and verify StartIdleDeferFallback is called within it
+        var idleDeferIdx = source.IndexOf("[IDLE-DEFER]");
+        Assert.True(idleDeferIdx >= 0, "IDLE-DEFER log tag must exist in Events.cs");
+
+        var startFallbackIdx = source.IndexOf("StartIdleDeferFallback", idleDeferIdx);
+        Assert.True(startFallbackIdx >= 0,
+            "StartIdleDeferFallback must be called after IDLE-DEFER detection");
+    }
+
+    /// <summary>
+    /// CancelIdleDeferFallback must be called in CompleteResponse to prevent
+    /// stale timer from force-completing after normal completion.
+    /// </summary>
+    [Fact]
+    public void CompleteResponse_CancelsIdleDeferFallback_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        // Find CompleteResponse method and verify CancelIdleDeferFallback is called
+        var completeResponseIdx = source.IndexOf("private void CompleteResponse(SessionState state,");
+        Assert.True(completeResponseIdx >= 0, "CompleteResponse method must exist");
+
+        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", completeResponseIdx);
+        Assert.True(cancelIdx >= 0,
+            "CancelIdleDeferFallback must be called inside CompleteResponse");
+    }
+
+    /// <summary>
+    /// CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync
+    /// to prevent stale timer from firing after forced completion.
+    /// </summary>
+    [Fact]
+    public void ForceComplete_CancelsIdleDeferFallback_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+        Assert.True(File.Exists(orgPath));
+        var source = File.ReadAllText(orgPath);
+
+        var forceIdx = source.IndexOf("ForceCompleteProcessingAsync");
+        Assert.True(forceIdx >= 0);
+
+        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", forceIdx);
+        Assert.True(cancelIdx >= 0,
+            "CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync");
+    }
+
+    /// <summary>
+    /// The IDLE-DEFER-TIMEOUT log tag must exist in the fallback timer callback,
+    /// confirming the timer fires with proper diagnostics.
+    /// </summary>
+    [Fact]
+    public void IdleDeferFallbackTimer_LogsTimeoutTag_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        Assert.Contains("[IDLE-DEFER-TIMEOUT]", source);
+    }
+
+    #endregion
 }
