@@ -338,4 +338,213 @@ public class SquadDiscoveryTests
         var result = UserPresets.DeleteRepoPreset(Path.GetTempPath(), "NonExistent-Preset-12345");
         Assert.False(result);
     }
+
+    // --- DiscoverFromPath ---
+
+    [Fact]
+    public void DiscoverFromPath_WorksWithSquadDir()
+    {
+        var squadDir = Path.Combine(SquadSampleDir, ".squad");
+        var presets = SquadDiscovery.DiscoverFromPath(squadDir);
+        Assert.Single(presets);
+        Assert.Equal("The Review Squad", presets[0].Name);
+    }
+
+    [Fact]
+    public void DiscoverFromPath_WorksWithParentDir()
+    {
+        var presets = SquadDiscovery.DiscoverFromPath(SquadSampleDir);
+        Assert.Single(presets);
+        Assert.Equal("The Review Squad", presets[0].Name);
+    }
+
+    [Fact]
+    public void DiscoverFromPath_ReturnsEmpty_WhenPathNotFound()
+    {
+        var presets = SquadDiscovery.DiscoverFromPath(@"C:\nonexistent\path\xyz");
+        Assert.Empty(presets);
+    }
+
+    [Fact]
+    public void DiscoverFromPath_WorksWithAiTeamDir()
+    {
+        var aiTeamDir = Path.Combine(LegacyAiTeamDir, ".ai-team");
+        var presets = SquadDiscovery.DiscoverFromPath(aiTeamDir);
+        Assert.Single(presets);
+        Assert.Equal("Legacy Team", presets[0].Name);
+    }
+}
+
+public class SquadImportExportTests : IDisposable
+{
+    private readonly string _tempDir;
+    private readonly string _presetsDir;
+
+    public SquadImportExportTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "squad-import-" + Guid.NewGuid().ToString("N")[..8]);
+        _presetsDir = Path.Combine(_tempDir, "presets");
+        Directory.CreateDirectory(_presetsDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+
+    [Fact]
+    public void ImportFromSquadFolder_SavesPresetToJson()
+    {
+        var squadRoot = CreateSampleSquad("Import Team", "dev", "You are a developer.");
+
+        var imported = UserPresets.ImportFromSquadFolder(_presetsDir, squadRoot);
+
+        Assert.Single(imported);
+        Assert.Equal("Import Team", imported[0].Name);
+        Assert.True(imported[0].IsUserDefined);
+        Assert.False(imported[0].IsRepoLevel);
+
+        // Verify persisted to presets.json
+        var loaded = UserPresets.Load(_presetsDir);
+        Assert.Single(loaded);
+        Assert.Equal("Import Team", loaded[0].Name);
+    }
+
+    [Fact]
+    public void ImportFromSquadFolder_AcceptsSquadDirPath()
+    {
+        var squadRoot = CreateSampleSquad("Direct Team", "worker", "You are a worker.");
+        var squadDir = Path.Combine(squadRoot, ".squad");
+
+        var imported = UserPresets.ImportFromSquadFolder(_presetsDir, squadDir);
+
+        Assert.Single(imported);
+        Assert.Equal("Direct Team", imported[0].Name);
+    }
+
+    [Fact]
+    public void ImportFromSquadFolder_UpdatesExistingPreset()
+    {
+        var squadRoot = CreateSampleSquad("Update Team", "dev", "Original charter.");
+        UserPresets.ImportFromSquadFolder(_presetsDir, squadRoot);
+
+        // Update the charter and re-import
+        File.WriteAllText(Path.Combine(squadRoot, ".squad", "agents", "dev", "charter.md"), "Updated charter.");
+        var imported = UserPresets.ImportFromSquadFolder(_presetsDir, squadRoot);
+
+        var loaded = UserPresets.Load(_presetsDir);
+        Assert.Single(loaded); // Should replace, not duplicate
+        Assert.Contains("Updated charter", loaded[0].WorkerSystemPrompts![0]);
+    }
+
+    [Fact]
+    public void ImportFromSquadFolder_ReturnsEmpty_WhenNoSquadFound()
+    {
+        var emptyDir = Path.Combine(_tempDir, "empty");
+        Directory.CreateDirectory(emptyDir);
+
+        var imported = UserPresets.ImportFromSquadFolder(_presetsDir, emptyDir);
+        Assert.Empty(imported);
+    }
+
+    [Fact]
+    public void ExportPresetToSquadFolder_CreatesSquadDir()
+    {
+        // Save a user preset first
+        var preset = new GroupPreset("Export Team", "A test team", "🧪",
+            MultiAgentMode.OrchestratorReflect, "claude-opus-4.6",
+            new[] { "claude-sonnet-4.5", "gpt-5" })
+        {
+            IsUserDefined = true,
+            WorkerDisplayNames = new[] { "analyzer", "coder" },
+            WorkerSystemPrompts = new string?[] { "You analyze code.", "You write code." },
+            SharedContext = "Be concise.",
+            RoutingContext = "Route analysis first."
+        };
+        var existing = UserPresets.Load(_presetsDir);
+        existing.Add(preset);
+        UserPresets.Save(_presetsDir, existing);
+
+        var targetDir = Path.Combine(_tempDir, "export-target");
+        var result = UserPresets.ExportPresetToSquadFolder(_presetsDir, "Export Team", targetDir);
+
+        Assert.NotNull(result);
+        Assert.True(Directory.Exists(result));
+        Assert.True(File.Exists(Path.Combine(result, "team.md")));
+        Assert.True(File.Exists(Path.Combine(result, "agents", "analyzer", "charter.md")));
+        Assert.True(File.Exists(Path.Combine(result, "agents", "coder", "charter.md")));
+        Assert.True(File.Exists(Path.Combine(result, "decisions.md")));
+        Assert.True(File.Exists(Path.Combine(result, "routing.md")));
+    }
+
+    [Fact]
+    public void ExportPresetToSquadFolder_ReturnsNull_WhenPresetNotFound()
+    {
+        var targetDir = Path.Combine(_tempDir, "export-missing");
+        var result = UserPresets.ExportPresetToSquadFolder(_presetsDir, "Nonexistent", targetDir);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ExportPresetToSquadFolder_CanExportBuiltIn()
+    {
+        var builtInName = GroupPreset.BuiltIn[0].Name;
+        var targetDir = Path.Combine(_tempDir, "export-builtin");
+
+        var result = UserPresets.ExportPresetToSquadFolder(_presetsDir, builtInName, targetDir);
+
+        Assert.NotNull(result);
+        Assert.True(File.Exists(Path.Combine(result, "team.md")));
+        var teamMd = File.ReadAllText(Path.Combine(result, "team.md"));
+        Assert.Contains(builtInName, teamMd);
+    }
+
+    [Fact]
+    public void RoundTrip_ExportThenImport_PreservesContent()
+    {
+        var preset = new GroupPreset("Roundtrip Team", "Full cycle", "🔄",
+            MultiAgentMode.Orchestrator, "claude-opus-4.6",
+            new[] { "claude-sonnet-4.5" })
+        {
+            IsUserDefined = true,
+            WorkerDisplayNames = new[] { "reviewer" },
+            WorkerSystemPrompts = new string?[] { "You review pull requests carefully." },
+            SharedContext = "Follow OWASP guidelines.",
+            RoutingContext = "All PRs go to reviewer."
+        };
+        var existing = UserPresets.Load(_presetsDir);
+        existing.Add(preset);
+        UserPresets.Save(_presetsDir, existing);
+
+        // Export
+        var exportDir = Path.Combine(_tempDir, "roundtrip-export");
+        var squadDir = UserPresets.ExportPresetToSquadFolder(_presetsDir, "Roundtrip Team", exportDir);
+        Assert.NotNull(squadDir);
+
+        // Import into a fresh presets dir
+        var freshPresetsDir = Path.Combine(_tempDir, "fresh-presets");
+        Directory.CreateDirectory(freshPresetsDir);
+        var imported = UserPresets.ImportFromSquadFolder(freshPresetsDir, exportDir);
+
+        Assert.Single(imported);
+        var result = imported[0];
+        Assert.Equal("Roundtrip Team", result.Name);
+        Assert.Equal(MultiAgentMode.Orchestrator, result.Mode);
+        Assert.Contains("pull requests", result.WorkerSystemPrompts![0]);
+        Assert.Contains("OWASP", result.SharedContext);
+        Assert.Contains("reviewer", result.RoutingContext);
+    }
+
+    private string CreateSampleSquad(string teamName, string agentName, string charter)
+    {
+        var root = Path.Combine(_tempDir, "squad-" + Guid.NewGuid().ToString("N")[..6]);
+        var squadDir = Path.Combine(root, ".squad");
+        var agentDir = Path.Combine(squadDir, "agents", agentName);
+        Directory.CreateDirectory(agentDir);
+        File.WriteAllText(Path.Combine(squadDir, "team.md"),
+            $"# {teamName}\n| Member | Role |\n|---|---|\n| {agentName} | Worker |");
+        File.WriteAllText(Path.Combine(agentDir, "charter.md"), charter);
+        return root;
+    }
 }
