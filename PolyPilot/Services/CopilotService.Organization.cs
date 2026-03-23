@@ -3230,8 +3230,71 @@ public partial class CopilotService
             // response still streaming when workers complete and we try to send synthesis).
             await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
 
-            await SendPromptAsync(pending.OrchestratorName, synthesisPrompt, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
-            Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}'");
+            // Wait for the orchestrator's synthesis response so we can check for @worker blocks.
+            // Previously this was fire-and-forget, which meant the orchestrator could plan more
+            // work but nobody would dispatch it, leaving the group hung.
+            var synthesisResponse = await SendPromptAndWaitAsync(pending.OrchestratorName, synthesisPrompt, ct, originalPrompt: pending.OriginalPrompt);
+            await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
+            Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}' — response len={synthesisResponse.Length}");
+
+            // Check if the orchestrator marked the work as complete
+            if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase))
+            {
+                Debug($"[DISPATCH] Resume synthesis response contains [[GROUP_REFLECT_COMPLETE]] — marking complete");
+                var group2 = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
+                if (group2?.ReflectionState != null)
+                {
+                    group2.ReflectionState.GoalMet = true;
+                    group2.ReflectionState.IsActive = false;
+                    group2.ReflectionState.CompletedAt = DateTime.Now;
+                    AddOrchestratorSystemMessage(pending.OrchestratorName,
+                        $"✅ {group2.ReflectionState.BuildCompletionSummary()}");
+                }
+                ClearPendingOrchestration();
+                SaveOrganization();
+                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+                return;
+            }
+
+            // Check if the orchestrator's response contains @worker blocks indicating more work
+            var workerNames = pending.WorkerNames;
+            var newAssignments = ParseTaskAssignments(synthesisResponse, workerNames);
+
+            if (newAssignments.Count > 0)
+            {
+                Debug($"[DISPATCH] Resume synthesis response contains {newAssignments.Count} @worker assignments — re-entering reflect loop");
+                AddOrchestratorSystemMessage(pending.OrchestratorName,
+                    $"🔄 Orchestrator dispatched {newAssignments.Count} follow-up task(s) — continuing...");
+
+                // Re-enter the full reflect loop for the group
+                var group = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
+                if (group != null && pending.IsReflect && group.ReflectionState != null)
+                {
+                    // Re-activate the reflection state so the loop can continue
+                    group.ReflectionState.IsActive = true;
+                    group.ReflectionState.LastEvaluation = "Resumed after interruption. The orchestrator's last response dispatched new worker tasks. Continue the reflect loop.";
+                    ClearPendingOrchestration();
+
+                    var members = GetMultiAgentGroupMembers(pending.GroupId);
+                    InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Planning, "Resumed"));
+                    await SendViaOrchestratorReflectAsync(pending.GroupId, members, pending.OriginalPrompt, ct);
+                    return; // reflect loop handles completion
+                }
+
+                // Non-reflect fallback: dispatch workers directly and collect results
+                ClearPendingOrchestration();
+                var deduped = DeduplicateAssignments(newAssignments);
+                var followUpTasks = deduped.Select(a => ExecuteWorkerAsync(a.WorkerName, a.Task, pending.OriginalPrompt, ct));
+                var followUpResults = await Task.WhenAll(followUpTasks);
+
+                // Send follow-up results back to orchestrator
+                var followUpSynthesis = BuildSynthesisPrompt(pending.OriginalPrompt, followUpResults.ToList());
+                await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
+                await SendPromptAsync(pending.OrchestratorName, followUpSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
+                Debug($"[DISPATCH] Resume follow-up synthesis sent to '{pending.OrchestratorName}'");
+                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+                return;
+            }
         }
         catch (Exception ex)
         {
