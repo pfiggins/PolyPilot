@@ -1864,6 +1864,49 @@
     background: var(--danger-bg, rgba(248, 81, 73, 0.15));
 }
 
+.preset-action-btn {
+    all: unset;
+    cursor: pointer;
+    font-size: var(--type-footnote);
+    padding: 0.15rem 0.25rem;
+    border-radius: 4px;
+    opacity: 0.4;
+    flex-shrink: 0;
+}
+.preset-action-btn:hover {
+    opacity: 1;
+    background: rgba(0, 150, 255, 0.15);
+}
+
+.preset-import-row {
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.preset-import-btn {
+    all: unset;
+    cursor: pointer;
+    font-size: var(--type-callout);
+    color: var(--text-dim);
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    width: 100%;
+    box-sizing: border-box;
+    text-align: center;
+}
+.preset-import-btn:hover {
+    color: var(--accent-primary);
+    background: rgba(0, 150, 255, 0.08);
+}
+
+.preset-import-message {
+    font-size: var(--type-footnote);
+    color: var(--text-dim);
+    padding: 0.2rem 0.5rem;
+    text-align: center;
+}
+
 .preset-badge {
     font-size: var(--type-footnote);
     flex-shrink: 0;

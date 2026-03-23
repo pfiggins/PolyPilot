@@ -333,11 +333,21 @@ else
                         @foreach (var preset in userPresets)
                         {
                             var p = preset;
-                            <button class="preset-item" @onclick="() => CreateFromPresetForRepo(p, pendingMultiAgentRepo)" title="@p.Description — 🎯 @p.OrchestratorModel · 👷 @string.Join(", ", p.WorkerModels)">
-                                <span class="preset-emoji">@p.Emoji</span>
-                                <span class="preset-name">@p.Name</span>
-                            </button>
+                            <div class="preset-item-row">
+                                <button class="preset-item" @onclick="() => CreateFromPresetForRepo(p, pendingMultiAgentRepo)" title="@p.Description — 🎯 @p.OrchestratorModel · 👷 @string.Join(", ", p.WorkerModels)">
+                                    <span class="preset-emoji">@p.Emoji</span>
+                                    <span class="preset-name">@p.Name</span>
+                                </button>
+                                <button class="preset-action-btn" @onclick="() => ExportPresetToFolder(p)" @onclick:stopPropagation="true" title="Export to .squad folder">📤</button>
+                            </div>
                         }
+                    }
+                    <div class="preset-import-row">
+                        <button class="preset-import-btn" @onclick="ImportPresetFromFolder" title="Import a preset from a .squad folder">📥 Import from .squad</button>
+                    </div>
+                    @if (!string.IsNullOrEmpty(importExportMessage))
+                    {
+                        <div class="preset-import-message">@importExportMessage</div>
                     }
                     @* Ad-hoc creation removed — users must select a preset *@
                 </div>
@@ -736,6 +746,7 @@ else
                                     </div>
                                 }
                                 <button class="save-preset-btn" @onclick="() => PromptSaveAsPreset(maGroupId)" @onclick:stopPropagation="true" title="Save this group as a reusable preset">💾 Save as Preset</button>
+                                <button class="save-preset-btn" @onclick="() => ExportGroupToSquadFolder(maGroupId)" @onclick:stopPropagation="true" title="Export this group to a .squad folder">📤 Export .squad</button>
                                 @if (!string.IsNullOrEmpty(group.SourcePresetName))
                                 {
                                     <button class="save-preset-btn" @onclick="() => RefreshFromPreset(maGroupId)" @onclick:stopPropagation="true" title="Refresh settings from preset '@group.SourcePresetName'">🔄 Refresh from Preset</button>
@@ -1294,6 +1305,7 @@ else
     private bool isCreating = false;
     private string newSessionName = "";
     private string? createError = null;
+    private string? importExportMessage = null;
     private readonly Dictionary<string, string?> _codespaceErrors = new();
     private bool showPersistedSessions = false;
     private bool showExternalSessions = true; // auto-expand when external sessions exist
@@ -2527,6 +2539,99 @@ else
             }
         }
         StateHasChanged();
+    }
+
+    private async Task ImportPresetFromFolder()
+    {
+#if MACCATALYST || WINDOWS
+        try
+        {
+            var dir = await FolderPickerService.PickFolderAsync();
+            if (string.IsNullOrEmpty(dir)) return;
+
+            var imported = CopilotService.ImportPresetFromSquadFolder(dir);
+            if (imported.Count > 0)
+            {
+                importExportMessage = $"📥 Imported: {string.Join(", ", imported.Select(p => p.Name))}";
+            }
+            else
+            {
+                importExportMessage = "⚠️ No .squad team definition found in selected folder.";
+            }
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            importExportMessage = $"❌ Import failed: {ex.Message}";
+            StateHasChanged();
+        }
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+    private async Task ExportPresetToFolder(GroupPreset preset)
+    {
+#if MACCATALYST || WINDOWS
+        try
+        {
+            var dir = await FolderPickerService.PickFolderAsync();
+            if (string.IsNullOrEmpty(dir)) return;
+
+            var result = CopilotService.ExportPresetToSquadFolder(preset.Name, dir);
+            importExportMessage = result != null
+                ? $"📤 Exported \"{preset.Name}\" to {result}"
+                : $"⚠️ Could not export preset \"{preset.Name}\".";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            importExportMessage = $"❌ Export failed: {ex.Message}";
+            StateHasChanged();
+        }
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+    private async Task ExportGroupToSquadFolder(string groupId)
+    {
+#if MACCATALYST || WINDOWS
+        try
+        {
+            var group = CopilotService.Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (group == null) return;
+
+            // Save as preset first (captures current state)
+            var members = CopilotService.GetMultiAgentGroupMembers(groupId);
+            var desc = $"{group.OrchestratorMode} group with {members.Count} agent(s)";
+            var preset = CopilotService.SaveGroupAsPreset(groupId, group.Name, desc, "⭐");
+            if (preset == null) return;
+
+            var dir = await FolderPickerService.PickFolderAsync();
+            if (string.IsNullOrEmpty(dir)) return;
+
+            var result = CopilotService.ExportPresetToSquadFolder(preset.Name, dir);
+            if (result != null)
+            {
+                var orchestratorName = CopilotService.GetOrchestratorSession(groupId);
+                if (orchestratorName != null)
+                {
+                    var session = CopilotService.GetSession(orchestratorName);
+                    if (session != null)
+                        session.History.Add(ChatMessage.SystemMessage($"📤 Group exported to .squad folder: {result}"));
+                }
+            }
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            importExportMessage = $"❌ Export failed: {ex.Message}";
+            StateHasChanged();
+        }
+#else
+        await Task.CompletedTask;
+#endif
     }
 
     private void OnSidebarMultiAgentModeChanged(string groupId, ChangeEventArgs e)
