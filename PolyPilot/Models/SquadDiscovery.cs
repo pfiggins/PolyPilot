@@ -211,6 +211,7 @@ public static class SquadDiscovery
 
         var workerModels = agents.Select(_ => defaultModel).ToArray();
         var systemPrompts = agents.Select(a => a.Charter).ToArray();
+        var displayNames = agents.Select(a => a.Name).ToArray();
 
         return new GroupPreset(
             teamName,
@@ -223,6 +224,7 @@ public static class SquadDiscovery
             IsRepoLevel = true,
             SourcePath = squadDir,
             WorkerSystemPrompts = systemPrompts,
+            WorkerDisplayNames = displayNames,
             SharedContext = decisions,
             RoutingContext = routing,
         };

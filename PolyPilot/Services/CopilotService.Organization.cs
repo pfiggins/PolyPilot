@@ -3579,6 +3579,7 @@ public partial class CopilotService
             var meta = GetSessionMeta(workerName);
             if (meta != null)
             {
+                meta.Role = MultiAgentRole.Worker;
                 meta.WorktreeId = workerWtIds[i] ?? orchWtId ?? worktreeId;
                 if (systemPrompt != null) meta.SystemPrompt = systemPrompt;
             }
