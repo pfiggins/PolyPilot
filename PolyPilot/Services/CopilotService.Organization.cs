@@ -4692,5 +4692,23 @@ public partial class CopilotService
         }
     }
 
+    /// <summary>
+    /// Import preset(s) from a .squad/ folder path into the user's presets.json.
+    /// The path can point to either a .squad/ directory or a parent directory containing one.
+    /// </summary>
+    public List<Models.GroupPreset> ImportPresetFromSquadFolder(string path)
+    {
+        return Models.UserPresets.ImportFromSquadFolder(PolyPilotBaseDir, path);
+    }
+
+    /// <summary>
+    /// Export a preset (by name) to a .squad/ folder at the given target path.
+    /// Returns the created .squad/ directory path, or null if the preset was not found.
+    /// </summary>
+    public string? ExportPresetToSquadFolder(string presetName, string targetPath, string? repoWorkingDirectory = null)
+    {
+        return Models.UserPresets.ExportPresetToSquadFolder(PolyPilotBaseDir, presetName, targetPath, repoWorkingDirectory);
+    }
+
     #endregion
 }

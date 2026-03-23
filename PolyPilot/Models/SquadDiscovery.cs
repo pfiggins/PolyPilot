@@ -28,27 +28,58 @@ public static class SquadDiscovery
         {
             var squadDir = FindSquadDirectory(worktreeRoot);
             if (squadDir == null) return new();
-
-            var teamFile = Path.Combine(squadDir, "team.md");
-            if (!File.Exists(teamFile)) return new();
-
-            var teamContent = File.ReadAllText(teamFile);
-            var agents = DiscoverAgents(squadDir);
-
-            if (agents.Count == 0) return new();
-
-            var teamName = ParseTeamName(teamContent) ?? "Squad Team";
-            var mode = ParseMode(teamContent);
-            var decisions = ReadOptionalFile(Path.Combine(squadDir, "decisions.md"), MaxDecisionsLength);
-            var routing = ReadOptionalFile(Path.Combine(squadDir, "routing.md"), MaxDecisionsLength);
-
-            var preset = BuildPreset(teamName, agents, decisions, routing, squadDir, mode);
-            return new List<GroupPreset> { preset };
+            return DiscoverFromSquadDir(squadDir);
         }
         catch
         {
             return new();
         }
+    }
+
+    /// <summary>
+    /// Discover a Squad team definition from a path that is either a .squad/ directory
+    /// itself or a parent directory containing .squad/ or .ai-team/.
+    /// </summary>
+    public static List<GroupPreset> DiscoverFromPath(string path)
+    {
+        try
+        {
+            if (!Directory.Exists(path)) return new();
+
+            var dirName = Path.GetFileName(path);
+            // If the path IS a .squad/ or .ai-team/ directory, use it directly
+            if (dirName is ".squad" or ".ai-team")
+                return DiscoverFromSquadDir(path);
+
+            // Otherwise treat it as a parent directory
+            return Discover(path);
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    /// <summary>
+    /// Core discovery logic from a known .squad/ directory path.
+    /// </summary>
+    internal static List<GroupPreset> DiscoverFromSquadDir(string squadDir)
+    {
+        var teamFile = Path.Combine(squadDir, "team.md");
+        if (!File.Exists(teamFile)) return new();
+
+        var teamContent = File.ReadAllText(teamFile);
+        var agents = DiscoverAgents(squadDir);
+
+        if (agents.Count == 0) return new();
+
+        var teamName = ParseTeamName(teamContent) ?? "Squad Team";
+        var mode = ParseMode(teamContent);
+        var decisions = ReadOptionalFile(Path.Combine(squadDir, "decisions.md"), MaxDecisionsLength);
+        var routing = ReadOptionalFile(Path.Combine(squadDir, "routing.md"), MaxDecisionsLength);
+
+        var preset = BuildPreset(teamName, agents, decisions, routing, squadDir, mode);
+        return new List<GroupPreset> { preset };
     }
 
     /// <summary>

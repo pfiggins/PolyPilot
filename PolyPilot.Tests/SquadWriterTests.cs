@@ -280,4 +280,89 @@ public class SquadWriterTests : IDisposable
     private static GroupPreset MakePreset(string name) => new(
         name, "Test", "🧪", MultiAgentMode.OrchestratorReflect,
         "claude-opus-4.6", new[] { "gpt-5", "claude-sonnet-4.5" });
+
+    [Fact]
+    public void WriteFromPreset_UsesWorkerDisplayNames()
+    {
+        var preset = MakePreset("Named Team") with
+        {
+            WorkerDisplayNames = new[] { "analyst", "reviewer" },
+            WorkerSystemPrompts = new string?[] { "You are an analyst.", "You are a reviewer." }
+        };
+
+        SquadWriter.WriteFromPreset(_tempDir, preset);
+
+        Assert.True(Directory.Exists(Path.Combine(_tempDir, ".squad", "agents", "analyst")));
+        Assert.True(Directory.Exists(Path.Combine(_tempDir, ".squad", "agents", "reviewer")));
+        var charter = File.ReadAllText(Path.Combine(_tempDir, ".squad", "agents", "analyst", "charter.md"));
+        Assert.Equal("You are an analyst.", charter);
+    }
+
+    [Fact]
+    public void WriteFromPreset_FallsBackToWorkerN_WhenNoDisplayNames()
+    {
+        var preset = MakePreset("Unnamed Workers");
+
+        SquadWriter.WriteFromPreset(_tempDir, preset);
+
+        Assert.True(Directory.Exists(Path.Combine(_tempDir, ".squad", "agents", "worker-1")));
+        Assert.True(Directory.Exists(Path.Combine(_tempDir, ".squad", "agents", "worker-2")));
+    }
+
+    [Fact]
+    public void WriteFromPreset_WritesSharedAndRoutingContext()
+    {
+        var preset = MakePreset("Context Team") with
+        {
+            SharedContext = "Always use async.",
+            RoutingContext = "Route security tasks to reviewer."
+        };
+
+        SquadWriter.WriteFromPreset(_tempDir, preset);
+
+        Assert.Equal("Always use async.", File.ReadAllText(Path.Combine(_tempDir, ".squad", "decisions.md")));
+        Assert.Equal("Route security tasks to reviewer.", File.ReadAllText(Path.Combine(_tempDir, ".squad", "routing.md")));
+    }
+
+    [Fact]
+    public void WriteFromPreset_WritesMode()
+    {
+        var preset = new GroupPreset("Mode Team", "Test", "🧪", MultiAgentMode.Orchestrator,
+            "claude-opus-4.6", new[] { "claude-sonnet-4.5" })
+        {
+            WorkerDisplayNames = new[] { "dev" },
+            WorkerSystemPrompts = new string?[] { "You are a developer." }
+        };
+
+        SquadWriter.WriteFromPreset(_tempDir, preset);
+
+        var teamMd = File.ReadAllText(Path.Combine(_tempDir, ".squad", "team.md"));
+        Assert.Contains("mode: orchestrator", teamMd);
+        Assert.DoesNotContain("orchestrator-reflect", teamMd);
+    }
+
+    [Fact]
+    public void WriteFromPreset_RoundTrips_ViaDiscovery()
+    {
+        var preset = MakePreset("Round Trip") with
+        {
+            WorkerDisplayNames = new[] { "dev", "tester" },
+            WorkerSystemPrompts = new string?[] { "You are a developer. Write code.", "You are a tester. Write tests." },
+            SharedContext = "Project guidelines here.",
+            RoutingContext = "Route implementations to dev."
+        };
+
+        SquadWriter.WriteFromPreset(_tempDir, preset);
+
+        var discovered = SquadDiscovery.Discover(_tempDir);
+        Assert.Single(discovered);
+        var result = discovered[0];
+        Assert.Equal("Round Trip", result.Name);
+        Assert.Equal(MultiAgentMode.OrchestratorReflect, result.Mode);
+        Assert.Equal(2, result.WorkerModels.Length);
+        Assert.Contains("Write code", string.Join(" | ", result.WorkerSystemPrompts!));
+        Assert.Contains("Write tests", string.Join(" | ", result.WorkerSystemPrompts!));
+        Assert.Contains("guidelines", result.SharedContext);
+        Assert.Contains("implementations", result.RoutingContext);
+    }
 }

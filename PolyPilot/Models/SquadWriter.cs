@@ -19,7 +19,7 @@ public static class SquadWriter
         var squadDir = Path.Combine(worktreeRoot, ".squad");
         Directory.CreateDirectory(squadDir);
 
-        WriteTeamFile(squadDir, preset.Name, workers);
+        WriteTeamFile(squadDir, preset.Name, preset.Mode, workers);
         WriteAgentCharters(squadDir, workers);
 
         if (!string.IsNullOrWhiteSpace(preset.SharedContext))
@@ -29,6 +29,28 @@ public static class SquadWriter
             File.WriteAllText(Path.Combine(squadDir, "routing.md"), preset.RoutingContext);
 
         return squadDir;
+    }
+
+    /// <summary>
+    /// Write a GroupPreset to .squad/ format, deriving the workers list from preset properties.
+    /// Uses WorkerDisplayNames if available, otherwise generates "worker-{i}" names.
+    /// </summary>
+    public static string WriteFromPreset(string worktreeRoot, GroupPreset preset)
+    {
+        var workerCount = preset.WorkerModels.Length;
+        var workers = new List<(string Name, string? SystemPrompt)>();
+        for (int i = 0; i < workerCount; i++)
+        {
+            var name = preset.WorkerDisplayNames != null && i < preset.WorkerDisplayNames.Length
+                       && !string.IsNullOrEmpty(preset.WorkerDisplayNames[i])
+                ? preset.WorkerDisplayNames[i]!
+                : $"worker-{i + 1}";
+            var prompt = preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length
+                ? preset.WorkerSystemPrompts[i]
+                : null;
+            workers.Add((name, prompt));
+        }
+        return WritePreset(worktreeRoot, preset, workers);
     }
 
     /// <summary>
@@ -56,10 +78,19 @@ public static class SquadWriter
     }
 
     private static void WriteTeamFile(string squadDir, string teamName,
-        List<(string Name, string? SystemPrompt)> workers)
+        MultiAgentMode mode, List<(string Name, string? SystemPrompt)> workers)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# {teamName}");
+        var modeStr = mode switch
+        {
+            MultiAgentMode.Broadcast => "broadcast",
+            MultiAgentMode.Sequential => "sequential",
+            MultiAgentMode.Orchestrator => "orchestrator",
+            MultiAgentMode.OrchestratorReflect => "orchestrator-reflect",
+            _ => "orchestrator-reflect"
+        };
+        sb.AppendLine($"mode: {modeStr}");
         sb.AppendLine();
         sb.AppendLine("| Member | Role |");
         sb.AppendLine("|--------|------|");
