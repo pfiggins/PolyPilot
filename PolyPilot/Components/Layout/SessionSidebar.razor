@@ -2552,7 +2552,20 @@ else
             var imported = CopilotService.ImportPresetFromSquadFolder(dir);
             if (imported.Count > 0)
             {
-                importExportMessage = $"📥 Imported: {string.Join(", ", imported.Select(p => p.Name))}";
+                var preset = imported[0];
+                importExportMessage = $"📥 Imported: {preset.Name} — creating group...";
+                StateHasChanged();
+
+                // Auto-create group from the imported preset if we're in the preset picker flow
+                if (pendingMultiAgentRepo != null)
+                {
+                    await CreateFromPresetForRepo(preset, pendingMultiAgentRepo);
+                    importExportMessage = null;
+                }
+                else
+                {
+                    importExportMessage = $"📥 Imported: {string.Join(", ", imported.Select(p => p.Name))}";
+                }
             }
             else
             {
