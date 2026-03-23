@@ -54,13 +54,27 @@ if (Test-Path $ServerPidFile) {
 # Capture PIDs of currently running instances BEFORE build
 $OldPids = @(Get-Process -Name 'PolyPilot' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
 
+# Also capture headless copilot server processes from our build directory.
+# The copilot.exe binary lives under the build output and locks files, preventing rebuild.
+$BuildBase = Join-Path (Join-Path (Join-Path $ProjectDir 'bin') 'Debug') $Framework
+$CopilotPids = @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($BuildBase, [System.StringComparison]::OrdinalIgnoreCase) } |
+    Select-Object -ExpandProperty Id)
+
 # On Windows, the running exe locks the output file, preventing build.
 # Kill old instances BEFORE building to free the file lock.
-if ($OldPids.Count -gt 0) {
+$AllPidsToKill = @($OldPids) + @($CopilotPids) | Select-Object -Unique
+if ($AllPidsToKill.Count -gt 0) {
     Write-Host '[*] Closing old instance(s) to unlock build output...'
-    foreach ($OldPid in $OldPids) {
-        Write-Host "   Killing PID $OldPid"
-        Stop-Process -Id $OldPid -Force -ErrorAction SilentlyContinue
+    foreach ($pid in $AllPidsToKill) {
+        $procName = (Get-Process -Id $pid -ErrorAction SilentlyContinue).ProcessName
+        Write-Host "   Killing $procName PID $pid"
+        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    }
+    # Clean up stale server.pid if we killed the copilot server
+    if ($CopilotPids.Count -gt 0 -and (Test-Path $ServerPidFile)) {
+        Remove-Item $ServerPidFile -Force -ErrorAction SilentlyContinue
+        Write-Host '[*] Removed stale server.pid (copilot server was killed for rebuild)'
     }
     # Give it a moment to release file locks
     Start-Sleep -Seconds 2
