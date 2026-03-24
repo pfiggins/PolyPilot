@@ -66,10 +66,10 @@ $CopilotPids = @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue |
 $AllPidsToKill = @($OldPids) + @($CopilotPids) | Select-Object -Unique
 if ($AllPidsToKill.Count -gt 0) {
     Write-Host '[*] Closing old instance(s) to unlock build output...'
-    foreach ($pid in $AllPidsToKill) {
-        $procName = (Get-Process -Id $pid -ErrorAction SilentlyContinue).ProcessName
-        Write-Host "   Killing $procName PID $pid"
-        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    foreach ($killpid in $AllPidsToKill) {
+        $procName = (Get-Process -Id $killpid -ErrorAction SilentlyContinue).ProcessName
+        Write-Host "   Killing $procName PID $killpid"
+        Stop-Process -Id $killpid -Force -ErrorAction SilentlyContinue
     }
     # Clean up stale server.pid if we killed the copilot server
     if ($CopilotPids.Count -gt 0 -and (Test-Path $ServerPidFile)) {
