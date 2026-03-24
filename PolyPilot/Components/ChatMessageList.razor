@@ -304,15 +304,16 @@
     {
         // Dynamic sections — shown expanded (novel per-message content)
         { "Worker Results", true },
-        { "Your Task", true },
         // Boilerplate sections — collapsed (repetitive orchestrator scaffolding)
-        { "Previous Iteration Feedback", false },
-        { "Previous Iteration Evaluation", false },
+        { "Your Task", false },
+        { "Previous Iteration", false },
         { "Evaluation Check", false },
         { "Work Routing", false },
         { "Instructions", false },
         { "Original Request", false },
         { "User Request", false },
+        { "Additional Orchestration Instructions", false },
+        { "Independent Quality Evaluation", false },
     };
 
     // Section headers characteristic of orchestrator-generated prompts.
@@ -327,6 +328,7 @@
         "## Evaluation Check",
         "## Previous Iteration",
         "## User Request",
+        "## Additional Orchestration Instructions",
         "@worker:",
         "[[GROUP_REFLECT_COMPLETE]]",
     };
