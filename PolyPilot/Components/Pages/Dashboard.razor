@@ -1606,17 +1606,31 @@
             var orchGroupId = CopilotService.GetOrchestratorGroupId(sessionName);
             if (orchGroupId != null)
             {
-                CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
                 List<string>? queueImagePaths = null;
                 if (hasImages)
                 {
                     queueImagePaths = pendingSendImages!.Select(i => i.TempPath).ToList();
                     pendingImagesBySession.Remove(sessionName);
                 }
-                CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
-                // Show user feedback that message is queued (orchestrator is busy dispatching workers)
-                session.History.Add(ChatMessage.SystemMessage(
-                    "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+
+                // Always show the user's message in the chat window
+                session.History.Add(ChatMessage.UserMessage(finalPrompt));
+
+                // Try routing directly into the active reflect loop (bypasses dispatch lock).
+                // Fall back to MessageQueue if no reflect loop is running.
+                if (queueImagePaths is null or { Count: 0 } && CopilotService.TryQueueForActiveReflectLoop(sessionName, finalPrompt))
+                {
+                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
+                    session.History.Add(ChatMessage.SystemMessage(
+                        "📋 Orchestrator is busy — your message will be processed at the next iteration."));
+                }
+                else
+                {
+                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
+                    CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
+                    session.History.Add(ChatMessage.SystemMessage(
+                        "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+                }
                 session.MessageCount = session.History.Count;
                 _needsScrollToBottom = true;
                 await InvokeAsync(SafeRefreshAsync);
