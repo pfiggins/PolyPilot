@@ -1879,6 +1879,23 @@ public partial class CopilotService
             orchPlanning.EarlyDispatchOnWorkerBlocks = true;
         var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
 
+        // Dead connection detection (non-reflect path)
+        if (_sessions.TryGetValue(orchestratorName, out var nrDeadConn)
+            && nrDeadConn.WatchdogKilledThisTurn
+            && Volatile.Read(ref nrDeadConn.EventCountThisTurn) == 0
+            && nrDeadConn.FlushedResponse.Length == 0
+            && nrDeadConn.CurrentResponse.Length == 0)
+        {
+            Debug($"[DEAD-CONN] '{orchestratorName}' dead connection detected in non-reflect planning");
+            AddOrchestratorSystemMessage(orchestratorName, "🔄 Connection lost — creating fresh session...");
+            if (await TryRecoverWithFreshSessionAsync(orchestratorName, cancellationToken))
+            {
+                if (_sessions.TryGetValue(orchestratorName, out var freshNr))
+                    freshNr.EarlyDispatchOnWorkerBlocks = true;
+                planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+            }
+        }
+
         // Early dispatch may return a truncated response — wait for idle and re-read full response
         await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
         if (_sessions.TryGetValue(orchestratorName, out var orchPostPlanning))
@@ -3893,6 +3910,28 @@ public partial class CopilotService
 
             var planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
 
+            // Dead connection detection: watchdog killed with 0 SDK events means the
+            // server-side session is broken (common after user abort). ResumeSessionAsync
+            // reconnects the SDK handle but the event stream stays dead. Fix by creating
+            // a brand-new session and retrying the planning prompt.
+            if (_sessions.TryGetValue(orchestratorName, out var deadConnState)
+                && deadConnState.WatchdogKilledThisTurn
+                && Volatile.Read(ref deadConnState.EventCountThisTurn) == 0
+                && deadConnState.FlushedResponse.Length == 0
+                && deadConnState.CurrentResponse.Length == 0)
+            {
+                Debug($"[DEAD-CONN] '{orchestratorName}' dead connection detected after planning prompt (watchdog kill, 0 events, 0 content)");
+                AddOrchestratorSystemMessage(orchestratorName,
+                    "🔄 Connection lost — creating fresh session...");
+                if (await TryRecoverWithFreshSessionAsync(orchestratorName, ct))
+                {
+                    // Re-enable early dispatch on the fresh session
+                    if (_sessions.TryGetValue(orchestratorName, out var freshState))
+                        freshState.EarlyDispatchOnWorkerBlocks = true;
+                    planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                }
+            }
+
             // Early dispatch may have resolved the TCS mid-turn with a partial response.
             // Wait for the orchestrator to finish all tool rounds, then re-read from history
             // to capture any @worker blocks emitted after the early dispatch point.
@@ -4083,6 +4122,17 @@ public partial class CopilotService
                 var synthOnlyPrompt = BuildSynthesisOnlyPrompt(prompt, results.ToList());
                 synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt);
 
+                // Dead connection recovery for synthesis (dedicated evaluator path)
+                if (string.IsNullOrEmpty(synthesisResponse)
+                    && _sessions.TryGetValue(orchestratorName, out var synthDcEval)
+                    && synthDcEval.WatchdogKilledThisTurn
+                    && Volatile.Read(ref synthDcEval.EventCountThisTurn) == 0)
+                {
+                    Debug($"[DEAD-CONN] '{orchestratorName}' dead connection during synthesis (evaluator path)");
+                    if (await TryRecoverWithFreshSessionAsync(orchestratorName, ct))
+                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt);
+                }
+
                 // Send to evaluator for independent scoring
                 var evalOnlyPrompt = BuildEvaluatorPrompt(prompt, synthesisResponse, reflectState);
                 var evalResponse = await SendPromptAndWaitAsync(evaluatorName, evalOnlyPrompt, ct, originalPrompt: prompt);
@@ -4138,6 +4188,20 @@ public partial class CopilotService
             else
             {
                 synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt);
+
+                // Dead connection recovery for synthesis phase — same pattern as planning.
+                // The orchestrator MUST see worker results, so a dead connection here is critical.
+                if (string.IsNullOrEmpty(synthesisResponse)
+                    && _sessions.TryGetValue(orchestratorName, out var synthDeadConn)
+                    && synthDeadConn.WatchdogKilledThisTurn
+                    && Volatile.Read(ref synthDeadConn.EventCountThisTurn) == 0)
+                {
+                    Debug($"[DEAD-CONN] '{orchestratorName}' dead connection detected during synthesis — creating fresh session");
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        "🔄 Connection lost during synthesis — reconnecting...");
+                    if (await TryRecoverWithFreshSessionAsync(orchestratorName, ct))
+                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt);
+                }
 
                 // Check completion sentinel
                 var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
