@@ -1637,6 +1637,33 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Try to queue a prompt directly into the active reflect loop for the given orchestrator.
+    /// Returns true if the loop is running and the prompt was queued (will be drained at next iteration).
+    /// Returns false if no reflect loop is active — caller should fall back to EnqueueMessage.
+    /// This bypasses _groupDispatchLocks, avoiding the deadlock where CompleteResponse's queue
+    /// drain tries SendToMultiAgentGroupAsync while the loop still holds the dispatch lock.
+    /// </summary>
+    public bool TryQueueForActiveReflectLoop(string sessionName, string prompt)
+    {
+        var groupId = GetOrchestratorGroupId(sessionName);
+        if (groupId == null) return false;
+
+        var loopLock = _reflectLoopLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (loopLock.Wait(0))
+        {
+            // We acquired the semaphore — loop is NOT running. Release and return false.
+            loopLock.Release();
+            return false;
+        }
+
+        // Loop IS running — queue directly to _reflectQueuedPrompts
+        var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+        queue.Enqueue(prompt);
+        Debug($"[DISPATCH] TryQueueForActiveReflectLoop: queued prompt for '{sessionName}' (len={prompt.Length})");
+        return true;
+    }
+
+    /// <summary>
     /// Send a prompt to all sessions in a multi-agent group based on its orchestration mode.
     /// </summary>
     public async Task SendToMultiAgentGroupAsync(string groupId, string prompt, CancellationToken cancellationToken = default)
@@ -4244,6 +4271,20 @@ public partial class CopilotService
                     leftoverPrompts.Add(leftover);
             }
 
+            // Also drain the orchestrator's MessageQueue — messages queued via EnqueueMessage
+            // (e.g., when the reflect loop couldn't be reached directly) would otherwise sit
+            // in the queue waiting for CompleteResponse drain, which tries SendToMultiAgentGroupAsync
+            // and blocks on the dispatch lock we just released.
+            if (orchestratorName != null && _sessions.TryGetValue(orchestratorName, out var orchStateForDrain))
+            {
+                string? mqPrompt;
+                while ((mqPrompt = orchStateForDrain.Info.MessageQueue.TryDequeue()) != null)
+                {
+                    Debug($"[DISPATCH] Draining orchestrator MessageQueue after loop exit (len={mqPrompt.Length})");
+                    leftoverPrompts.Add(mqPrompt);
+                }
+            }
+
             SaveOrganization();
             var completionSummary = reflectState.BuildCompletionSummary();
             InvokeOnUI(() =>
@@ -4284,26 +4325,27 @@ public partial class CopilotService
         }
 
         // Fire-and-forget: deliver leftover prompts after semaphore is released.
-        // If delivery fails (broken connection), prompts are still visible in chat history.
+        // Route through SendToMultiAgentGroupAsync so full orchestration pipeline runs
+        // (worker dispatch, reflection loop). The semaphore is released so this won't deadlock.
         if (leftoverPrompts.Count > 0)
         {
-            var orchName = orchestratorName;
+            var gId = groupId;
             SafeFireAndForget(Task.Run(async () =>
             {
-                foreach (var leftover in leftoverPrompts)
+                // Combine multiple leftovers into a single prompt to avoid starting
+                // separate orchestration cycles for each queued message.
+                var combined = leftoverPrompts.Count == 1
+                    ? leftoverPrompts[0]
+                    : string.Join("\n\n---\n\n", leftoverPrompts);
+
+                try
                 {
-                    try
-                    {
-                        Debug($"[DISPATCH] Sending leftover queued prompt after loop exit (len={leftover.Length})");
-                        using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-                        await SendPromptAndWaitAsync(orchName,
-                            $"[User sent a message — the reflection loop has completed]\n\n{leftover}",
-                            cleanupCts.Token, originalPrompt: leftover);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug($"[DISPATCH] Failed to send leftover queued prompt: {ex.Message}");
-                    }
+                    Debug($"[DISPATCH] Sending {leftoverPrompts.Count} leftover prompt(s) through orchestration pipeline (len={combined.Length})");
+                    await SendToMultiAgentGroupAsync(gId, combined);
+                }
+                catch (Exception ex)
+                {
+                    Debug($"[DISPATCH] Failed to send leftover prompts via orchestration: {ex.Message}");
                 }
             }), "leftover-prompt-delivery");
         }
