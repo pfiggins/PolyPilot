@@ -75,10 +75,11 @@ public static class SquadDiscovery
 
         var teamName = ParseTeamName(teamContent) ?? "Squad Team";
         var mode = ParseMode(teamContent);
+        var worktreeStrategy = ParseWorktreeStrategy(teamContent);
         var decisions = ReadOptionalFile(Path.Combine(squadDir, "decisions.md"), MaxDecisionsLength);
         var routing = ReadOptionalFile(Path.Combine(squadDir, "routing.md"), MaxDecisionsLength);
 
-        var preset = BuildPreset(teamName, agents, decisions, routing, squadDir, mode);
+        var preset = BuildPreset(teamName, agents, decisions, routing, squadDir, mode, worktreeStrategy);
         return new List<GroupPreset> { preset };
     }
 
@@ -170,6 +171,34 @@ public static class SquadDiscovery
     }
 
     /// <summary>
+    /// Parse optional worktree strategy from team.md content.
+    /// Looks for: "worktrees: isolated" (case-insensitive).
+    /// Supports: shared, group-shared, orchestrator-isolated, isolated/fully-isolated, selective.
+    /// Returns null if not specified (caller applies default).
+    /// </summary>
+    internal static WorktreeStrategy? ParseWorktreeStrategy(string teamContent)
+    {
+        foreach (var line in teamContent.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("worktrees:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = trimmed["worktrees:".Length..].Trim().ToLowerInvariant();
+                return value switch
+                {
+                    "shared" => WorktreeStrategy.Shared,
+                    "group-shared" or "groupshared" => WorktreeStrategy.GroupShared,
+                    "orchestrator-isolated" or "orchestratorisolated" => WorktreeStrategy.OrchestratorIsolated,
+                    "isolated" or "fully-isolated" or "fullyisolated" => WorktreeStrategy.FullyIsolated,
+                    "selective" or "selective-isolated" or "selectiveisolated" => WorktreeStrategy.SelectiveIsolated,
+                    _ => null
+                };
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Parse agent roster from team.md table rows.
     /// Returns member names from the first column of markdown tables.
     /// </summary>
@@ -203,7 +232,8 @@ public static class SquadDiscovery
     }
 
     private static GroupPreset BuildPreset(string teamName, List<SquadAgent> agents,
-        string? decisions, string? routing, string squadDir, MultiAgentMode mode)
+        string? decisions, string? routing, string squadDir, MultiAgentMode mode,
+        WorktreeStrategy? worktreeStrategy)
     {
         // Use a sensible default model for all agents (user can override after creation)
         var defaultModel = "claude-sonnet-4.6";
@@ -227,6 +257,9 @@ public static class SquadDiscovery
             WorkerDisplayNames = displayNames,
             SharedContext = decisions,
             RoutingContext = routing,
+            // Honor explicit team.md setting, otherwise default to FullyIsolated
+            // so parallel workers don't cause git conflicts.
+            DefaultWorktreeStrategy = worktreeStrategy ?? WorktreeStrategy.FullyIsolated,
         };
     }
 
