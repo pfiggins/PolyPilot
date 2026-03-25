@@ -421,7 +421,7 @@ public class WsBridgeServer : IDisposable
             {
                 var active = _copilot.GetActiveSession();
                 if (active != null && active.History.Count > 0)
-                    await SendSessionHistoryToClient(clientId, ws, active.Name, 10, ct);
+                    await SendSessionHistoryToClient(clientId, ws, active.Name, CopilotService.HistoryLimitForBridge, ct);
             }
 
             // Read client commands (with fragmentation support)
@@ -555,7 +555,7 @@ public class WsBridgeServer : IDisposable
                     {
                         _copilot.SetActiveSession(switchReq.SessionName);
                         BroadcastSessionsList();
-                        await SendSessionHistoryToClient(clientId, ws, switchReq.SessionName, 10, ct);
+                        await SendSessionHistoryToClient(clientId, ws, switchReq.SessionName, CopilotService.HistoryLimitForBridge, ct);
                     }
                     break;
 
