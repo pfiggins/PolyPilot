@@ -297,23 +297,27 @@
         return count;
     }
 
-    // Known orchestrator top-level section headers and whether they are dynamic (expanded)
-    // or boilerplate (collapsed). Only these headers trigger section splits — unknown ## headers
+    // Known orchestrator top-level section headers and display mode:
+    //   "expanded"   — collapsible, starts open (novel per-message content)
+    //   "collapsed"  — collapsible, starts closed, standalone (lengthy but potentially useful content)
+    //   "boilerplate" — collapsed and grouped together (repetitive orchestrator scaffolding)
+    // Only these headers trigger section splits — unknown ## headers
     // within worker output or other content stay inside their parent section.
-    private static readonly Dictionary<string, bool> OrchestratorSectionMap = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly Dictionary<string, string> OrchestratorSectionMap = new(StringComparer.OrdinalIgnoreCase)
     {
-        // Dynamic sections — shown expanded (novel per-message content)
-        { "Worker Results", true },
-        // Boilerplate sections — collapsed (repetitive orchestrator scaffolding)
-        { "Your Task", false },
-        { "Previous Iteration", false },
-        { "Evaluation Check", false },
-        { "Work Routing", false },
-        { "Instructions", false },
-        { "Original Request", false },
-        { "User Request", false },
-        { "Additional Orchestration Instructions", false },
-        { "Independent Quality Evaluation", false },
+        // Collapsed standalone — content is long but potentially interesting; user can expand
+        { "Worker Results", "collapsed" },
+        // Boilerplate sections — collapsed and grouped together
+        { "Your Task", "boilerplate" },
+        { "Previous Iteration", "boilerplate" },
+        { "Evaluation Check", "boilerplate" },
+        { "Work Routing", "boilerplate" },
+        { "Instructions", "boilerplate" },
+        { "Original Request", "boilerplate" },
+        { "User Request", "boilerplate" },
+        { "Additional Orchestration Instructions", "boilerplate" },
+        { "Independent Quality Evaluation", "boilerplate" },
+        { "Original User Request", "boilerplate" },
     };
 
     // Section headers characteristic of orchestrator-generated prompts.
@@ -463,23 +467,34 @@
                 continue;
 
             // Preamble (null header) is always boilerplate. Known headers use the map.
-            // Unknown headers (shouldn't happen with the new splitter) default to dynamic.
-            bool isDynamic;
+            // Unknown headers (shouldn't happen with the new splitter) default to expanded.
+            string mode;
             if (header == null)
-                isDynamic = false;
+                mode = "boilerplate";
             else
             {
                 var matchingKey = OrchestratorSectionMap.Keys
                     .FirstOrDefault(k => header.StartsWith(k, StringComparison.OrdinalIgnoreCase));
-                isDynamic = matchingKey != null ? OrchestratorSectionMap[matchingKey] : true;
+                mode = matchingKey != null ? OrchestratorSectionMap[matchingKey] : "expanded";
             }
 
-            if (isDynamic)
+            if (mode == "expanded")
             {
                 FlushBoilerplate();
                 // Dynamic sections are collapsible but start open
                 sb.Append("<details class=\"orchestrator-dynamic-details\" open>");
                 sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</summary>");
+                sb.Append("<div class=\"orchestrator-dynamic-content\">");
+                sb.Append(MarkdownRenderer.ToHtml(body));
+                sb.Append("</div></details>");
+            }
+            else if (mode == "collapsed")
+            {
+                FlushBoilerplate();
+                // Collapsed standalone — generate a brief summary line for the collapsed header
+                var summary = BuildCollapsedSummary(header!, body);
+                sb.Append("<details class=\"orchestrator-dynamic-details\">");
+                sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(summary)}</summary>");
                 sb.Append("<div class=\"orchestrator-dynamic-content\">");
                 sb.Append(MarkdownRenderer.ToHtml(body));
                 sb.Append("</div></details>");
@@ -492,6 +507,44 @@
         }
         FlushBoilerplate();
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Builds a brief summary for a collapsed orchestrator section header.
+    /// For "Worker Results", extracts worker names and their ✅/❌ status.
+    /// For other sections, returns the header as-is.
+    /// </summary>
+    private static string BuildCollapsedSummary(string header, string body)
+    {
+        if (!header.StartsWith("Worker Results", StringComparison.OrdinalIgnoreCase))
+            return header;
+
+        // Extract ### WorkerName (✅ completed, Xs) / (❌ failed, Xs) lines
+        var workers = new List<string>();
+        foreach (var line in body.Split('\n'))
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("### "))
+            {
+                var entry = trimmed.Substring(4).Trim();
+                // Shorten to just "WorkerName ✅" or "WorkerName ❌"
+                var parenIdx = entry.IndexOf('(');
+                if (parenIdx > 0)
+                {
+                    var name = entry[..parenIdx].Trim();
+                    // Extract just the short group-relative worker name (after last dash-prefix)
+                    var lastDash = name.LastIndexOf('-');
+                    var shortName = lastDash >= 0 && lastDash < name.Length - 1 ? name[(lastDash + 1)..] : name;
+                    var status = entry.Contains("✅") ? "✅" : entry.Contains("❌") ? "❌" : "⏳";
+                    workers.Add($"{shortName} {status}");
+                }
+            }
+        }
+
+        if (workers.Count == 0)
+            return header;
+
+        return $"Worker Results — {string.Join(", ", workers)}";
     }
 
     internal static string FirstLines(string? text, int lines)
