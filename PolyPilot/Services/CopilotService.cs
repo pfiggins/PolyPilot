@@ -3744,10 +3744,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         Info = state.Info
                     };
                     newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    // Carry forward ProcessingGeneration so stale callbacks on the
-                    // orphaned old state can't pass generation checks on the new state.
-                    Interlocked.Exchange(ref newState.ProcessingGeneration,
-                        Interlocked.Read(ref state.ProcessingGeneration));
+                    // Reset ProcessingGeneration to 0 instead of copying from old state.
+                    // The old state already has long.MaxValue (set above) which invalidates
+                    // all stale callbacks. Copying long.MaxValue and then incrementing (line 3506)
+                    // wraps to long.MinValue, corrupting the generation counter.
+                    Interlocked.Exchange(ref newState.ProcessingGeneration, 0);
                     // Reset tool tracking for the NEW connection. The old connection's
                     // tool state is stale — no tools have run on this connection yet.
                     // Without this, HasUsedToolsThisTurn=true from the dead connection
@@ -3958,6 +3959,73 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (skillDirs != null)
             Debug($"[FRESH-CONFIG] Includes {skillDirs.Count} skill dir(s)");
         return config;
+    }
+
+    /// <summary>
+    /// Force-create a fresh SDK session when the event stream is dead.
+    /// Called after detecting repeated watchdog kills with 0 events (the server-side session
+    /// is unrecoverable via ResumeSessionAsync). Creates a brand-new session ID so the
+    /// next SendPromptAsync gets a clean event stream.
+    /// </summary>
+    internal async Task<bool> TryRecoverWithFreshSessionAsync(string sessionName, CancellationToken ct)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state))
+            return false;
+
+        Debug($"[DEAD-CONN] '{sessionName}' creating fresh session (old session event stream is dead)");
+
+        try
+        {
+            if (_client == null)
+            {
+                Debug($"[DEAD-CONN] '{sessionName}' no client available — cannot recover");
+                return false;
+            }
+
+            var freshConfig = BuildFreshSessionConfig(state);
+            CopilotSession newSession;
+            try
+            {
+                newSession = await _client.CreateSessionAsync(freshConfig, ct);
+            }
+            catch (Exception createEx)
+            {
+                Debug($"[DEAD-CONN] '{sessionName}' fresh session creation failed: {createEx.Message}");
+                return false;
+            }
+
+            // Orphan the old state
+            state.IsOrphaned = true;
+            Interlocked.Exchange(ref state.ProcessingGeneration, long.MaxValue);
+            CancelProcessingWatchdog(state);
+            CancelTurnEndFallback(state);
+            CancelToolHealthCheck(state);
+            state.ResponseCompletion?.TrySetCanceled();
+
+            // Create new state with fresh session
+            var newState = new SessionState
+            {
+                Session = newSession,
+                Info = state.Info
+            };
+            newState.Info.SessionId = newSession.SessionId;
+            newState.Info.IsProcessing = false;
+            newState.Info.ProcessingStartedAt = null;
+            newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            newState.IsMultiAgentSession = state.IsMultiAgentSession;
+            DisposePrematureIdleSignal(state);
+            newSession.On(evt => HandleSessionEvent(newState, evt));
+            _sessions[sessionName] = newState;
+
+            FlushSaveActiveSessionsToDisk();
+            Debug($"[DEAD-CONN] '{sessionName}' fresh session created: {newSession.SessionId}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug($"[DEAD-CONN] '{sessionName}' recovery failed: {ex.Message}");
+            return false;
+        }
     }
 
     public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
@@ -4467,7 +4535,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Info = state.Info
             };
             newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            Interlocked.Exchange(ref newState.ProcessingGeneration, Interlocked.Read(ref state.ProcessingGeneration));
+            // Reset to 0 — old state is orphaned (IsOrphaned=true) so stale callbacks
+            // bail out via the orphan guard. Copying old gen risks overflow if it was long.MaxValue.
+            Interlocked.Exchange(ref newState.ProcessingGeneration, 0);
             newState.IsMultiAgentSession = state.IsMultiAgentSession;
 
             // Register event handler BEFORE publishing to the dictionary (INV-16) so no
