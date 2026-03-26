@@ -12,6 +12,10 @@
     var sessionDir = GetSessionDirectory();
     var provider = CopilotService.GetProviderForSession(Session.Name);
     var providerDisplayName = CopilotService.GetProviderSessionDisplayName(Session.Name);
+    // Strip group name prefix from multi-agent member cards for cleaner display
+    var displayName = providerDisplayName ?? Session.Name;
+    if (!string.IsNullOrEmpty(GroupName) && displayName.StartsWith(GroupName + "-", StringComparison.OrdinalIgnoreCase))
+        displayName = displayName[(GroupName.Length + 1)..];
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.NeedsAttention ? "needs-attention" :
@@ -62,7 +66,7 @@
                 {
                     <span class="provider-icon" title="@provider.DisplayName">@provider.Icon</span>
                 }
-                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@(providerDisplayName ?? Session.Name)</span>
+                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true" title="@Session.Name">@displayName</span>
                 @if (Meta?.Role == MultiAgentRole.Orchestrator)
                 {
                     <span class="role-badge orchestrator" title="Orchestrator">🎯</span>
@@ -274,6 +278,7 @@
     [Parameter] public SessionUsageInfo? UsageInfo { get; set; }
     [Parameter] public bool IsWorkerChild { get; set; }
     [Parameter] public bool IsMultiAgentMember { get; set; }
+    [Parameter] public string? GroupName { get; set; }
 
     [Parameter] public EventCallback OnSelect { get; set; }
     [Parameter] public EventCallback OnClose { get; set; }

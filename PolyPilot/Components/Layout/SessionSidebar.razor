@@ -200,6 +200,7 @@ else
     [Parameter] public EventCallback OnToggleStatistics { get; set; }
 
     private Dictionary<string, (OrchestratorPhase Phase, string? Detail)> _groupPhases = new();
+    private HashSet<string> _groupSettingsExpanded = new();
     private Timer? _diskSizeTimer;
     private DotNetObjectReference<SessionSidebar>? _sidebarRef;
 
@@ -683,22 +684,6 @@ else
                         {
                             var maGroupId = group.Id;
                             <div class="sidebar-ma-controls" @onclick:stopPropagation="true">
-                                <select class="sidebar-ma-mode-select" @onchange="(e) => OnSidebarMultiAgentModeChanged(maGroupId, e)">
-                                    <option value="Broadcast" selected="@(group.OrchestratorMode == MultiAgentMode.Broadcast)">📡 Broadcast</option>
-                                    <option value="Sequential" selected="@(group.OrchestratorMode == MultiAgentMode.Sequential)">⏩ Sequential</option>
-                                    <option value="Orchestrator" selected="@(group.OrchestratorMode == MultiAgentMode.Orchestrator)">🎯 Orchestrate</option>
-                                    <option value="OrchestratorReflect" selected="@(group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">🔄 Reflect</option>
-                                </select>
-                                @if (group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
-                                {
-                                    <div class="reflect-iterations-bar">
-                                        <label class="reflect-iter-label">Max iterations:</label>
-                                        <input type="number" min="1" max="100" value="@GetGroupMaxIterations(maGroupId)"
-                                               class="reflect-iter-input"
-                                               @onchange="(e) => SetGroupMaxIterations(maGroupId, e)"
-                                               @onclick:stopPropagation="true" />
-                                    </div>
-                                }
                                 @if (group.OrchestratorMode != MultiAgentMode.Orchestrator && group.OrchestratorMode != MultiAgentMode.OrchestratorReflect)
                                 {
                                 <div class="sidebar-ma-input-bar">
@@ -745,11 +730,39 @@ else
                                         }
                                     </div>
                                 }
-                                <button class="save-preset-btn" @onclick="() => PromptSaveAsPreset(maGroupId)" @onclick:stopPropagation="true" title="Save this group as a reusable preset">💾 Save as Preset</button>
-                                <button class="save-preset-btn" @onclick="() => ExportGroupToSquadFolder(maGroupId)" @onclick:stopPropagation="true" title="Export this group to a .squad folder">📤 Export .squad</button>
-                                @if (!string.IsNullOrEmpty(group.SourcePresetName))
+                                @{
+                                    var settingsExpanded = _groupSettingsExpanded.Contains(maGroupId);
+                                }
+                                <div class="group-settings-toggle" @onclick="() => ToggleGroupSettings(maGroupId)" @onclick:stopPropagation="true">
+                                    <span class="unpinned-chevron">@(settingsExpanded ? "▼" : "▶")</span>
+                                    <span class="unpinned-label">⚙ Settings</span>
+                                </div>
+                                @if (settingsExpanded)
                                 {
-                                    <button class="save-preset-btn" @onclick="() => RefreshFromPreset(maGroupId)" @onclick:stopPropagation="true" title="Refresh settings from preset '@group.SourcePresetName'">🔄 Refresh from Preset</button>
+                                    <div class="group-settings-panel">
+                                        <select class="sidebar-ma-mode-select" @onchange="(e) => OnSidebarMultiAgentModeChanged(maGroupId, e)">
+                                            <option value="Broadcast" selected="@(group.OrchestratorMode == MultiAgentMode.Broadcast)">📡 Broadcast</option>
+                                            <option value="Sequential" selected="@(group.OrchestratorMode == MultiAgentMode.Sequential)">⏩ Sequential</option>
+                                            <option value="Orchestrator" selected="@(group.OrchestratorMode == MultiAgentMode.Orchestrator)">🎯 Orchestrate</option>
+                                            <option value="OrchestratorReflect" selected="@(group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">🔄 Reflect</option>
+                                        </select>
+                                        @if (group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+                                        {
+                                            <div class="reflect-iterations-bar">
+                                                <label class="reflect-iter-label">Max iterations:</label>
+                                                <input type="number" min="1" max="100" value="@GetGroupMaxIterations(maGroupId)"
+                                                       class="reflect-iter-input"
+                                                       @onchange="(e) => SetGroupMaxIterations(maGroupId, e)"
+                                                       @onclick:stopPropagation="true" />
+                                            </div>
+                                        }
+                                        <button class="save-preset-btn" @onclick="() => PromptSaveAsPreset(maGroupId)" @onclick:stopPropagation="true" title="Save this group as a reusable preset">💾 Save as Preset</button>
+                                        <button class="save-preset-btn" @onclick="() => ExportGroupToSquadFolder(maGroupId)" @onclick:stopPropagation="true" title="Export this group to a .squad folder">📤 Export .squad</button>
+                                        @if (!string.IsNullOrEmpty(group.SourcePresetName))
+                                        {
+                                            <button class="save-preset-btn" @onclick="() => RefreshFromPreset(maGroupId)" @onclick:stopPropagation="true" title="Refresh settings from preset '@group.SourcePresetName'">🔄 Refresh from Preset</button>
+                                        }
+                                    </div>
                                 }
                             </div>
                         }
@@ -799,6 +812,7 @@ else
                                                  IsRenaming="@(renamingSession == orchSession.Name)"
                                                  IsMenuOpen="@(openMenuSession == orchSession.Name)"
                                                  IsMultiAgentMember="true"
+                                                 GroupName="@group.Name"
                                                  ShortcutIndex="orchIdx"
                                                  Groups="CopilotService.Organization.Groups"
                                                  UsageInfo="@(usageBySession.TryGetValue(orchSession.Name, out var orchUsg) ? orchUsg : null)"
@@ -845,6 +859,7 @@ else
                                                          IsDisabled="@(group.IsCodespace && group.ConnectionState != CodespaceConnectionState.Connected)"
                                                          IsWorkerChild="true"
                                                          IsMultiAgentMember="true"
+                                                         GroupName="@group.Name"
                                                          IsRenaming="@(renamingSession == session.Name)"
                                                          IsMenuOpen="@(openMenuSession == session.Name)"
                                                          ShortcutIndex="wIdx"
@@ -2653,6 +2668,12 @@ else
         {
             CopilotService.SetMultiAgentMode(groupId, mode);
         }
+    }
+
+    private void ToggleGroupSettings(string groupId)
+    {
+        if (!_groupSettingsExpanded.Remove(groupId))
+            _groupSettingsExpanded.Add(groupId);
     }
 
     private static string GetInputPlaceholder(MultiAgentMode mode) => mode switch
