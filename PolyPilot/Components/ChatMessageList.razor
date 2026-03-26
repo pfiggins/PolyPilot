@@ -406,7 +406,8 @@
         if (!hasAnySections)
         {
             var fallback = new System.Text.StringBuilder();
-            if (!string.IsNullOrEmpty(originalContent))
+            // Show original user message at top — but skip if it's itself an orchestrator prompt
+            if (!string.IsNullOrEmpty(originalContent) && !IsOrchestratorPrompt(originalContent))
             {
                 fallback.Append("<div class=\"chat-msg-text\">");
                 fallback.Append(FormatUserMessage(originalContent));
@@ -422,8 +423,8 @@
 
         var sb = new System.Text.StringBuilder();
 
-        // Show the original user prompt as a short label at the top
-        if (!string.IsNullOrEmpty(originalContent))
+        // Show original user message at top — but skip if it's itself an orchestrator prompt
+        if (!string.IsNullOrEmpty(originalContent) && !IsOrchestratorPrompt(originalContent))
         {
             sb.Append("<div class=\"chat-msg-text\">");
             sb.Append(FormatUserMessage(originalContent));
