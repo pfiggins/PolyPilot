@@ -1958,6 +1958,26 @@
 }
 .save-preset-btn:hover { opacity: 1; color: var(--accent-primary); }
 
+.group-settings-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    cursor: pointer;
+    padding: 0.2rem 0;
+    font-size: var(--type-footnote);
+    color: var(--text-dim);
+    user-select: none;
+}
+.group-settings-toggle:hover { color: var(--text-primary); }
+.group-settings-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 0.3rem 0 0.1rem 0.8rem;
+    border-left: 2px solid var(--control-border);
+    margin-left: 0.3rem;
+}
+
 .reflect-score {
     font-size: var(--type-caption1);
     color: #4ade80;
