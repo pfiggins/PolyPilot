@@ -1215,6 +1215,11 @@ public partial class CopilotService
         OnSessionComplete?.Invoke(state.Info.Name, summary);
         OnStateChanged?.Invoke();
 
+        // Safety net: if this is an orchestrator whose response contains @worker blocks
+        // but was sent via SendPromptAsync (not the multi-agent pipeline), dispatch them.
+        // This catches routing bypasses where SendToMultiAgentGroupAsync was skipped.
+        TryDispatchOrphanedOrchestratorResponse(state.Info.Name, fullResponse);
+
         // Reflection cycle: evaluate response and enqueue follow-up if goal not yet met
         var cycle = state.Info.ReflectionCycle;
         if (cycle != null && cycle.IsActive)
@@ -1596,6 +1601,9 @@ public partial class CopilotService
                     var skipHistory = state.Info.ReflectionCycle is { IsActive: true } &&
                                       ReflectionCycle.IsReflectionFollowUpPrompt(nextPrompt2);
 
+                    // Check if this is an orchestrator — route through multi-agent pipeline
+                    var orchGroupId2 = GetOrchestratorGroupId(state.Info.Name);
+
                     _ = Task.Run(async () =>
                     {
                         try
@@ -1608,7 +1616,15 @@ public partial class CopilotService
                                 {
                                     try
                                     {
-                                        await SendPromptAsync(state.Info.Name, nextPrompt2, skipHistoryMessage: skipHistory, agentMode: nextAgentMode2);
+                                        if (orchGroupId2 != null)
+                                        {
+                                            Debug($"[DISPATCH] Evaluator drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId2}'");
+                                            await SendToMultiAgentGroupAsync(orchGroupId2, nextPrompt2);
+                                        }
+                                        else
+                                        {
+                                            await SendPromptAsync(state.Info.Name, nextPrompt2, skipHistoryMessage: skipHistory, agentMode: nextAgentMode2);
+                                        }
                                         tcs.TrySetResult();
                                     }
                                     catch (Exception ex)

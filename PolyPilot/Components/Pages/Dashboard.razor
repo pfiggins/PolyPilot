@@ -1687,6 +1687,7 @@
 
             if (isOrchestrator && (imagePaths == null || imagePaths.Count == 0))
             {
+                Console.WriteLine($"[DISPATCH-BRANCH] Taking ORCHESTRATOR path for '{sessionName}' (groupId='{group!.Id}')");
                 AutoStartReflectionIfNeeded(group!.Id, finalPrompt);
                 _ = CopilotService.SendToMultiAgentGroupAsync(group!.Id, finalPrompt).ContinueWith(t =>
                 {
@@ -1702,6 +1703,11 @@
             }
             else
             {
+            // Defensive: log when an orchestrator bypasses the multi-agent pipeline
+            if (isOrchestrator)
+                Console.WriteLine($"[DISPATCH-BRANCH] ⚠️ ORCHESTRATOR '{sessionName}' taking DIRECT path (imagePaths={imagePaths?.Count ?? -1}, agentMode={agentMode}) — safety net will catch @worker blocks");
+            else
+                Console.WriteLine($"[DISPATCH-BRANCH] Taking DIRECT path for '{sessionName}' (isOrch={isOrchestrator}, agentMode={agentMode})");
             // If this is an orchestrator but images are present, warn the user
             if (isOrchestrator && imagePaths is { Count: > 0 })
             {
