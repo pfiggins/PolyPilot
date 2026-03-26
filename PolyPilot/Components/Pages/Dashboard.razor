@@ -887,6 +887,8 @@
                             }
                         }
                         // ArrowUp/Down: command history navigation
+                        // Only trigger when the cursor cannot move further in that direction
+                        // within the text (single-line at boundary, or already navigating history).
                         if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && isInput && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
                             var ta = e.target;
                             var atStart = ta.selectionStart === 0 && ta.selectionEnd === 0;
@@ -894,7 +896,17 @@
                             var card = ta.closest('[data-session]');
                             var sessionName = card ? card.dataset.session : '';
                             var histNavActive = sessionName && window.__histNavActive && window.__histNavActive[sessionName];
-                            if ((e.key === 'ArrowUp' && atStart) || (e.key === 'ArrowDown' && (atEnd || histNavActive))) {
+                            // For multi-line content, only navigate history when already in history mode.
+                            // For ArrowUp: trigger only when cursor is at position 0 AND on the first line.
+                            // For ArrowDown: trigger only when already navigating history (never on atEnd alone,
+                            //   which would clear user-typed text).
+                            var textBeforeCursor = ta.value.substring(0, ta.selectionStart);
+                            var textAfterCursor = ta.value.substring(ta.selectionStart);
+                            var cursorOnFirstLine = textBeforeCursor.indexOf('\n') === -1;
+                            var cursorOnLastLine = textAfterCursor.indexOf('\n') === -1;
+                            var triggerUp = e.key === 'ArrowUp' && atStart && cursorOnFirstLine;
+                            var triggerDown = e.key === 'ArrowDown' && histNavActive && atEnd && cursorOnLastLine;
+                            if (triggerUp || triggerDown) {
                                 if (sessionName && window.__dashRef) {
                                     e.preventDefault();
                                     window.__dashRef.invokeMethodAsync('JsNavigateHistory', sessionName, e.key === 'ArrowUp').then(function(isNav) {
