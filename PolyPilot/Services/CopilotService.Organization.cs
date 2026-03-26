@@ -1637,6 +1637,68 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Safety net: detect orchestrator responses with @worker blocks that were sent via SendPromptAsync
+    /// (bypassing the multi-agent dispatch pipeline) and dispatch the orphaned worker assignments.
+    /// This catches race conditions where the dispatch routing in Dashboard.razor or Events.cs
+    /// fails to route through SendToMultiAgentGroupAsync.
+    /// </summary>
+    internal void TryDispatchOrphanedOrchestratorResponse(string sessionName, string response)
+    {
+        if (string.IsNullOrEmpty(response)) return;
+
+        // Only relevant for orchestrator sessions
+        var groupId = GetOrchestratorGroupId(sessionName);
+        if (groupId == null) return;
+
+        // If a reflect loop is actively running for this group, the loop will handle
+        // the response via the TCS — this is not an orphan.
+        var loopLock = _reflectLoopLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (!loopLock.Wait(0))
+        {
+            // Loop is running — not orphaned
+            return;
+        }
+        loopLock.Release();
+
+        // If the dispatch lock is held, someone is actively dispatching — not orphaned.
+        var dispatchLock = _groupDispatchLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (!dispatchLock.Wait(0))
+        {
+            return;
+        }
+        dispatchLock.Release();
+
+        // Check if response contains @worker blocks
+        var workerNames = GetMultiAgentGroupMembers(groupId)
+            .Where(m => m != sessionName).ToList();
+        if (workerNames.Count == 0) return;
+
+        var assignments = ParseTaskAssignments(response, workerNames);
+        if (assignments.Count == 0) return;
+
+        // This IS an orphaned orchestrator response — dispatch the workers
+        Debug($"[DISPATCH-ORPHAN] Detected orphaned orchestrator response from '{sessionName}' with " +
+              $"{assignments.Count} @worker assignments. Dispatching via orchestration pipeline.");
+        AddOrchestratorSystemMessage(sessionName,
+            $"🔄 Safety net: detected {assignments.Count} undispatched worker assignment(s) — dispatching now.");
+
+        // Route through the full pipeline so reflection/synthesis happens
+        SafeFireAndForget(Task.Run(async () =>
+        {
+            try
+            {
+                // Small delay to let CompleteResponse fully unwind
+                await Task.Delay(200);
+                await SendToMultiAgentGroupAsync(groupId, response);
+            }
+            catch (Exception ex)
+            {
+                Debug($"[DISPATCH-ORPHAN] Failed to dispatch orphaned response: {ex.Message}");
+            }
+        }), "orphaned-orchestrator-dispatch");
+    }
+
+    /// <summary>
     /// Try to queue a prompt directly into the active reflect loop for the given orchestrator.
     /// Returns true if the loop is running and the prompt was queued (will be drained at next iteration).
     /// Returns false if no reflect loop is active — caller should fall back to EnqueueMessage.
