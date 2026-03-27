@@ -20,6 +20,13 @@ public partial class CopilotService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, int> _remoteStreamingSessions = new();
 
     /// <summary>
+    /// Drafts queued by "Continue in new session" for the Dashboard to pick up.
+    /// Key = session name, Value = pre-filled prompt text.
+    /// Dashboard consumes entries when it renders the session's input.
+    /// </summary>
+    internal readonly ConcurrentDictionary<string, string> PendingDrafts = new();
+
+    /// <summary>
     /// Whether a session's history is still being synced after a turn completed (streaming guard active).
     /// Used by the UI to avoid clearing streaming content before the history sync replaces it.
     /// </summary>
@@ -669,6 +676,7 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
             message.StartsWith("[KEEPALIVE") || message.StartsWith("[ERROR") ||
             message.StartsWith("[ABORT") || message.StartsWith("[BRIDGE") ||
+            message.StartsWith("[SYNC") ||
             message.Contains("watchdog") || message.Contains("Failed to");
     }
 
@@ -2943,6 +2951,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // In remote mode, delegate to WsBridgeClient
         if (IsRemoteMode)
         {
+            if (!_bridgeClient.IsConnected)
+                throw new InvalidOperationException("Not connected to server. Reconnecting…");
+
             // Add user message locally for immediate UI feedback
             var session = GetRemoteSession(sessionName);
             if (session != null && !skipHistoryMessage)
@@ -2954,7 +2965,20 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             if (session != null)
                 session.IsProcessing = true;
             OnStateChanged?.Invoke();
-            await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, cancellationToken);
+            try
+            {
+                await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, cancellationToken);
+            }
+            catch
+            {
+                // Send failed (disconnected) — clean up processing state
+                if (session != null)
+                {
+                    session.IsProcessing = false;
+                    OnStateChanged?.Invoke();
+                }
+                throw;
+            }
             return ""; // Response comes via events
         }
 
@@ -4236,7 +4260,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         _activeSessionName = name;
         if (IsRemoteMode)
-            _ = _bridgeClient.SwitchSessionAsync(name);
+            _ = _bridgeClient.SwitchSessionAsync(name)
+                .ContinueWith(t => Console.WriteLine($"[CopilotService] SwitchSession bridge error: {t.Exception?.InnerException?.Message}"),
+                    TaskContinuationOptions.OnlyOnFaulted);
         OnStateChanged?.Invoke();
         return true;
     }
@@ -4351,7 +4377,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             _activeSessionName = name;
             activeState.Info.LastUpdatedAt = DateTime.Now;
             if (IsRemoteMode)
-                _ = _bridgeClient.SwitchSessionAsync(name);
+                _ = _bridgeClient.SwitchSessionAsync(name)
+                    .ContinueWith(t => Console.WriteLine($"[CopilotService] SwitchSession bridge error: {t.Exception?.InnerException?.Message}"),
+                        TaskContinuationOptions.OnlyOnFaulted);
         }
     }
 

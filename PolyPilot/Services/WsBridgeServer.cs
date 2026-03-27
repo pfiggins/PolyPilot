@@ -143,8 +143,16 @@ public class WsBridgeServer : IDisposable
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.TurnStart,
                 new SessionNamePayload { SessionName = session }));
         _copilot.OnTurnEnd += (session) =>
+        {
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.TurnEnd,
                 new SessionNamePayload { SessionName = session }));
+            // Push updated history to all clients after each sub-turn flush.
+            // FlushCurrentResponse runs before OnTurnEnd, so History is up-to-date.
+            // Without this, mobile only has content_delta-built messages — if any
+            // deltas were missed (WS buffering, timing), the text is permanently lost
+            // until the user manually requests a history sync.
+            _ = BroadcastSessionHistoryAsync(session);
+        };
         _copilot.OnSessionComplete += (session, summary) =>
         {
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.SessionComplete,
@@ -615,7 +623,11 @@ public class WsBridgeServer : IDisposable
                     if (abortReq != null && !string.IsNullOrWhiteSpace(abortReq.SessionName))
                     {
                         Console.WriteLine($"[WsBridge] Client aborting session '{abortReq.SessionName}'");
-                        await _copilot.AbortSessionAsync(abortReq.SessionName);
+                        // AbortSessionAsync mutates IsProcessing/History — must run on UI thread
+                        _copilot.InvokeOnUI(() =>
+                        {
+                            _ = _copilot.AbortSessionAsync(abortReq.SessionName);
+                        });
                     }
                     break;
 
@@ -1188,6 +1200,83 @@ public class WsBridgeServer : IDisposable
         if (_copilot == null) return;
         var msg = BridgeMessage.Create(BridgeMessageTypes.OrganizationState, _copilot.Organization);
         Broadcast(msg);
+    }
+
+    /// <summary>
+    /// Push the current session history to all connected clients.
+    /// Called after FlushCurrentResponse on each sub-turn end so mobile clients
+    /// have authoritative history even if content_delta events were missed.
+    /// </summary>
+    private async Task BroadcastSessionHistoryAsync(string sessionName)
+    {
+        try
+        {
+            if (_copilot == null || _clients.IsEmpty) return;
+
+            var session = _copilot.GetSession(sessionName);
+            if (session == null) return;
+
+        ChatMessage[] snapshot;
+        lock (session.HistoryLock)
+        {
+            snapshot = session.History.ToArray();
+        }
+
+        var totalCount = snapshot.Length;
+        List<ChatMessage> messagesToSend;
+        bool hasMore;
+        if (totalCount > CopilotService.HistoryLimitForBridge)
+        {
+            messagesToSend = snapshot.Skip(totalCount - CopilotService.HistoryLimitForBridge).ToList();
+            hasMore = true;
+        }
+        else
+        {
+            messagesToSend = snapshot.ToList();
+            hasMore = false;
+        }
+
+        // Populate ImageDataUri for Image messages — clone to avoid mutating shared History objects
+        for (int i = 0; i < messagesToSend.Count; i++)
+        {
+            var m = messagesToSend[i];
+            if (m.MessageType == ChatMessageType.Image && string.IsNullOrEmpty(m.ImageDataUri) && !string.IsNullOrEmpty(m.ImagePath))
+            {
+                try
+                {
+                    if (File.Exists(m.ImagePath))
+                    {
+                        var bytes = await File.ReadAllBytesAsync(m.ImagePath);
+                        var clone = new ChatMessage(m.Role, m.Content, m.Timestamp, m.MessageType)
+                        {
+                            ImagePath = m.ImagePath,
+                            Caption = m.Caption,
+                            ToolCallId = m.ToolCallId,
+                            ToolName = m.ToolName,
+                            IsComplete = m.IsComplete,
+                            IsSuccess = m.IsSuccess,
+                            ImageDataUri = $"data:{ImageMimeType(m.ImagePath)};base64,{Convert.ToBase64String(bytes)}"
+                        };
+                        messagesToSend[i] = clone;
+                    }
+                }
+                catch { /* best effort */ }
+            }
+        }
+
+        var payload = new SessionHistoryPayload
+        {
+            SessionName = sessionName,
+            Messages = messagesToSend,
+            TotalCount = totalCount,
+            HasMore = hasMore
+        };
+        Broadcast(BridgeMessage.Create(BridgeMessageTypes.SessionHistory, payload));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] BroadcastSessionHistory error for '{sessionName}': {ex.Message}");
+        }
     }
 
     private async Task HandleOrganizationCommandAsync(OrganizationCommandPayload cmd)
