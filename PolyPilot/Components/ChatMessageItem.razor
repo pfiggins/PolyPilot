@@ -27,7 +27,7 @@
                 }
                 @if (!string.IsNullOrEmpty(Message.OriginalContent))
                 {
-                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content, Message.OriginalContent))
+                    @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content, Message.OriginalContent, CollapseOriginalContent))
                 }
                 else if (ChatMessageList.IsOrchestratorPrompt(Message.Content))
                 {
@@ -256,6 +256,7 @@
     [Parameter] public ChatMessage Message { get; set; } = default!;
     [Parameter] public bool Compact { get; set; }
     [Parameter] public bool IsStreaming { get; set; }
+    [Parameter] public bool CollapseOriginalContent { get; set; }
     [Parameter] public string? UserAvatarUrl { get; set; }
     [Parameter] public string? RepoUrl { get; set; }
 

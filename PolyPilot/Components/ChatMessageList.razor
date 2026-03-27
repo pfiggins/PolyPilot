@@ -10,9 +10,16 @@
     }
     else
     {
+        var _seenFirstUserOriginal = false;
         @foreach (var msg in Messages.ToList())
         {
-            <ChatMessageItem @key="msg" Message="msg" Compact="Compact" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
+            var collapseOrig = false;
+            if (msg.MessageType == ChatMessageType.User && !string.IsNullOrEmpty(msg.OriginalContent))
+            {
+                collapseOrig = _seenFirstUserOriginal;
+                _seenFirstUserOriginal = true;
+            }
+            <ChatMessageItem @key="msg" Message="msg" Compact="Compact" CollapseOriginalContent="collapseOrig" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
         }
 
         @* Current turn tool activity feed — skip activities already in history *@
@@ -367,10 +374,11 @@
     /// boilerplate sections (Instructions, Work Routing, etc.) are collapsed.
     /// Only known orchestrator headers trigger section splits — unknown ## headers
     /// (e.g., from worker output) stay within their parent section.
-    /// When originalContent is provided, it's shown as a brief user prompt label
-    /// instead of rendering the full original prompt text uncollapsed.
+    /// When originalContent is provided, it's shown as a brief user prompt label.
+    /// When collapseOriginal is true, the original prompt is rendered in a collapsed
+    /// details element (for re-dispatch messages where the prompt repeats).
     /// </summary>
-    internal static string RenderOrchestratorPromptSections(string content, string? originalContent = null)
+    internal static string RenderOrchestratorPromptSections(string content, string? originalContent = null, bool collapseOriginal = false)
     {
         if (string.IsNullOrEmpty(content)) return "";
 
@@ -409,9 +417,14 @@
             // Show original user message at top — but skip if it's itself an orchestrator prompt
             if (!string.IsNullOrEmpty(originalContent) && !IsOrchestratorPrompt(originalContent))
             {
-                fallback.Append("<div class=\"chat-msg-text\">");
-                fallback.Append(FormatUserMessage(originalContent));
-                fallback.Append("</div>");
+                if (collapseOriginal)
+                    AppendCollapsedOriginalContent(fallback, originalContent);
+                else
+                {
+                    fallback.Append("<div class=\"chat-msg-text\">");
+                    fallback.Append(FormatUserMessage(originalContent));
+                    fallback.Append("</div>");
+                }
             }
             fallback.Append("<details class=\"orchestration-prompt-details\">");
             fallback.Append("<summary>Full orchestration prompt</summary>");
@@ -426,9 +439,14 @@
         // Show original user message at top — but skip if it's itself an orchestrator prompt
         if (!string.IsNullOrEmpty(originalContent) && !IsOrchestratorPrompt(originalContent))
         {
-            sb.Append("<div class=\"chat-msg-text\">");
-            sb.Append(FormatUserMessage(originalContent));
-            sb.Append("</div>");
+            if (collapseOriginal)
+                AppendCollapsedOriginalContent(sb, originalContent);
+            else
+            {
+                sb.Append("<div class=\"chat-msg-text\">");
+                sb.Append(FormatUserMessage(originalContent));
+                sb.Append("</div>");
+            }
         }
 
         // Group consecutive boilerplate sections into a single collapsible panel
@@ -546,6 +564,22 @@
             return header;
 
         return $"Worker Results — {string.Join(", ", workers)}";
+    }
+
+    /// <summary>
+    /// Appends originalContent as a collapsed details element with a truncated summary.
+    /// Used for re-dispatch messages where the original prompt repeats.
+    /// </summary>
+    private static void AppendCollapsedOriginalContent(System.Text.StringBuilder sb, string originalContent)
+    {
+        var summary = originalContent.Length > 100
+            ? originalContent[..100].Replace("\n", " ").Replace("\r", "") + "…"
+            : originalContent.Replace("\n", " ").Replace("\r", "");
+        sb.Append("<details class=\"orchestration-prompt-details\">");
+        sb.Append($"<summary>Original prompt: {System.Net.WebUtility.HtmlEncode(summary)}</summary>");
+        sb.Append("<div class=\"chat-msg-text\">");
+        sb.Append(FormatUserMessage(originalContent));
+        sb.Append("</div></details>");
     }
 
     internal static string FirstLines(string? text, int lines)
