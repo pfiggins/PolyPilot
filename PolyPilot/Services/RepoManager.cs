@@ -727,7 +727,7 @@ public class RepoManager
         }
 
         // Copy seed files into the new worktree (if a reposeed folder exists for this repo)
-        ApplyRepoSeedFiles(repo.Name, worktreePath);
+        ApplyRepoSeedFiles(repo.Name, repo.Id, worktreePath);
 
         var wt = new WorktreeInfo
         {
@@ -817,22 +817,26 @@ public class RepoManager
     }
 
     /// <summary>
-    /// Copies files from <c>~/.polypilot/reposeed/{repoName}/</c> into the worktree.
-    /// Matches on repo name (case-insensitive). Overwrites existing files.
+    /// Copies files from <c>~/.polypilot/reposeed/{repoName or repoId}/</c> into the worktree.
+    /// Matches on repo name or repo ID (case-insensitive). Overwrites existing files.
     /// This lets users supply config files (.claude/, scripts, etc.) that should
     /// be present in every worktree created for a given repository.
     /// </summary>
-    private static void ApplyRepoSeedFiles(string repoName, string worktreePath)
+    private static void ApplyRepoSeedFiles(string repoName, string? repoId, string worktreePath)
     {
         try
         {
             var seedRoot = Path.Combine(GetBaseDir(), "reposeed");
             if (!Directory.Exists(seedRoot)) return;
 
-            // Find a matching seed folder (case-insensitive)
+            // Find a matching seed folder by name or id (case-insensitive)
             var seedDir = Directory.GetDirectories(seedRoot)
-                .FirstOrDefault(d => Path.GetFileName(d)
-                    .Equals(repoName, StringComparison.OrdinalIgnoreCase));
+                .FirstOrDefault(d =>
+                {
+                    var dirName = Path.GetFileName(d);
+                    return dirName.Equals(repoName, StringComparison.OrdinalIgnoreCase)
+                        || (!string.IsNullOrEmpty(repoId) && dirName.Equals(repoId, StringComparison.OrdinalIgnoreCase));
+                });
             if (seedDir == null) return;
 
             CopyDirectoryRecursive(seedDir, worktreePath);
@@ -945,7 +949,7 @@ public class RepoManager
         }
 
         // Copy seed files into the new worktree (if a reposeed folder exists for this repo)
-        ApplyRepoSeedFiles(repo.Name, worktreePath);
+        ApplyRepoSeedFiles(repo.Name, repo.Id, worktreePath);
 
         var wt = new WorktreeInfo
         {
