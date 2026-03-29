@@ -640,6 +640,19 @@
                     _initialGridSet = true; // Prevent RefreshState from overriding
                     Console.WriteLine($"[Dashboard] Will restore to grid view (no expanded session)");
                 }
+
+                // Restore draft text saved before an auto-update relaunch
+                if (uiState.Drafts?.Count > 0)
+                {
+                    foreach (var (name, text) in uiState.Drafts)
+                    {
+                        if (!string.IsNullOrWhiteSpace(text))
+                            draftBySession[name] = text;
+                    }
+                    Console.WriteLine($"[Dashboard] Restored {draftBySession.Count} draft(s) from pre-relaunch save");
+                    // Clear saved drafts so they don't persist across normal restarts
+                    CopilotService.SaveDraftsImmediate(new Dictionary<string, string>());
+                }
             }
             else
             {
@@ -709,6 +722,7 @@
             }
 
             GitAutoUpdate.Initialize();
+            GitAutoUpdate.OnBeforeRelaunch += HandleBeforeRelaunch;
             
             _initializationComplete = true; // Allow RefreshState to process changes now
         }
@@ -1484,6 +1498,22 @@
         currentToolBySession.Remove(sessionName);
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
+    }
+
+    /// <summary>
+    /// Called by GitAutoUpdateService just before relaunching.
+    /// Persists all in-progress draft text so it can be restored after restart.
+    /// </summary>
+    private void HandleBeforeRelaunch()
+    {
+        var nonEmpty = draftBySession
+            .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Value))
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        if (nonEmpty.Count > 0)
+        {
+            Console.WriteLine($"[Dashboard] Saving {nonEmpty.Count} draft(s) before relaunch");
+            CopilotService.SaveDraftsImmediate(nonEmpty);
+        }
     }
 
     private void HandleOrchestratorPhaseChanged(string groupId, OrchestratorPhase phase, string? detail)
@@ -3537,6 +3567,7 @@
         CopilotService.OnOrchestratorPhaseChanged -= HandleOrchestratorPhaseChanged;
         FiestaService.OnStateChanged -= HandleFiestaStateChanged;
         FiestaService.OnHostTaskUpdate -= HandleFiestaTaskUpdate;
+        GitAutoUpdate.OnBeforeRelaunch -= HandleBeforeRelaunch;
         _heartbeatTimer?.Dispose();
         _heartbeatTimer = null;
         _renderTimer?.Dispose();

@@ -5067,6 +5067,8 @@ public class UiState
     public HashSet<string> CompletedTutorials { get; set; } = new();
     public int GridColumns { get; set; } = 3;
     public int CardMinHeight { get; set; } = 250;
+    /// <summary>Draft text per session, saved before auto-update relaunch so users don't lose in-progress messages.</summary>
+    public Dictionary<string, string> Drafts { get; set; } = new();
 }
 
 public class ActiveSessionEntry
