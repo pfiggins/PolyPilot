@@ -1144,6 +1144,7 @@ public partial class CopilotService
         // Also cancel any pending TurnEnd→Idle fallback — CompleteResponse is now executing
         CancelTurnEndFallback(state);
         CancelToolHealthCheck(state);
+        CancelIdleDeferFallback(state);
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
         state.HasDeferredIdle = false;
@@ -1958,6 +1959,16 @@ public partial class CopilotService
     {
         var prev = Interlocked.Exchange(ref state.TurnEndIdleCts, null);
         prev?.Cancel();
+        prev?.Dispose();
+    }
+
+    /// <summary>
+    /// Cancels the IDLE-DEFER fallback timer to prevent stale force-completion
+    /// after normal completion or a new turn has started.
+    /// </summary>
+    private static void CancelIdleDeferFallback(SessionState state)
+    {
+        var prev = Interlocked.Exchange(ref state.IdleDeferFallbackTimer, null);
         prev?.Dispose();
     }
 

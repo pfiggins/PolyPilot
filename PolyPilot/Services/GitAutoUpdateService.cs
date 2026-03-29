@@ -135,14 +135,14 @@ public class GitAutoUpdateService : IDisposable
             var local = (await RunGit("rev-parse HEAD")).Trim();
             var remote = (await RunGit($"rev-parse {updateRemote}/main")).Trim();
 
+            // Always record the current commit as the pre-update baseline.
+            // If the update fails to build, we revert to this commit.
+            _lastLocalCommit = local;
+
             if (local == remote)
             {
                 _status = $"Up to date ({local[..7]})";
-                if (_lastLocalCommit != local)
-                {
-                    _lastLocalCommit = local;
-                    NotifyChanged();
-                }
+                NotifyChanged();
                 return;
             }
 
@@ -244,7 +244,46 @@ public class GitAutoUpdateService : IDisposable
 
             rebuild:
 
-            _status = "Rebuilding & relaunching...";
+            // Verify the build succeeds BEFORE relaunching. If it fails, revert to
+            // the pre-update commit so the next relaunch still works.
+            var preUpdateCommit = _lastLocalCommit;
+            var currentCommit = (await RunGit("rev-parse HEAD")).Trim();
+
+            _status = "Building to verify update...";
+            NotifyChanged();
+
+            var buildOk = await TryBuild();
+            if (!buildOk)
+            {
+                _logger.LogError("Build failed after update — reverting to {Commit}", preUpdateCommit ?? currentCommit);
+                _status = "Build failed — reverting...";
+                NotifyChanged();
+
+                try
+                {
+                    if (!string.IsNullOrEmpty(preUpdateCommit))
+                    {
+                        await RunGit($"reset --hard {preUpdateCommit}");
+                        _logger.LogInformation("Reverted to pre-update commit {Commit}", preUpdateCommit);
+                    }
+                    else
+                    {
+                        // No known good commit — reset to the previous HEAD
+                        await RunGit("reset --hard HEAD@{1}");
+                        _logger.LogInformation("Reverted to previous HEAD");
+                    }
+                }
+                catch (Exception revertEx)
+                {
+                    _logger.LogError(revertEx, "Failed to revert after build failure");
+                }
+
+                _status = "Update reverted (build failed)";
+                NotifyChanged();
+                return;
+            }
+
+            _status = "Build verified — relaunching...";
             NotifyChanged();
 
             await Relaunch();
@@ -423,6 +462,55 @@ public class GitAutoUpdateService : IDisposable
         SetPath(psi);
         Process.Start(psi);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Runs a build-only pass (no launch) to verify the current code compiles.
+    /// Returns true if the build succeeds, false otherwise.
+    /// </summary>
+    private async Task<bool> TryBuild()
+    {
+        try
+        {
+            string framework;
+            if (OperatingSystem.IsWindows())
+                framework = "net10.0-windows10.0.19041.0";
+            else if (OperatingSystem.IsMacCatalyst() || OperatingSystem.IsMacOS())
+                framework = "net10.0-maccatalyst";
+            else
+                framework = "net10.0-android";
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"build PolyPilot.csproj -f {framework} --no-restore",
+                WorkingDirectory = _projectDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            SetPath(psi);
+
+            using var process = Process.Start(psi)!;
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+            {
+                _logger.LogError("Verification build failed (exit {Code}):\n{Error}", process.ExitCode, error);
+                return false;
+            }
+
+            _logger.LogInformation("Verification build succeeded");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Verification build threw exception");
+            return false;
+        }
     }
 
     private static void SetPath(ProcessStartInfo psi)
