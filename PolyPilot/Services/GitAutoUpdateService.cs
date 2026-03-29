@@ -22,6 +22,8 @@ public class GitAutoUpdateService : IDisposable
     public string? Branch { get; private set; }
 
     public event Action? OnStateChanged;
+    /// <summary>Fired synchronously before a relaunch so subscribers can persist transient state (e.g. draft text).</summary>
+    public event Action? OnBeforeRelaunch;
 
     public GitAutoUpdateService(ILogger<GitAutoUpdateService> logger)
     {
@@ -285,6 +287,10 @@ public class GitAutoUpdateService : IDisposable
 
             _status = "Build verified — relaunching...";
             NotifyChanged();
+
+            // Let subscribers save transient state (e.g. draft messages) before the app restarts
+            try { OnBeforeRelaunch?.Invoke(); }
+            catch (Exception ex2) { _logger.LogWarning(ex2, "OnBeforeRelaunch handler failed"); }
 
             await Relaunch();
         }

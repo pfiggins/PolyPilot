@@ -797,7 +797,7 @@ public partial class CopilotService
 
     }
 
-    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null)
+    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null)
     {
         try
         {
@@ -818,6 +818,9 @@ public partial class CopilotService
                 CompletedTutorials = existing?.CompletedTutorials ?? new HashSet<string>(),
                 GridColumns = gridColumns ?? existing?.GridColumns ?? 3,
                 CardMinHeight = cardMinHeight ?? existing?.CardMinHeight ?? 250,
+                Drafts = drafts != null
+                    ? new Dictionary<string, string>(drafts)
+                    : existing?.Drafts ?? new Dictionary<string, string>(),
             };
 
             lock (_uiStateLock)
@@ -830,6 +833,29 @@ public partial class CopilotService
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to prepare UI state: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Saves draft text and immediately flushes to disk (no debounce).
+    /// Called before auto-update relaunch to ensure drafts survive the restart.
+    /// </summary>
+    public void SaveDraftsImmediate(Dictionary<string, string> drafts)
+    {
+        try
+        {
+            Directory.CreateDirectory(PolyPilotBaseDir);
+            var existing = LoadUiState() ?? new UiState();
+            existing.Drafts = new Dictionary<string, string>(drafts);
+            lock (_uiStateLock)
+            {
+                _pendingUiState = existing;
+            }
+            FlushUiState();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to save drafts: {ex.Message}");
         }
     }
 
