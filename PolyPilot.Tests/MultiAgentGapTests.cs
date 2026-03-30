@@ -328,6 +328,121 @@ Do task B.
         Assert.Empty(result);
     }
 
+    // --- ResolveWorkerName / Suffix Matching ---
+
+    [Fact]
+    public void ResolveWorkerName_ExactMatch_TakesPriority()
+    {
+        var workers = new List<string> { "alpha", "team-alpha" };
+        Assert.Equal("alpha", CopilotService.ResolveWorkerName("alpha", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_SuffixMatch_GroupPrefixDropped()
+    {
+        // Model writes "srdev-1" but available is "tuul A Team-srdev-1"
+        var workers = new List<string> { "tuul A Team-srdev-1", "tuul A Team-reviewer" };
+        Assert.Equal("tuul A Team-srdev-1", CopilotService.ResolveWorkerName("srdev-1", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_SuffixMatch_PartialPrefixDropped()
+    {
+        // Model writes "Team-srdev-1" (space boundary)
+        var workers = new List<string> { "tuul A Team-srdev-1", "tuul A Team-reviewer" };
+        Assert.Equal("tuul A Team-srdev-1", CopilotService.ResolveWorkerName("Team-srdev-1", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_AmbiguousSuffix_ReturnsNull()
+    {
+        // "worker-1" matches both — ambiguity guard rejects
+        var workers = new List<string> { "team-A-worker-1", "team-B-worker-1" };
+        Assert.Null(CopilotService.ResolveWorkerName("worker-1", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_NoBoundary_RejectsPartialMatch()
+    {
+        // "rdev-1" is a substring suffix but not at a word boundary (preceded by 's')
+        var workers = new List<string> { "tuul A Team-srdev-1" };
+        Assert.Null(CopilotService.ResolveWorkerName("rdev-1", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_UnknownName_ReturnsNull()
+    {
+        var workers = new List<string> { "alpha", "beta" };
+        Assert.Null(CopilotService.ResolveWorkerName("gamma", workers));
+    }
+
+    [Fact]
+    public void IsSuffixMatch_DashBoundary_Matches()
+    {
+        Assert.True(CopilotService.IsSuffixMatch("tuul A Team-srdev-1", "srdev-1"));
+    }
+
+    [Fact]
+    public void IsSuffixMatch_SpaceBoundary_Matches()
+    {
+        Assert.True(CopilotService.IsSuffixMatch("tuul A Team-srdev-1", "Team-srdev-1"));
+    }
+
+    [Fact]
+    public void IsSuffixMatch_NoBoundary_Rejects()
+    {
+        // 'rdev-1' preceded by 's' — not a word boundary
+        Assert.False(CopilotService.IsSuffixMatch("tuul A Team-srdev-1", "rdev-1"));
+    }
+
+    [Fact]
+    public void IsSuffixMatch_ExactMatch_Matches()
+    {
+        Assert.True(CopilotService.IsSuffixMatch("alpha", "alpha"));
+    }
+
+    [Fact]
+    public void IsSuffixMatch_EmptySuffix_Rejects()
+    {
+        Assert.False(CopilotService.IsSuffixMatch("alpha", ""));
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_SuffixMatch_ResolvesAbbreviatedName()
+    {
+        // End-to-end: model abbreviates group-prefixed worker name
+        var response = "@worker:srdev-1\nImplement the feature.\n@end";
+        var workers = new List<string> { "tuul A Team-srdev-1", "tuul A Team-reviewer" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+
+        Assert.Single(result);
+        Assert.Equal("tuul A Team-srdev-1", result[0].WorkerName);
+        Assert.Contains("Implement", result[0].Task);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_SuffixMatch_AmbiguousRejectsAll()
+    {
+        // Two workers have same suffix — ambiguity guard rejects
+        var response = "@worker:worker-1\nDo the work.\n@end";
+        var workers = new List<string> { "team-A-worker-1", "team-B-worker-1" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+
+        Assert.Empty(result);
+    }
+
+    [Fact]
+    public void TryParseJsonAssignments_SuffixMatch_ResolvesAbbreviatedName()
+    {
+        // JSON path also uses suffix matching
+        var response = """[{"worker":"srdev-1","task":"Review the PR"}]""";
+        var workers = new List<string> { "tuul A Team-srdev-1", "tuul A Team-reviewer" };
+        var result = CopilotService.TryParseJsonAssignments(response, workers);
+
+        Assert.Single(result);
+        Assert.Equal("tuul A Team-srdev-1", result[0].WorkerName);
+    }
+
     // --- BuildDelegationNudgePrompt ---
 
     [Fact]

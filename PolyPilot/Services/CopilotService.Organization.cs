@@ -1979,6 +1979,7 @@ public partial class CopilotService
 
         var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
         Debug($"[DISPATCH] '{orchestratorName}' iteration 0: {rawAssignments.Count} raw assignments. Response length={planResponse.Length}");
+        LogUnresolvedWorkerNames(planResponse, rawAssignments, workerNames, orchestratorName);
 
         var iterAssignments = DeduplicateAssignments(rawAssignments, dispatchedWorkers);
 
@@ -2355,13 +2356,46 @@ public partial class CopilotService
             var task = match.Groups[2].Value.Trim();
             if (string.IsNullOrEmpty(task)) continue;
 
-            // Exact match only — no fuzzy bidirectional Contains (caused misroutes)
-            var resolved = availableWorkers.FirstOrDefault(w =>
-                w.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+            var resolved = ResolveWorkerName(workerName, availableWorkers);
             if (resolved != null)
                 assignments.Add(new TaskAssignment(resolved, task));
         }
         return assignments;
+    }
+
+    /// <summary>
+    /// Resolves a worker name from an orchestrator response to a full session name.
+    /// Tries exact match first, then falls back to suffix matching with a word boundary
+    /// guard (preceded by '-' or ' '). Suffix match only used when unambiguous (exactly 1 candidate).
+    /// </summary>
+    internal static string? ResolveWorkerName(string workerName, List<string> availableWorkers)
+    {
+        // 1. Exact match (case-insensitive) — always preferred
+        var exact = availableWorkers.FirstOrDefault(w =>
+            w.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+        if (exact != null) return exact;
+
+        // 2. Suffix match with word boundary: the model often abbreviates
+        //    "tuul A Team-srdev-1" to just "srdev-1" in @worker blocks.
+        //    Only accept if exactly one worker matches (ambiguity guard).
+        var suffixMatches = availableWorkers.Where(w => IsSuffixMatch(w, workerName)).ToList();
+        if (suffixMatches.Count == 1)
+            return suffixMatches[0];
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if <paramref name="fullName"/> ends with <paramref name="suffix"/> at a word boundary
+    /// (preceded by '-' or ' '). Prevents false matches like "rdev-1" matching "srdev-1".
+    /// </summary>
+    internal static bool IsSuffixMatch(string fullName, string suffix)
+    {
+        if (string.IsNullOrEmpty(suffix)) return false;
+        if (!fullName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return false;
+        if (fullName.Length == suffix.Length) return true; // exact match
+        var preceding = fullName[fullName.Length - suffix.Length - 1];
+        return preceding == '-' || preceding == ' ';
     }
 
     /// <summary>
@@ -2389,14 +2423,37 @@ public partial class CopilotService
                 var task = element.TryGetProperty("task", out var t) ? t.GetString() : null;
                 if (string.IsNullOrEmpty(workerName) || string.IsNullOrEmpty(task)) continue;
 
-                var resolved = availableWorkers.FirstOrDefault(wk =>
-                    wk.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+                var resolved = ResolveWorkerName(workerName, availableWorkers);
                 if (resolved != null)
                     assignments.Add(new TaskAssignment(resolved, task));
             }
         }
         catch (System.Text.Json.JsonException) { /* Not valid JSON — fall through to regex */ }
         return assignments;
+    }
+
+    /// <summary>
+    /// Logs diagnostic information when @worker blocks are present in the response
+    /// but ParseTaskAssignments resolved fewer assignments than expected.
+    /// </summary>
+    private void LogUnresolvedWorkerNames(string response, List<TaskAssignment> resolved, List<string> availableWorkers, string orchestratorName)
+    {
+        // Extract all @worker:name references from the response
+        var namePattern = @"@worker:([^\n]+?)(?:\s*\n|$)";
+        var mentioned = Regex.Matches(response, namePattern, RegexOptions.IgnoreCase)
+            .Cast<Match>()
+            .Select(m => m.Groups[1].Value.Trim().Trim('`', '\'', '"'))
+            .Where(n => !string.IsNullOrEmpty(n))
+            .ToList();
+
+        if (mentioned.Count == 0 || mentioned.Count == resolved.Count) return;
+
+        var resolvedNames = new HashSet<string>(resolved.Select(r => r.WorkerName), StringComparer.OrdinalIgnoreCase);
+        var unresolved = mentioned.Where(n => ResolveWorkerName(n, availableWorkers) == null || !resolvedNames.Contains(ResolveWorkerName(n, availableWorkers)!)).ToList();
+        if (unresolved.Count > 0)
+        {
+            Debug($"[DISPATCH] '{orchestratorName}' had {unresolved.Count} unresolved @worker name(s): [{string.Join(", ", unresolved)}]. Available: [{string.Join(", ", availableWorkers)}]");
+        }
     }
 
     private record WorkerResult(string WorkerName, string? Response, bool Success, string? Error, TimeSpan Duration);
@@ -4103,6 +4160,7 @@ public partial class CopilotService
 
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
+            LogUnresolvedWorkerNames(planResponse, rawAssignments, workerNames, orchestratorName);
             var assignments = DeduplicateAssignments(rawAssignments);
 
             if (assignments.Count == 0)
