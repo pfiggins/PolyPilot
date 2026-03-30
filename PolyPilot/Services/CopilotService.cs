@@ -5069,6 +5069,8 @@ public class UiState
     public int CardMinHeight { get; set; } = 250;
     /// <summary>Draft text per session, saved before auto-update relaunch so users don't lose in-progress messages.</summary>
     public Dictionary<string, string> Drafts { get; set; } = new();
+    /// <summary>Sidebar width in pixels. Default 320, range 200-600.</summary>
+    public int SidebarWidth { get; set; } = 320;
 }
 
 public class ActiveSessionEntry

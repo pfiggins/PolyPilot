@@ -797,7 +797,7 @@ public partial class CopilotService
 
     }
 
-    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null)
+    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null, int? sidebarWidth = null)
     {
         try
         {
@@ -821,6 +821,7 @@ public partial class CopilotService
                 Drafts = drafts != null
                     ? new Dictionary<string, string>(drafts)
                     : existing?.Drafts ?? new Dictionary<string, string>(),
+                SidebarWidth = Math.Clamp(sidebarWidth ?? existing?.SidebarWidth ?? 320, 200, 600),
             };
 
             lock (_uiStateLock)
