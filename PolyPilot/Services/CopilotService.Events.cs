@@ -1321,8 +1321,17 @@ public partial class CopilotService
                             {
                                 if (orchGroupId != null && nextImagePaths is null or { Count: 0 })
                                 {
-                                    Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
-                                    await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                                    // If a reflect loop is active, queue for its next iteration boundary
+                                    // instead of starting a competing loop via SendToMultiAgentGroupAsync.
+                                    if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt))
+                                    {
+                                        Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
+                                        await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                                    }
+                                    else
+                                    {
+                                        Debug($"[DISPATCH] Queue drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId}'");
+                                    }
                                 }
                                 else
                                 {
@@ -1341,8 +1350,15 @@ public partial class CopilotService
                     {
                         if (orchGroupId != null && nextImagePaths is null or { Count: 0 })
                         {
-                            Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
-                            await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                            if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt))
+                            {
+                                Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
+                                await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                            }
+                            else
+                            {
+                                Debug($"[DISPATCH] Queue drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId}'");
+                            }
                         }
                         else
                         {
@@ -1621,8 +1637,15 @@ public partial class CopilotService
                                     {
                                         if (orchGroupId2 != null)
                                         {
-                                            Debug($"[DISPATCH] Evaluator drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId2}'");
-                                            await SendToMultiAgentGroupAsync(orchGroupId2, nextPrompt2);
+                                            if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt2))
+                                            {
+                                                Debug($"[DISPATCH] Evaluator drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId2}'");
+                                                await SendToMultiAgentGroupAsync(orchGroupId2, nextPrompt2);
+                                            }
+                                            else
+                                            {
+                                                Debug($"[DISPATCH] Evaluator drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId2}'");
+                                            }
                                         }
                                         else
                                         {
