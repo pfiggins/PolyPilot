@@ -3049,7 +3049,21 @@
     private void SetMaxIterations(string groupId, ChangeEventArgs e)
     {
         if (int.TryParse(e.Value?.ToString(), out var val) && val >= 1)
+        {
             _groupMaxIterations[groupId] = val;
+            
+            // Update the persistent SessionGroup.MaxReflectIterations
+            var group = CopilotService.Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (group != null)
+            {
+                group.MaxReflectIterations = val;
+                CopilotService.SaveOrganization();
+                CopilotService.FlushSaveOrganization();
+            }
+            
+            // Trigger UI refresh to sync both textboxes
+            StateHasChanged();
+        }
     }
 
     private async Task SendToMultiAgentGroup(string groupId)
