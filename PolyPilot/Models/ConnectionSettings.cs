@@ -128,6 +128,14 @@ public class ConnectionSettings
     public bool EnableVerboseEventTracing { get; set; } = false;
 
     /// <summary>
+    /// Message types to filter from the mobile bridge view.
+    /// Messages of these types are excluded from session history sent to mobile clients,
+    /// and their corresponding streaming events are suppressed.
+    /// Stored as ChatMessageType enum names (e.g. "System", "Reasoning", "ToolCall").
+    /// </summary>
+    public List<string> BridgeFilteredMessageTypes { get; set; } = new() { "System" };
+
+    /// <summary>
     /// Normalizes a remote URL by ensuring it has an http(s):// scheme.
     /// Plain IPs/hostnames get http://, devtunnels/known TLS hosts get https://.
     /// Already-schemed URLs pass through unchanged. Returns null for null/empty input.

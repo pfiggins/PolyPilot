@@ -345,6 +345,30 @@ public static class SettingsRegistry
             IsVisible = ctx => ctx.IsDesktop
         });
 
+        // ── Mobile Bridge Filtering ─────────────────────────────────
+        // Each toggle controls whether a message type is hidden from the mobile app.
+        // When enabled, messages of that type are excluded from bridge history and
+        // their streaming events are suppressed.
+
+        AddBridgeFilterToggle(list, "bridge.filterSystem", "Hide System Messages",
+            "Filter out system/status messages (orchestrator notifications, warnings).",
+            ChatMessageType.System, order: 80);
+        AddBridgeFilterToggle(list, "bridge.filterToolCalls", "Hide Tool Calls",
+            "Filter out tool call details (file edits, searches, shell commands).",
+            ChatMessageType.ToolCall, order: 81);
+        AddBridgeFilterToggle(list, "bridge.filterReasoning", "Hide Reasoning",
+            "Filter out thinking/reasoning blocks.",
+            ChatMessageType.Reasoning, order: 82);
+        AddBridgeFilterToggle(list, "bridge.filterShellOutput", "Hide Shell Output",
+            "Filter out shell command output blocks.",
+            ChatMessageType.ShellOutput, order: 83);
+        AddBridgeFilterToggle(list, "bridge.filterDiffs", "Hide Diffs",
+            "Filter out diff/code change blocks.",
+            ChatMessageType.Diff, order: 84);
+        AddBridgeFilterToggle(list, "bridge.filterReflection", "Hide Reflection",
+            "Filter out reflection/evaluation messages.",
+            ChatMessageType.Reflection, order: 85);
+
         // ── Developer ───────────────────────────────────────────────
 
         list.Add(new SettingDescriptor
@@ -410,5 +434,38 @@ public static class SettingsRegistry
             || s.Category.Contains(q, StringComparison.OrdinalIgnoreCase)
             || (s.Section?.Contains(q, StringComparison.OrdinalIgnoreCase) ?? false)
             || s.SearchKeywords.Contains(q, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Adds a Bool toggle that controls whether a ChatMessageType is in the
+    /// BridgeFilteredMessageTypes list (checked = filtered out from mobile view).
+    /// </summary>
+    private static void AddBridgeFilterToggle(List<SettingDescriptor> list,
+        string id, string label, string description, ChatMessageType messageType, int order)
+    {
+        var typeName = messageType.ToString();
+        list.Add(new SettingDescriptor
+        {
+            Id = id,
+            Label = label,
+            Description = description,
+            Category = "UI",
+            Section = "Mobile Bridge Filter",
+            Type = SettingType.Bool,
+            Order = order,
+            SearchKeywords = $"bridge mobile filter hide {typeName.ToLowerInvariant()} message remote phone",
+            GetValue = ctx => ctx.Settings.BridgeFilteredMessageTypes.Contains(typeName),
+            SetValue = (ctx, v) =>
+            {
+                if (v is bool b)
+                {
+                    if (b && !ctx.Settings.BridgeFilteredMessageTypes.Contains(typeName))
+                        ctx.Settings.BridgeFilteredMessageTypes.Add(typeName);
+                    else if (!b)
+                        ctx.Settings.BridgeFilteredMessageTypes.Remove(typeName);
+                }
+            },
+            IsVisible = ctx => ctx.IsDesktop
+        });
     }
 }

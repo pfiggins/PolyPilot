@@ -28,6 +28,9 @@ public class WsBridgeServer : IDisposable
     private Timer? _sessionsListDebounce;
     private Timer? _orgStateDebounce;
     private const int SessionsListDebounceMs = 500;
+
+    // Bridge message type filter — cached from settings, reloadable at runtime
+    private volatile HashSet<ChatMessageType> _filteredTypes = new() { ChatMessageType.System };
     private const int OrgStateDebounceMs = 2000;
 
     public int BridgePort => _bridgePort;
@@ -46,6 +49,25 @@ public class WsBridgeServer : IDisposable
     public event Action? OnStateChanged;
 
     /// <summary>
+    /// Reload the bridge message type filter from persisted settings.
+    /// Call after changing BridgeFilteredMessageTypes in ConnectionSettings.
+    /// </summary>
+    public void ReloadBridgeFilter()
+    {
+        var settings = ConnectionSettings.Load();
+        var set = new HashSet<ChatMessageType>();
+        foreach (var name in settings.BridgeFilteredMessageTypes)
+        {
+            if (Enum.TryParse<ChatMessageType>(name, ignoreCase: true, out var t))
+                set.Add(t);
+        }
+        _filteredTypes = set;
+    }
+
+    /// <summary>Returns true if the given message type should be excluded from bridge output.</summary>
+    internal bool IsBridgeFiltered(ChatMessageType type) => _filteredTypes.Contains(type);
+
+    /// <summary>
     /// Start the bridge server. Now only needs the port — connects to CopilotService directly.
     /// The targetPort parameter is kept for API compat but ignored.
     /// </summary>
@@ -55,6 +77,7 @@ public class WsBridgeServer : IDisposable
 
         _bridgePort = bridgePort;
         _cts = new CancellationTokenSource();
+        ReloadBridgeFilter();
 
         if (TryBindListener(bridgePort))
         {
@@ -111,10 +134,14 @@ public class WsBridgeServer : IDisposable
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ContentDelta,
                 new ContentDeltaPayload { SessionName = session, Content = content }));
         _copilot.OnToolStarted += (session, tool, callId, input) =>
+        {
+            if (IsBridgeFiltered(ChatMessageType.ToolCall)) return;
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ToolStarted,
                 new ToolStartedPayload { SessionName = session, ToolName = tool, CallId = callId, ToolInput = input }));
+        };
         _copilot.OnToolCompleted += (session, callId, result, success) =>
         {
+            if (IsBridgeFiltered(ChatMessageType.ToolCall)) return;
             var payload = new ToolCompletedPayload { SessionName = session, CallId = callId, Result = result, Success = success };
             // Check if this is a show_image result — include image data for remote clients
             if (success)
@@ -135,11 +162,17 @@ public class WsBridgeServer : IDisposable
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ToolCompleted, payload));
         };
         _copilot.OnReasoningReceived += (session, reasoningId, content) =>
+        {
+            if (IsBridgeFiltered(ChatMessageType.Reasoning)) return;
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ReasoningDelta,
                 new ReasoningDeltaPayload { SessionName = session, ReasoningId = reasoningId, Content = content }));
+        };
         _copilot.OnReasoningComplete += (session, reasoningId) =>
+        {
+            if (IsBridgeFiltered(ChatMessageType.Reasoning)) return;
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ReasoningComplete,
                 new ReasoningCompletePayload { SessionName = session, ReasoningId = reasoningId }));
+        };
         _copilot.OnIntentChanged += (session, intent) =>
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.IntentChanged,
                 new IntentChangedPayload { SessionName = session, Intent = intent }));
@@ -1140,6 +1173,11 @@ public class WsBridgeServer : IDisposable
             hasMore = false;
         }
 
+        // Filter out message types configured in BridgeFilteredMessageTypes setting
+        var filtered = _filteredTypes;
+        if (filtered.Count > 0)
+            messagesToSend = messagesToSend.Where(m => !filtered.Contains(m.MessageType)).ToList();
+
         // Populate ImageDataUri for Image messages so mobile can render them
         foreach (var m in messagesToSend)
         {
@@ -1261,6 +1299,11 @@ public class WsBridgeServer : IDisposable
             messagesToSend = snapshot.ToList();
             hasMore = false;
         }
+
+        // Filter out message types configured in BridgeFilteredMessageTypes setting
+        var filtered = _filteredTypes;
+        if (filtered.Count > 0)
+            messagesToSend = messagesToSend.Where(m => !filtered.Contains(m.MessageType)).ToList();
 
         // Populate ImageDataUri for Image messages — clone to avoid mutating shared History objects
         for (int i = 0; i < messagesToSend.Count; i++)

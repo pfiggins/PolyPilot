@@ -871,6 +871,10 @@
                 CopilotService.NotifyStateChanged();
                 break;
         }
+
+        // Reload bridge filter whenever a bridge.filter* setting changes
+        if (settingId.StartsWith("bridge.filter"))
+            WsBridgeServer.ReloadBridgeFilter();
         SaveSettingsQuietly();
         StateHasChanged();
     }
