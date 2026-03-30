@@ -738,6 +738,37 @@ log = guaranteed orphaned dispatch. Occurs when `Interlocked.Increment` wraps
 **Invariants violated**: INV-O4 (OnSessionComplete not fired on watchdog orphan exit),
 INV-O9-reflect (new — reflect path must use collection timeout).
 
+### Bug: ParseTaskAssignments returns 0 when model abbreviates worker names (discovered 2026-03-30)
+
+**Symptom**: Orchestrator response contains `@worker` blocks (early dispatch detects
+them), but `ParseTaskAssignments` returns 0 assignments. User sees "No @worker
+assignments parsed from orchestrator response. Retrying..." in the orchestrator chat.
+After a nudge retry (~26s delay), parsing succeeds and workers are dispatched.
+
+**Root cause**: `ParseTaskAssignments` used exact string equality to resolve worker
+names from `@worker:name` blocks against the `availableWorkers` list. The model was
+shown full session names like `'tuul A Team-srdev-1'` in the planning prompt but
+wrote abbreviated names like `@worker:srdev-1`, dropping the group prefix. Since
+`"srdev-1" != "tuul A Team-srdev-1"`, every regex match was silently discarded.
+
+**Why nudge works**: `BuildDelegationNudgePrompt` includes an explicit example
+`@worker:tuul A Team-srdev-1` with the full name, which the model copies verbatim.
+
+**Fix**: Added `ResolveWorkerName` helper with two-stage resolution:
+1. **Exact match** (case-insensitive) — always preferred
+2. **Suffix match** with word boundary guard — `availableWorker.EndsWith(name)` with
+   preceding char being `-` or ` `. Only used when exactly one candidate matches
+   (ambiguity guard prevents misroutes).
+
+Applied to both regex and JSON parsing paths. Also added `LogUnresolvedWorkerNames`
+diagnostic that logs unresolved `@worker:name` references with the full available
+worker list, making future parse failures immediately visible in event diagnostics.
+
+**Historical note**: Fuzzy bidirectional `Contains` matching was tried previously but
+removed because it caused misroutes. The suffix + boundary + ambiguity approach is
+safe because worker suffixes within a group are unique (e.g., `srdev-1`, `reviewer`,
+`debugger`), and the ambiguity guard rejects when multiple workers share a suffix.
+
 ---
 
 ## IDLE-DEFER & BackgroundTasks (PR #399)
