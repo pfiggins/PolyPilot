@@ -2123,7 +2123,15 @@ public partial class CopilotService
                 await Task.Delay(TimeSpan.FromSeconds(WatchdogCheckIntervalSeconds), ct);
 
                 if (!state.Info.IsProcessing) break;
-                if (state.IsOrphaned) { Debug($"[WATCHDOG] '{sessionName}' exiting — state is orphaned"); return; }
+                if (state.IsOrphaned)
+                {
+                    Debug($"[WATCHDOG] '{sessionName}' exiting — state is orphaned, resolving TCS to unblock callers");
+                    state.Info.IsProcessing = false;
+                    state.Info.ProcessingStartedAt = null;
+                    state.ResponseCompletion?.TrySetCanceled();
+                    OnSessionComplete?.Invoke(sessionName, "(orphaned)");
+                    return;
+                }
 
                 var lastEventTicks = Interlocked.Read(ref state.LastEventAtTicks);
                 var elapsed = (DateTime.UtcNow - new DateTime(lastEventTicks)).TotalSeconds;

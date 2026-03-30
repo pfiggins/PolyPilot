@@ -2539,6 +2539,21 @@ public partial class CopilotService
         const int maxRetries = 2;
         var dispatchTime = DateTime.Now;
 
+        // Pre-dispatch: if worker state is orphaned (e.g., from a failed reconnect),
+        // attempt to create a fresh session. Dispatching to an orphaned state would hang
+        // indefinitely because no event handler is registered on orphaned states.
+        if (_sessions.TryGetValue(workerName, out var orphanCheck) && orphanCheck.IsOrphaned)
+        {
+            Debug($"[DISPATCH] Worker '{workerName}' state is orphaned — attempting fresh session recovery");
+            var recovered = await TryRecoverWithFreshSessionAsync(workerName, cancellationToken);
+            if (!recovered)
+            {
+                Debug($"[DISPATCH] Worker '{workerName}' fresh session recovery failed — returning error");
+                return new WorkerResult(workerName, null, false, "Worker session is orphaned and recovery failed", sw.Elapsed);
+            }
+            Debug($"[DISPATCH] Worker '{workerName}' recovered with fresh session — proceeding with dispatch");
+        }
+
         // Pre-dispatch: if worker is still processing from a previous run (e.g., restored
         // mid-processing after app relaunch), wait for it to become idle. The watchdog will
         // clear IsProcessing within 30-120s for restored sessions.
@@ -4232,8 +4247,54 @@ public partial class CopilotService
 
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.WaitingForWorkers, iterDetail));
 
-            var workerTasks = assignments.Select(a => ExecuteWorkerAsync(a.WorkerName, a.Task, prompt, ct));
-            var results = await Task.WhenAll(workerTasks);
+            // Stagger workers with 1s delay (matching non-reflect dispatch path)
+            var workerTasks = new List<Task<WorkerResult>>();
+            foreach (var a in assignments)
+            {
+                workerTasks.Add(ExecuteWorkerAsync(a.WorkerName, a.Task, prompt, ct));
+                if (workerTasks.Count < assignments.Count)
+                    await Task.Delay(1000, ct);
+            }
+
+            // Bounded wait: if any worker is stuck, proceed with partial results
+            // rather than blocking the reflect loop indefinitely. Uses CancellationToken.None
+            // so the caller's token doesn't interfere with the timeout detection.
+            var allDone = Task.WhenAll(workerTasks);
+            var collectionTimeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            WorkerResult[] results;
+            if (await Task.WhenAny(allDone, collectionTimeout) != allDone)
+            {
+                Debug($"[DISPATCH] Reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers (iteration {reflectState.CurrentIteration})");
+                foreach (var a in assignments)
+                {
+                    if (_sessions.TryGetValue(a.WorkerName, out var ws))
+                    {
+                        if (ws.Info.IsProcessing)
+                        {
+                            Debug($"[DISPATCH] Force-completing stuck worker '{a.WorkerName}'");
+                            AddOrchestratorSystemMessage(a.WorkerName,
+                                "⚠️ Worker timed out — orchestrator is proceeding with partial results.");
+                            await ForceCompleteProcessingAsync(a.WorkerName, ws, $"reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m)");
+                        }
+                        else if (ws.ResponseCompletion?.Task.IsCompleted == false)
+                        {
+                            Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
+                            ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
+                        }
+                    }
+                }
+                var partialResults = new List<WorkerResult>();
+                foreach (var t in workerTasks)
+                {
+                    try { partialResults.Add(await t); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                }
+                results = partialResults.ToArray();
+            }
+            else
+            {
+                results = await allDone;
+            }
 
             // Track both attempted and successful workers across all iterations
             foreach (var a in assignments)

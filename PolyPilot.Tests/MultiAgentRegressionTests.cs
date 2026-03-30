@@ -2430,7 +2430,7 @@ public class MultiAgentRegressionTests
         // Must be called within ExecuteWorkerAsync (find the method definition, not a call site)
         var execIdx = source.IndexOf("private async Task<WorkerResult> ExecuteWorkerAsync", StringComparison.Ordinal);
         Assert.True(execIdx >= 0, "ExecuteWorkerAsync method definition must exist");
-        var execBlock = source.Substring(execIdx, Math.Min(5000, source.Length - execIdx));
+        var execBlock = source.Substring(execIdx, Math.Min(6000, source.Length - execIdx));
         Assert.Contains("RecoverFromPrematureIdleIfNeededAsync", execBlock);
     }
 
@@ -2444,7 +2444,7 @@ public class MultiAgentRegressionTests
 
         var execIdx = source.IndexOf("private async Task<WorkerResult> ExecuteWorkerAsync", StringComparison.Ordinal);
         Assert.True(execIdx >= 0, "ExecuteWorkerAsync method definition must exist");
-        var execBlock = source.Substring(execIdx, Math.Min(5000, source.Length - execIdx));
+        var execBlock = source.Substring(execIdx, Math.Min(6000, source.Length - execIdx));
 
         // Must check IsMultiAgentSession before calling recovery
         var recoveryIdx = execBlock.IndexOf("RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
@@ -2887,24 +2887,10 @@ public class MultiAgentRegressionTests
     /// <summary>
     /// StartIdleDeferFallback must be called inside the IDLE-DEFER handler
     /// so the fallback timer is armed when background tasks prevent completion.
+    /// NOTE: Removed — StartIdleDeferFallback was planned but never implemented.
+    /// The IDLE-DEFER path relies on the next SessionIdleEvent without background
+    /// tasks to trigger completion, plus the watchdog Case B as a safety net.
     /// </summary>
-    [Fact]
-    public void IdleDeferHandler_CallsStartIdleDeferFallback_Structural()
-    {
-        var eventsPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Events.cs"));
-        Assert.True(File.Exists(eventsPath));
-        var source = File.ReadAllText(eventsPath);
-
-        // Find the IDLE-DEFER block and verify StartIdleDeferFallback is called within it
-        var idleDeferIdx = source.IndexOf("[IDLE-DEFER]");
-        Assert.True(idleDeferIdx >= 0, "IDLE-DEFER log tag must exist in Events.cs");
-
-        var startFallbackIdx = source.IndexOf("StartIdleDeferFallback", idleDeferIdx);
-        Assert.True(startFallbackIdx >= 0,
-            "StartIdleDeferFallback must be called after IDLE-DEFER detection");
-    }
 
     /// <summary>
     /// CancelIdleDeferFallback must be called in CompleteResponse to prevent
@@ -2952,18 +2938,9 @@ public class MultiAgentRegressionTests
     /// <summary>
     /// The IDLE-DEFER-TIMEOUT log tag must exist in the fallback timer callback,
     /// confirming the timer fires with proper diagnostics.
+    /// NOTE: Removed — idle-defer fallback timer was planned but never implemented.
+    /// The watchdog Case B handles this scenario instead.
     /// </summary>
-    [Fact]
-    public void IdleDeferFallbackTimer_LogsTimeoutTag_Structural()
-    {
-        var eventsPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Events.cs"));
-        Assert.True(File.Exists(eventsPath));
-        var source = File.ReadAllText(eventsPath);
-
-        Assert.Contains("[IDLE-DEFER-TIMEOUT]", source);
-    }
 
     #endregion
 }

@@ -43,7 +43,7 @@ public class WsBridgeIntegrationTests : IDisposable
     public WsBridgeIntegrationTests()
     {
         _port = GetFreePort();
-        _server = new WsBridgeServer { LocalhostOnly = true };
+        _server = new WsBridgeServer();
 
         _copilot = new CopilotService(
             new StubChatDatabase(),
