@@ -337,6 +337,7 @@ When modifying orchestration, verify:
 - [ ] **INV-O6**: Phase changes fire OnOrchestratorPhaseChanged for UI updates
 - [ ] **INV-O7**: Worker timeouts use 10-minute default (600s for resumed sessions)
 - [ ] **INV-O8**: Cancellation tokens propagated to all async operations
+- [ ] **INV-O9-reflect**: Reflect dispatch path uses OrchestratorCollectionTimeout (not bare Task.WhenAll)
 - [ ] **INV-O15**: IDLE-DEFER flushes CurrentResponse before breaking (content preservation)
 
 ---
@@ -683,6 +684,60 @@ present (older CLI versions, or non-agent premature idles).
 
 **Filed**: See GitHub issue for tracking.
 
+### Bug: Worker dispatched to orphaned state hangs orchestrator (discovered 2026-03-30)
+
+**Symptom**: Orchestrator dispatches a worker, worker never responds. Orchestrator
+hangs until user manually aborts (44+ minutes observed). Event diagnostics show
+`[SEND]` with `gen=-9223372036854775808` (long.MinValue) for the stuck worker.
+
+**Root cause**: Three bugs combined:
+
+1. **Reflect path missing collection timeout (PRIMARY)**: `SendViaOrchestratorReflectAsync`
+   used bare `Task.WhenAll(workerTasks)` with NO timeout. The non-reflect path correctly
+   used `Task.WhenAny(allDone, timeout)` with 15-min `OrchestratorCollectionTimeout`.
+   Also missing: worker staggering (reflect path launched all workers simultaneously).
+
+2. **ExecuteWorkerAsync dispatches to orphaned state**: No `IsOrphaned` check before
+   dispatch. A worker's state was orphaned from a reconnect failure ("Session not found")
+   3 minutes earlier, but dispatch proceeded. The prompt was sent to a dead session —
+   TCS created but no event handler → TCS never completes.
+
+3. **Watchdog orphan exit doesn't resolve TCS**: When `RunProcessingWatchdogAsync`
+   detected `state.IsOrphaned`, it silently returned without resolving the
+   `ResponseCompletion` TCS or clearing `IsProcessing`. The orchestrator's
+   `Task.WhenAll` hung because the TCS was never completed.
+
+**Timeline from incident**:
+```
+12:16:16  Reconnect fails for 'tuul A Team-debugger' ("Session not found")
+          → State marked IsOrphaned, ProcessingGeneration=long.MaxValue
+12:19:08  Orchestrator dispatches 2 workers:
+          - reviewer: gen=1 (healthy) ✓
+          - debugger: gen=-9223372036854775808 (orphaned!) ✗
+12:19:23  Watchdog detects orphan, silently exits (TCS unresolved)
+12:20:58  Reviewer completes normally (126s)
+13:03:49  User manually aborts debugger after 2681s (44.7 min)
+```
+
+**Diagnostic indicator**: `gen=-9223372036854775808` (`long.MinValue`) in `[SEND]`
+log = guaranteed orphaned dispatch. Occurs when `Interlocked.Increment` wraps
+`long.MaxValue` (set during orphan marking per INV-O9) to `long.MinValue`.
+
+**Fix (3 parts)**:
+1. **Events.cs — Watchdog resolves TCS on orphan exit**: When watchdog detects
+   `IsOrphaned`, now calls `TrySetCanceled()` on TCS, clears `IsProcessing`,
+   fires `OnSessionComplete`. Orchestrator unblocks immediately.
+2. **Organization.cs — Orphan check before dispatch**: `ExecuteWorkerAsync` checks
+   `state.IsOrphaned` before sending. If orphaned, attempts fresh session recovery
+   via `TryRecoverWithFreshSessionAsync`. If recovery fails, returns
+   `WorkerResult(success: false)` immediately.
+3. **Organization.cs — Reflect path collection timeout**: Added
+   `OrchestratorCollectionTimeout` (15 min) + worker staggering to reflect dispatch
+   path, matching the non-reflect path pattern.
+
+**Invariants violated**: INV-O4 (OnSessionComplete not fired on watchdog orphan exit),
+INV-O9-reflect (new — reflect path must use collection timeout).
+
 ---
 
 ## IDLE-DEFER & BackgroundTasks (PR #399)
@@ -960,6 +1015,7 @@ Reflect mode runs multiple iterations. Expect this pattern:
 | Many IDLE-DEFER entries | `grep "IDLE-DEFER" diagnostics.log` | Normal — worker has active sub-agents; wait for completion |
 | IDLE-DEFER but worker never completes | Check if background tasks are leaking | Sub-agent/shell not terminating; check CLI logs |
 | Worker stuck 30+ min, events.jsonl fresh | Check file size across watchdog cycles | Dead connection — file-size-growth check should catch in ~360s (INV-O16) |
+| Worker gen=long.MinValue in SEND log | Worker state was orphaned before dispatch | Reconnect failed; ExecuteWorkerAsync now recovers with fresh session |
 
 ---
 
