@@ -19,7 +19,7 @@ public static class SquadWriter
         var squadDir = Path.Combine(worktreeRoot, ".squad");
         Directory.CreateDirectory(squadDir);
 
-        WriteTeamFile(squadDir, preset.Name, preset.Mode, workers);
+        WriteTeamFile(squadDir, preset.Name, preset.Mode, workers, preset.WorkerModels);
         WriteAgentCharters(squadDir, workers);
 
         if (!string.IsNullOrWhiteSpace(preset.SharedContext))
@@ -78,7 +78,8 @@ public static class SquadWriter
     }
 
     private static void WriteTeamFile(string squadDir, string teamName,
-        MultiAgentMode mode, List<(string Name, string? SystemPrompt)> workers)
+        MultiAgentMode mode, List<(string Name, string? SystemPrompt)> workers,
+        string[]? workerModels = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# {teamName}");
@@ -92,12 +93,34 @@ public static class SquadWriter
         };
         sb.AppendLine($"mode: {modeStr}");
         sb.AppendLine();
-        sb.AppendLine("| Member | Role |");
-        sb.AppendLine("|--------|------|");
-        foreach (var (name, prompt) in workers)
+
+        var hasModels = workerModels != null && workerModels.Length > 0
+            && workerModels.Any(m => !string.IsNullOrWhiteSpace(m));
+
+        if (hasModels)
         {
+            sb.AppendLine("| Member | Role | Model |");
+            sb.AppendLine("|--------|------|-------|");
+        }
+        else
+        {
+            sb.AppendLine("| Member | Role |");
+            sb.AppendLine("|--------|------|");
+        }
+
+        for (int i = 0; i < workers.Count; i++)
+        {
+            var (name, prompt) = workers[i];
             var role = DeriveRole(name, prompt);
-            sb.AppendLine($"| {name} | {role} |");
+            if (hasModels)
+            {
+                var model = workerModels != null && i < workerModels.Length ? workerModels[i] : "";
+                sb.AppendLine($"| {name} | {role} | {model} |");
+            }
+            else
+            {
+                sb.AppendLine($"| {name} | {role} |");
+            }
         }
         File.WriteAllText(Path.Combine(squadDir, "team.md"), sb.ToString());
     }

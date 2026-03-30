@@ -219,6 +219,32 @@ public static class SquadDiscovery
         return names;
     }
 
+    /// <summary>
+    /// Parse per-agent model assignments from team.md table rows.
+    /// Looks for a 3-column table: | Member | Role | Model |
+    /// Returns a dictionary mapping agent name to model string.
+    /// Returns empty dict if no Model column is present.
+    /// </summary>
+    internal static Dictionary<string, string> ParseRosterModels(string teamContent)
+    {
+        var models = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var tableRegex = new Regex(@"^\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|", RegexOptions.Multiline);
+        foreach (Match m in tableRegex.Matches(teamContent))
+        {
+            var name = m.Groups[1].Value.Trim();
+            var model = m.Groups[3].Value.Trim();
+            if (name == "---" || name.All(c => c == '-')
+                || name.Equals("Member", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Name", StringComparison.OrdinalIgnoreCase)
+                || model == "---" || model.All(c => c == '-')
+                || model.Equals("Model", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(model))
+                models[name] = model;
+        }
+        return models;
+    }
+
     private static string? ReadOptionalFile(string path, int maxLength)
     {
         if (!File.Exists(path)) return null;
@@ -235,11 +261,17 @@ public static class SquadDiscovery
         string? decisions, string? routing, string squadDir, MultiAgentMode mode,
         WorktreeStrategy? worktreeStrategy)
     {
-        // Use a sensible default model for all agents (user can override after creation)
         var defaultModel = "claude-sonnet-4.6";
         var orchestratorModel = "claude-opus-4.6";
 
-        var workerModels = agents.Select(_ => defaultModel).ToArray();
+        // Check for per-agent model assignments in team.md
+        var teamFile = Path.Combine(squadDir, "team.md");
+        var rosterModels = File.Exists(teamFile)
+            ? ParseRosterModels(File.ReadAllText(teamFile))
+            : new Dictionary<string, string>();
+
+        var workerModels = agents.Select(a =>
+            rosterModels.TryGetValue(a.Name, out var m) ? m : defaultModel).ToArray();
         var systemPrompts = agents.Select(a => a.Charter).ToArray();
         var displayNames = agents.Select(a => a.Name).ToArray();
 
