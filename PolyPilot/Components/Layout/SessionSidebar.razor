@@ -721,25 +721,29 @@ else
                                 @{
                                     var diags = CopilotService.GetGroupDiagnostics(maGroupId);
                                 }
-                                @if (diags.Count > 0)
-                                {
-                                    <div class="group-diagnostics">
-                                        @foreach (var d in diags)
-                                        {
-                                            <span class="diag-@d.Level">@d.Message</span>
-                                        }
-                                    </div>
-                                }
                                 @{
                                     var settingsExpanded = _groupSettingsExpanded.Contains(maGroupId);
                                 }
                                 <div class="group-settings-toggle" @onclick="() => ToggleGroupSettings(maGroupId)" @onclick:stopPropagation="true">
                                     <span class="unpinned-chevron">@(settingsExpanded ? "▼" : "▶")</span>
                                     <span class="unpinned-label">⚙ Settings</span>
+                                    @if (diags.Count > 0)
+                                    {
+                                        <span class="diag-badge" title="@diags.Count diagnostic(s)">⚠ @diags.Count</span>
+                                    }
                                 </div>
                                 @if (settingsExpanded)
                                 {
                                     <div class="group-settings-panel">
+                                        @if (diags.Count > 0)
+                                        {
+                                            <div class="group-diagnostics">
+                                                @foreach (var d in diags)
+                                                {
+                                                    <span class="diag-@d.Level">@d.Message</span>
+                                                }
+                                            </div>
+                                        }
                                         <select class="sidebar-ma-mode-select" @onchange="(e) => OnSidebarMultiAgentModeChanged(maGroupId, e)">
                                             <option value="Broadcast" selected="@(group.OrchestratorMode == MultiAgentMode.Broadcast)">📡 Broadcast</option>
                                             <option value="Sequential" selected="@(group.OrchestratorMode == MultiAgentMode.Sequential)">⏩ Sequential</option>

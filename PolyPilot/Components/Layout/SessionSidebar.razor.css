@@ -1948,6 +1948,12 @@
 .diag-warning { color: #fbbf24; }
 .diag-info { color: var(--text-dim); }
 
+.diag-badge {
+    font-size: var(--type-caption1);
+    color: #fbbf24;
+    margin-left: auto;
+}
+
 .save-preset-btn {
     all: unset;
     font-size: var(--type-body);
