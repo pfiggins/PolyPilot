@@ -257,6 +257,44 @@ public static class SquadDiscovery
         catch { return null; }
     }
 
+    /// <summary>
+    /// Determine whether an agent should get its own isolated worktree based on role.
+    /// Roles that don't develop (reviewer, architect, debugger, firmware-dev) share orchestrator's worktree.
+    /// </summary>
+    internal static bool ShouldGetOwnWorktree(string role)
+    {
+        if (string.IsNullOrWhiteSpace(role)) return true;
+        var lower = role.ToLowerInvariant();
+        return !lower.Contains("reviewer") && !lower.Contains("architect") 
+            && !lower.Contains("debugger") && !lower.Contains("firmware");
+    }
+
+    /// <summary>
+    /// Parse per-agent roles from team.md table rows.
+    /// Looks for a 3-column table: | Member | Role | Model |
+    /// Returns a dictionary mapping agent name to role string.
+    /// Returns empty dict if no Role column is present.
+    /// </summary>
+    internal static Dictionary<string, string> ParseRosterRoles(string teamContent)
+    {
+        var roles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var tableRegex = new Regex(@"^\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|", RegexOptions.Multiline);
+        foreach (Match m in tableRegex.Matches(teamContent))
+        {
+            var name = m.Groups[1].Value.Trim();
+            var role = m.Groups[2].Value.Trim();
+            if (name == "---" || name.All(c => c == '-')
+                || string.Equals(name, "Member", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "Name", StringComparison.OrdinalIgnoreCase)
+                || role == "---" || role.All(c => c == '-')
+                || string.Equals(role, "Role", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(role))
+                roles[name] = role;
+        }
+        return roles;
+    }
+
     private static GroupPreset BuildPreset(string teamName, List<SquadAgent> agents,
         string? decisions, string? routing, string squadDir, MultiAgentMode mode,
         WorktreeStrategy? worktreeStrategy)
@@ -264,16 +302,24 @@ public static class SquadDiscovery
         var defaultModel = "claude-sonnet-4.6";
         var orchestratorModel = "claude-opus-4.6";
 
-        // Check for per-agent model assignments in team.md
+        // Check for per-agent model assignments and roles in team.md
         var teamFile = Path.Combine(squadDir, "team.md");
-        var rosterModels = File.Exists(teamFile)
-            ? ParseRosterModels(File.ReadAllText(teamFile))
-            : new Dictionary<string, string>();
+        var teamContent = File.Exists(teamFile) ? File.ReadAllText(teamFile) : "";
+        var rosterModels = ParseRosterModels(teamContent);
+        var rosterRoles = ParseRosterRoles(teamContent);
 
         var workerModels = agents.Select(a =>
             rosterModels.TryGetValue(a.Name, out var m) ? m : defaultModel).ToArray();
         var systemPrompts = agents.Select(a => a.Charter).ToArray();
         var displayNames = agents.Select(a => a.Name).ToArray();
+        
+        // Build WorkerUseWorktree array: non-developer roles share orchestrator's worktree
+        var workerUseWorktree = agents.Select(a =>
+        {
+            if (rosterRoles.TryGetValue(a.Name, out var role))
+                return ShouldGetOwnWorktree(role);
+            return true; // Default: all workers get own worktree if no role specified
+        }).ToArray();
 
         return new GroupPreset(
             teamName,
@@ -292,6 +338,7 @@ public static class SquadDiscovery
             // Honor explicit team.md setting, otherwise default to FullyIsolated
             // so parallel workers don't cause git conflicts.
             DefaultWorktreeStrategy = worktreeStrategy ?? WorktreeStrategy.FullyIsolated,
+            WorkerUseWorktree = workerUseWorktree,
         };
     }
 
