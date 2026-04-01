@@ -259,14 +259,15 @@ public static class SquadDiscovery
 
     /// <summary>
     /// Determine whether an agent should get its own isolated worktree based on role.
-    /// Roles that don't develop (reviewer, architect, debugger, firmware-dev) share orchestrator's worktree.
+    /// Roles that don't develop (reviewer, architect, debugger) share orchestrator's worktree.
+    /// Developers and firmware developers get their own worktrees.
     /// </summary>
     internal static bool ShouldGetOwnWorktree(string role)
     {
         if (string.IsNullOrWhiteSpace(role)) return true;
         var lower = role.ToLowerInvariant();
         return !lower.Contains("reviewer") && !lower.Contains("architect") 
-            && !lower.Contains("debugger") && !lower.Contains("firmware");
+            && !lower.Contains("debugger");
     }
 
     /// <summary>
