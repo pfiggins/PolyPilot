@@ -620,6 +620,10 @@ public partial class CopilotService : IAsyncDisposable
         /// check to detect dead connections early (instead of waiting for the 600s watchdog timeout).</summary>
         public Timer? ToolHealthCheckTimer;
         public int ToolHealthStaleChecks; // Separate from WatchdogCaseAResets — health check's own stale counter
+        /// <summary>One-shot Timer started on first IDLE-DEFER that force-completes the session after
+        /// BackgroundTaskIdleMaxDeferSeconds (300s) even if no second idle arrives.
+        /// Must be a field (not property) so it can be used with Interlocked.Exchange.</summary>
+        public Timer? IdleDeferFallbackTimer;
         /// <summary>Timestamp when the most recent tool started. Used by the tool health check to
         /// determine if a tool has been running too long without any events.</summary>
         public long ToolStartedAtTicks;
@@ -644,6 +648,11 @@ public partial class CopilotService : IAsyncDisposable
         /// <summary>True if the watchdog has already attempted an abort for the current
         /// processing generation. Prevents repeated abort attempts.</summary>
         public volatile bool WatchdogAbortAttempted;
+        /// <summary>Set to true by the watchdog kill path when it force-completes a turn.
+        /// Read by the orchestrator reflect and non-reflect loops to detect truncated responses
+        /// (dead connection) and retry the full planning prompt instead of sending a nudge.
+        /// Cleared by SendPromptAsync at the start of each new turn.</summary>
+        public volatile bool WatchdogKilledThisTurn;
         /// <summary>Set to true when this state is replaced by a reconnect. Prevents orphaned
         /// event handlers (still registered on the old CopilotSession) from processing events
         /// or clearing IsProcessing on the shared Info object.</summary>
@@ -3262,6 +3271,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
         state.WasUserAborted = false; // Clear abort flag — new turn starts fresh (re-enables EVT-REARM)
+        state.WatchdogKilledThisTurn = false; // Clear watchdog-kill flag — new turn starts fresh
         state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);

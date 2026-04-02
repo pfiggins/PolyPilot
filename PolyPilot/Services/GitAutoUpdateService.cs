@@ -171,47 +171,34 @@ public class GitAutoUpdateService : IDisposable
                 }
                 catch
                 {
-                    // True divergence: both sides have unique commits. Try rebase for forks.
+                    // True divergence: both sides have unique commits. Merge (not rebase) so the
+                    // result is a reversible merge commit — bad merges can be reverted with
+                    // git revert -m 1 <merge-commit> without rewriting history.
                     if (updateRemote == "upstream")
                     {
-                        _status = $"Rebasing onto {updateRemote}/main...";
+                        _status = $"Merging {updateRemote}/main...";
                         NotifyChanged();
                         try
                         {
-                            await RunGit($"rebase {updateRemote}/main");
-                            // Rebase succeeded — force-push to keep fork in sync
+                            await RunGit($"merge {updateRemote}/main --no-edit");
+                            // Push to keep fork in sync — no force needed (merge preserves history)
                             try
                             {
-                                await RunGit("push origin main --force-with-lease --quiet");
-                                _logger.LogInformation("Fork rebased and force-pushed to origin");
+                                await RunGit("push origin main --quiet");
+                                _logger.LogInformation("Fork merged and pushed to origin");
                             }
                             catch (Exception pushEx)
                             {
-                                _logger.LogWarning(pushEx, "Rebase succeeded but force-push to origin failed");
+                                _logger.LogWarning(pushEx, "Merge succeeded but push to origin failed");
                             }
-                            // Continue to rebuild below
                             goto rebuild;
                         }
-                        catch (Exception rebaseEx)
+                        catch (Exception mergeEx)
                         {
-                            // Rebase had conflicts — attempt auto-resolution preferring upstream
-                            _logger.LogWarning(rebaseEx, "Rebase onto upstream/main had conflicts — attempting auto-resolve");
-                            if (await TryAutoResolveRebaseConflicts())
-                            {
-                                // Auto-resolve succeeded — force-push to keep fork in sync
-                                try
-                                {
-                                    await RunGit("push origin main --force-with-lease --quiet");
-                                    _logger.LogInformation("Fork rebased (auto-resolved) and force-pushed to origin");
-                                }
-                                catch (Exception pushEx)
-                                {
-                                    _logger.LogWarning(pushEx, "Rebase succeeded but force-push to origin failed");
-                                }
-                                goto rebuild;
-                            }
-                            // Auto-resolve failed — already aborted inside TryAutoResolveRebaseConflicts
-                            _status = $"Rebase conflict with {updateRemote}/main — auto-resolve failed, skipping";
+                            // Merge had conflicts — abort and let the user resolve manually
+                            _logger.LogWarning(mergeEx, "Merge of upstream/main had conflicts — aborting");
+                            try { await RunGit("merge --abort"); } catch { }
+                            _status = $"Merge conflict with {updateRemote}/main — resolve manually and restart";
                             NotifyChanged();
                             return;
                         }
@@ -304,90 +291,6 @@ public class GitAutoUpdateService : IDisposable
         {
             Interlocked.Exchange(ref _checking, 0);
         }
-    }
-
-    /// <summary>
-    /// Attempts to auto-resolve rebase conflicts by preferring upstream's version.
-    /// During a rebase, "ours" is the upstream base (the branch we're rebasing onto)
-    /// and "theirs" is our local commit being replayed. To prefer upstream, we use --ours.
-    /// Loops through each conflicted commit until the rebase completes or a non-resolvable
-    /// error occurs (max 50 iterations as safety bound).
-    /// </summary>
-    private async Task<bool> TryAutoResolveRebaseConflicts()
-    {
-        const int maxSteps = 50;
-        for (int step = 0; step < maxSteps; step++)
-        {
-            try
-            {
-                // Get list of conflicted files
-                var status = await RunGit("diff --name-only --diff-filter=U", throwOnError: false);
-                var conflicted = status.Trim()
-                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(f => f.Trim())
-                    .Where(f => !string.IsNullOrEmpty(f))
-                    .ToArray();
-
-                if (conflicted.Length == 0)
-                {
-                    // No conflicts — try to continue (may be an empty commit or rebase finished)
-                    try
-                    {
-                        await RunGit("-c core.editor=true rebase --continue");
-                    }
-                    catch
-                    {
-                        // rebase --continue can fail if rebase already finished
-                    }
-                    if (!IsRebaseInProgress()) return true;
-                    continue;
-                }
-
-                _status = $"Auto-resolving {conflicted.Length} conflict{(conflicted.Length == 1 ? "" : "s")} (step {step + 1})...";
-                NotifyChanged();
-
-                // Resolve each file preferring upstream (--ours during rebase = upstream base)
-                foreach (var file in conflicted)
-                {
-                    _logger.LogInformation("Auto-resolving conflict in {File} (preferring upstream)", file);
-                    await RunGit($"checkout --ours -- \"{file}\"");
-                    await RunGit($"add -- \"{file}\"");
-                }
-
-                // Continue the rebase with the resolved files
-                try
-                {
-                    await RunGit("-c core.editor=true rebase --continue");
-                }
-                catch
-                {
-                    // More conflicts on the next commit — loop will handle them
-                    if (!IsRebaseInProgress()) return true;
-                    continue;
-                }
-
-                if (!IsRebaseInProgress()) return true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Auto-resolve step {Step} failed — aborting rebase", step);
-                try { await RunGit("rebase --abort"); } catch { }
-                return false;
-            }
-        }
-
-        // Exceeded max steps
-        if (!IsRebaseInProgress()) return true;
-        _logger.LogWarning("Auto-resolve exceeded {MaxSteps} steps — aborting rebase", maxSteps);
-        try { await RunGit("rebase --abort"); } catch { }
-        return false;
-    }
-
-    private bool IsRebaseInProgress()
-    {
-        if (_gitRoot == null) return false;
-        return Directory.Exists(Path.Combine(_gitRoot, ".git", "rebase-merge"))
-            || Directory.Exists(Path.Combine(_gitRoot, ".git", "rebase-apply"));
     }
 
     private async Task<string> RunGit(string args, bool throwOnError = true)
