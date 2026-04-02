@@ -644,6 +644,14 @@ public partial class CopilotService
                 // Cancel the TurnEnd→Idle fallback — normal SessionIdleEvent arrived
                 CancelTurnEndFallback(state);
 
+                // Diagnostic: dump raw backgroundTasks payload to prove whether CLI populates it consistently
+                {
+                    var bt = idle.Data?.BackgroundTasks;
+                    var agentCount = bt?.Agents?.Length ?? -1;
+                    var shellCount = bt?.Shells?.Length ?? -1;
+                    Debug($"[IDLE-DIAG] '{sessionName}' session.idle payload: backgroundTasks={{agents={agentCount}, shells={shellCount}, null={bt == null}}}");
+                }
+
                 // KEY FIX: Check if the server reports active background tasks (sub-agents, shells).
                 // session.idle with background tasks means "foreground quiesced, background still running."
                 // Do NOT treat this as terminal — flush text and wait for the real idle.
@@ -658,6 +666,23 @@ public partial class CopilotService
                     {
                         if (state.IsOrphaned) return;
                         FlushCurrentResponse(state);
+
+                        // FIX #403: If IsProcessing was already cleared (by watchdog timeout,
+                        // reconnect, or prior EVT-REARM cycle), re-arm it. Without this, the
+                        // session appears done but background tasks are still running — the
+                        // orchestrator collects a truncated/empty response.
+                        // Guards mirror EVT-REARM: skip if orphaned or user-aborted.
+                        if (!state.Info.IsProcessing && !state.WasUserAborted)
+                        {
+                            Debug($"[IDLE-DEFER-REARM] '{sessionName}' re-arming IsProcessing — background tasks active but processing was cleared");
+                            state.Info.IsProcessing = true;
+                            state.Info.ProcessingPhase = 3; // Working (background tasks)
+                            state.Info.ProcessingStartedAt ??= DateTime.UtcNow;
+                            state.HasUsedToolsThisTurn = true; // 600s timeout (background tasks can run long)
+                            state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
+                            StartProcessingWatchdog(state, sessionName);
+                        }
+
                         NotifyStateChangedCoalesced();
                     });
                     break; // Don't complete — wait for next idle without background tasks
@@ -710,8 +735,18 @@ public partial class CopilotService
                 if (!string.IsNullOrEmpty(startModel))
                 {
                     var normalizedStartModel = Models.ModelHelper.NormalizeToSlug(startModel);
-                    state.Info.Model = normalizedStartModel;
-                    Debug($"Session model from start event: {startModel} → {normalizedStartModel}");
+                    // Only update if the user hasn't already set a model — the CLI may
+                    // report a default model (e.g. haiku) after abort/resume that overrides
+                    // the user's explicit choice.
+                    if (string.IsNullOrEmpty(state.Info.Model) || state.Info.Model == "resumed")
+                    {
+                        state.Info.Model = normalizedStartModel;
+                        Debug($"Session model from start event: {startModel} → {normalizedStartModel}");
+                    }
+                    else if (normalizedStartModel != state.Info.Model)
+                    {
+                        Debug($"Session model from start event ignored: {startModel} → {normalizedStartModel} (keeping user choice: {state.Info.Model})");
+                    }
                 }
                 Invoke(() => { if (!IsRestoring) SaveActiveSessionsToDisk(); });
                 break;

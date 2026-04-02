@@ -264,6 +264,11 @@ public partial class CopilotService : IAsyncDisposable
             ? _bridgeClient.AvailableModels
             : _localAvailableModels;
     private List<string> _localAvailableModels = new();
+    /// <summary>
+    /// Maps model slug (Id) → display name from the SDK's ListModelsAsync.
+    /// Used for richer display when the algorithmic prettification isn't sufficient.
+    /// </summary>
+    public Dictionary<string, string> ModelDisplayNames { get; private set; } = new();
 
     private readonly RepoManager _repoManager;
     private readonly CodespaceService _codespaceService;
@@ -1088,7 +1093,9 @@ public partial class CopilotService : IAsyncDisposable
         _ = CheckAuthStatusAsync();
 
         // Load organization state FIRST (groups, pinning, sorting) so reconcile during restore doesn't wipe it
+        var startupSw = System.Diagnostics.Stopwatch.StartNew();
         LoadOrganization();
+        Debug($"[STARTUP-TIMING] LoadOrganization: {startupSw.ElapsedMilliseconds}ms");
 
         // Session restore runs in the background so the UI renders immediately.
         // With many sessions (40+), sequential ResumeSessionAsync calls can take
@@ -1099,7 +1106,13 @@ public partial class CopilotService : IAsyncDisposable
         // Without Task.Run, the async continuations run on the UI thread. LoadHistoryFromDisk's
         // .GetAwaiter().GetResult() then blocks the UI thread waiting for async file I/O whose
         // continuation needs the UI thread → classic SyncContext deadlock → blue screen.
-        _ = Task.Run(() => RestoreSessionsInBackgroundAsync(cancellationToken));
+        Debug($"[STARTUP-TIMING] Pre-restore: {startupSw.ElapsedMilliseconds}ms");
+        _ = Task.Run(async () =>
+        {
+            var restoreSw = System.Diagnostics.Stopwatch.StartNew();
+            await RestoreSessionsInBackgroundAsync(cancellationToken);
+            Debug($"[STARTUP-TIMING] RestoreSessionsInBackground: {restoreSw.ElapsedMilliseconds}ms");
+        });
 
         // Initialize any registered providers (from DI / plugin loader)
         await InitializeProvidersAsync(cancellationToken);
