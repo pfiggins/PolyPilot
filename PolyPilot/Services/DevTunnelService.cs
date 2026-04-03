@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using PolyPilot.Models;
 
@@ -212,6 +213,7 @@ public partial class DevTunnelService : IDisposable
             // Hook bridge to CopilotService for state sync
             _bridge.SetCopilotService(_copilot);
             _bridge.SetRepoManager(_repoManager);
+            _bridge.ServerPassword = settings.ServerPassword;
 
             // Set a temporary random token before starting the bridge so connections
             // are rejected during the tunnel setup window (before the real token is issued).
@@ -267,16 +269,13 @@ public partial class DevTunnelService : IDisposable
             _accessToken = await IssueAccessTokenAsync();
             if (_accessToken == null)
             {
-                // Could not issue a real token — clear the random placeholder so the bridge
-                // reverts to unauthenticated local-only mode rather than being permanently
-                // locked with an opaque token no client can ever know.
-                _bridge.AccessToken = null;
-                Console.WriteLine("[DevTunnel] Warning: could not issue access token — bridge running in local-only mode");
+                var lastError = "Tunnel started but no connect token was issued";
+                Stop(cleanClose: false);
+                SetError(lastError);
+                return false;
             }
-            else
-            {
-                _bridge.AccessToken = _accessToken;
-            }
+
+            _bridge.AccessToken = _accessToken;
 
             SetState(TunnelState.Running);
             hostStopwatch.Stop();
@@ -418,51 +417,185 @@ public partial class DevTunnelService : IDisposable
         var tunnelArg = _tunnelId ?? "";
         try
         {
-            var psi = new ProcessStartInfo
+            var token = await TryIssueAccessTokenAsync(tunnelArg, useJsonOutput: true)
+                ?? await TryIssueAccessTokenAsync(tunnelArg, useJsonOutput: false);
+
+            if (token != null)
             {
-                FileName = ResolveDevTunnel(),
-                Arguments = $"token {tunnelArg} --scopes connect",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-            using var p = Process.Start(psi);
-            if (p == null) return null;
-            var output = await p.StandardOutput.ReadToEndAsync();
-            await p.WaitForExitAsync();
-            if (p.ExitCode != 0)
-            {
-                var err = await p.StandardError.ReadToEndAsync();
-                Console.WriteLine($"[DevTunnel] Token error: {err}");
-                return null;
+                Console.WriteLine($"[DevTunnel] Access token issued ({token.Length} chars)");
+                _ = _auditLog?.LogDevtunnelTokenAcquired(null, _tunnelId, token.Length);
+                return token;
             }
-            // Output has multiple lines like "Token tunnel ID: ...\nToken: <jwt>"
-            // Extract just the token value
-            var token = "";
-            foreach (var line in output.Split('\n'))
-            {
-                if (line.StartsWith("Token:", StringComparison.OrdinalIgnoreCase) && !line.StartsWith("Token ", StringComparison.OrdinalIgnoreCase))
-                {
-                    token = line["Token:".Length..].Trim();
-                    break;
-                }
-            }
-            // Fallback: if no "Token:" prefix found, try the last non-empty line (might be raw token)
-            if (string.IsNullOrEmpty(token))
-            {
-                var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                token = lines.Length > 0 ? lines[^1].Trim() : "";
-            }
-            Console.WriteLine($"[DevTunnel] Access token issued ({token.Length} chars)");
-            _ = _auditLog?.LogDevtunnelTokenAcquired(null, _tunnelId, token.Length);
-            return string.IsNullOrEmpty(token) ? null : token;
+
+            Console.WriteLine("[DevTunnel] Token output did not contain a usable access token");
+            return null;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[DevTunnel] Token error: {ex.Message}");
             return null;
         }
+    }
+
+    private static async Task<string?> TryIssueAccessTokenAsync(string tunnelArg, bool useJsonOutput)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = ResolveDevTunnel(),
+            Arguments = useJsonOutput
+                ? $"token {tunnelArg} --scopes connect -j"
+                : $"token {tunnelArg} --scopes connect",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var p = Process.Start(psi);
+        if (p == null) return null;
+
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
+        var stderrTask = p.StandardError.ReadToEndAsync();
+
+        await p.WaitForExitAsync();
+
+        var output = await stdoutTask;
+        var error = await stderrTask;
+
+        if (p.ExitCode != 0)
+        {
+            Console.WriteLine($"[DevTunnel] Token error{(useJsonOutput ? " (json)" : "")}: {SummarizeTokenCommandOutput(error, output)}");
+            return null;
+        }
+
+        // Prefer stdout; only fall back to stderr when stdout was truly empty/whitespace,
+        // to avoid picking up error messages or warnings as false-positive tokens.
+        var token = ParseAccessTokenOutput(output);
+        if (token != null)
+            return token;
+        return string.IsNullOrWhiteSpace(output) ? ParseAccessTokenOutput(error) : null;
+    }
+
+    internal static string? ParseAccessTokenOutput(string? output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return null;
+
+        var trimmed = output.Trim();
+
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            var jsonToken = TryExtractTokenFromJson(doc.RootElement);
+            if (!string.IsNullOrWhiteSpace(jsonToken))
+                return jsonToken;
+        }
+        catch (JsonException)
+        {
+        }
+
+        foreach (var line in trimmed.Split('\n'))
+        {
+            if (line.StartsWith("Token:", StringComparison.OrdinalIgnoreCase)
+                && !line.StartsWith("Token ", StringComparison.OrdinalIgnoreCase))
+            {
+                var token = line["Token:".Length..].Trim();
+                return string.IsNullOrEmpty(token) ? null : token;
+            }
+        }
+
+        var lines = trimmed.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length == 0)
+            return null;
+
+        var lastLine = lines[^1].Trim();
+        return LooksLikeAccessToken(lastLine) ? lastLine : null;
+    }
+
+    private static string? TryExtractTokenFromJson(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+            {
+                var value = element.GetString()?.Trim();
+                return LooksLikeAccessToken(value) ? value : null;
+            }
+
+            case JsonValueKind.Object:
+            {
+                foreach (var propertyName in new[] { "token", "accessToken", "access_token" })
+                {
+                    if (element.TryGetProperty(propertyName, out var namedValue))
+                    {
+                        var token = TryExtractTokenFromJson(namedValue);
+                        if (!string.IsNullOrWhiteSpace(token))
+                            return token;
+                    }
+                }
+
+                foreach (var property in element.EnumerateObject())
+                {
+                    var token = TryExtractTokenFromJson(property.Value);
+                    if (!string.IsNullOrWhiteSpace(token))
+                        return token;
+                }
+
+                break;
+            }
+
+            case JsonValueKind.Array:
+            {
+                foreach (var item in element.EnumerateArray())
+                {
+                    var token = TryExtractTokenFromJson(item);
+                    if (!string.IsNullOrWhiteSpace(token))
+                        return token;
+                }
+
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool LooksLikeAccessToken(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var trimmed = value.Trim();
+        if (trimmed.Contains("://", StringComparison.Ordinal)
+            || trimmed.Contains('/')
+            || trimmed.Contains('\\')
+            || trimmed.Contains(':')
+            || trimmed.Any(char.IsWhiteSpace))
+            return false;
+
+        // Tokens with dots (JWT-style "header.payload.signature") must be at least 32 chars
+        // to avoid matching version strings like "1.0.0-preview.260212.1" (22 chars).
+        var dotCount = trimmed.Count(c => c == '.');
+        if (dotCount >= 1 && trimmed.Length >= 32)
+            return true;
+
+        // Opaque tokens (no dots) must be at least 24 chars and consist only of
+        // base64url-safe characters to avoid matching error messages or file paths.
+        if (dotCount == 0 && trimmed.Length >= 24)
+            return trimmed.All(c => char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '+' || c == '=');
+
+        return false;
+    }
+
+    private static string SummarizeTokenCommandOutput(string primary, string secondary)
+    {
+        foreach (var candidate in new[] { primary, secondary })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+                return candidate.Trim().ReplaceLineEndings(" ");
+        }
+
+        return "(no output)";
     }
 
     /// <summary>
