@@ -705,6 +705,35 @@
     padding: 0 0.3rem;
 }
 
+/* Hybrid copy/select detail view: keep chrome non-selectable, but allow direct
+   text selection in actual message and output surfaces. */
+.expanded-card {
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.expanded-card input,
+.expanded-card textarea,
+.expanded-card select,
+.expanded-card ::deep .chat-msg-text,
+.expanded-card ::deep .orchestration-prompt-content,
+.expanded-card ::deep .reasoning-content,
+.expanded-card ::deep .system-text,
+.expanded-card ::deep .reflection-text,
+.expanded-card ::deep .task-complete-text,
+.expanded-card ::deep .error-text,
+.expanded-card ::deep .shell-output-text,
+.expanded-card ::deep .action-input pre,
+.expanded-card ::deep .action-full-input pre,
+.expanded-card ::deep .action-output pre,
+.expanded-card ::deep .markdown-body,
+.expanded-card ::deep .markdown-body *,
+.expanded-card ::deep .diff-table,
+.expanded-card ::deep .diff-table * {
+    -webkit-user-select: text;
+    user-select: text;
+}
+
 /* === Mobile responsive === */
 @media (max-width: 640px) {
     .status-extra { display: none; }
@@ -719,5 +748,3 @@
     .expanded-card .input-area textarea { font-size: var(--type-callout, 0.8rem); max-height: 30dvh; }
     .input-status-bar { gap: 0.4rem; }
 }
-
-
