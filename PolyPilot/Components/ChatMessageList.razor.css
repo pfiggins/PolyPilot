@@ -242,6 +242,54 @@
     margin: 0.2rem 0;
 }
 
+/* Worker Results — per-worker collapsible sections */
+::deep .worker-results-header {
+    font-weight: 600;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.85);
+    padding: 0.3rem 0;
+    margin-top: 0.5rem;
+}
+
+::deep .worker-results-preamble {
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.55);
+    padding: 0 0.5rem 0.3rem;
+}
+
+::deep .worker-result-details {
+    margin: 0.3rem 0;
+    background: rgba(0, 150, 255, 0.04);
+    border: 1px solid rgba(0, 150, 255, 0.12);
+    border-radius: 6px;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+::deep .worker-result-details > summary.worker-result-header {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.4rem 0.75rem;
+    color: rgba(255, 255, 255, 0.8);
+    user-select: none;
+}
+
+::deep .worker-result-details > summary.worker-result-header:hover {
+    color: rgba(255, 255, 255, 1);
+    background: rgba(0, 150, 255, 0.08);
+}
+
+::deep .worker-result-details .worker-result-content {
+    padding: 0 0.75rem 0.5rem;
+    max-height: 500px;
+    overflow-y: auto;
+    word-break: break-word;
+}
+
+::deep .worker-result-details .worker-result-content p {
+    margin: 0.2rem 0;
+}
+
 .chat-message-list.full ::deep .chat-msg.assistant .chat-msg-content {
     background: rgba(0, 195, 91, 0.06);
     border: 1px solid rgba(0, 195, 91, 0.12);

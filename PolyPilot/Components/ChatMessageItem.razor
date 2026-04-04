@@ -25,7 +25,15 @@
                 {
                     <span class="chat-msg-role">You</span>
                 }
-                @if (!string.IsNullOrEmpty(Message.OriginalContent))
+                @if (!string.IsNullOrEmpty(Message.OriginalContent) && ChatMessageList.IsWorkerPrompt(Message.Content))
+                {
+                    @((MarkupString)ChatMessageList.RenderWorkerPromptSections(Message.Content, Message.OriginalContent, CollapseOriginalContent))
+                }
+                else if (ChatMessageList.IsWorkerPrompt(Message.Content))
+                {
+                    @((MarkupString)ChatMessageList.RenderWorkerPromptSections(Message.Content))
+                }
+                else if (!string.IsNullOrEmpty(Message.OriginalContent))
                 {
                     @((MarkupString)ChatMessageList.RenderOrchestratorPromptSections(Message.Content, Message.OriginalContent, CollapseOriginalContent))
                 }

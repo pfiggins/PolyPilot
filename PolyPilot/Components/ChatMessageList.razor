@@ -327,6 +327,28 @@
         { "Original User Request", "boilerplate" },
     };
 
+    // Worker prompt section headers — used when the message is an orchestrator dispatch to a worker.
+    // "Your Assigned Task" is expanded by default; everything else is collapsed as context.
+    private static readonly Dictionary<string, string> WorkerPromptSectionMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        { "Your Assigned Task", "expanded" },
+        { "Original User Request", "boilerplate" },
+        { "CRITICAL: Tool Usage", "boilerplate" },
+        { "Team Context", "boilerplate" },
+        { "Your Worktree", "boilerplate" },
+        { "Multi-Agent Workflow Protocol", "boilerplate" },
+    };
+
+    /// <summary>
+    /// Returns true if content is a worker prompt (dispatched from orchestrator to worker).
+    /// Worker prompts always contain "## Your Assigned Task" near the end.
+    /// </summary>
+    internal static bool IsWorkerPrompt(string? content)
+    {
+        if (string.IsNullOrEmpty(content)) return false;
+        return content.Contains("## Your Assigned Task");
+    }
+
     // Section headers characteristic of orchestrator-generated prompts.
     // Any single match is sufficient — normal user messages never contain these headers.
     private static readonly string[] OrchestratorMarkers = new[]
@@ -510,10 +532,123 @@
             else if (mode == "collapsed")
             {
                 FlushBoilerplate();
-                // Collapsed standalone — generate a brief summary line for the collapsed header
-                var summary = BuildCollapsedSummary(header!, body);
-                sb.Append("<details class=\"orchestrator-dynamic-details\">");
-                sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(summary)}</summary>");
+                // For "Worker Results", split into per-worker collapsible sections
+                if (header!.StartsWith("Worker Results", StringComparison.OrdinalIgnoreCase))
+                {
+                    RenderPerWorkerSections(sb, header, body);
+                }
+                else
+                {
+                    // Other collapsed sections — single collapsible block
+                    var summary = BuildCollapsedSummary(header!, body);
+                    sb.Append("<details class=\"orchestrator-dynamic-details\">");
+                    sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(summary)}</summary>");
+                    sb.Append("<div class=\"orchestrator-dynamic-content\">");
+                    sb.Append(MarkdownRenderer.ToHtml(body));
+                    sb.Append("</div></details>");
+                }
+            }
+            else
+            {
+                var label = !string.IsNullOrEmpty(header) ? header : "Preamble";
+                boilerplateBuffer.Add((label, body));
+            }
+        }
+        FlushBoilerplate();
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Renders a worker prompt (orchestrator dispatch to a worker) with section-aware collapsing.
+    /// "Your Assigned Task" is shown expanded by default; all other sections (identity preamble,
+    /// Original User Request, Tool Usage Policy, Team Context, etc.) are collapsed into a single
+    /// "Orchestration context" panel.
+    /// </summary>
+    internal static string RenderWorkerPromptSections(string content, string? originalContent = null, bool collapseOriginal = false)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+
+        // Split content into sections by ## headers that are in the worker prompt map
+        var sections = new List<(string? header, string body)>();
+        var lines = content.Split('\n');
+        string? currentHeader = null;
+        var currentBody = new System.Text.StringBuilder();
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("## "))
+            {
+                var headerText = trimmed.Substring(3).Trim();
+                // Check if this header matches any worker prompt section key
+                bool isKnown = false;
+                foreach (var key in WorkerPromptSectionMap.Keys)
+                    if (headerText.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                    { isKnown = true; break; }
+
+                if (isKnown)
+                {
+                    if (currentHeader != null || currentBody.Length > 0)
+                        sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
+                    currentHeader = headerText;
+                    currentBody.Clear();
+                    continue;
+                }
+            }
+            currentBody.AppendLine(line);
+        }
+        if (currentHeader != null || currentBody.Length > 0)
+            sections.Add((currentHeader, currentBody.ToString().TrimEnd()));
+
+        var sb = new System.Text.StringBuilder();
+
+        // Collect boilerplate sections (everything except "Your Assigned Task")
+        var boilerplateBuffer = new List<(string label, string body)>();
+
+        void FlushWorkerBoilerplate()
+        {
+            if (boilerplateBuffer.Count == 0) return;
+            sb.Append("<details class=\"orchestration-prompt-details\">");
+            if (boilerplateBuffer.Count == 1)
+                sb.Append($"<summary>Orchestration context</summary>");
+            else
+                sb.Append($"<summary>Orchestration context ({boilerplateBuffer.Count} sections)</summary>");
+            sb.Append("<div class=\"orchestration-prompt-content\">");
+            foreach (var (label, body) in boilerplateBuffer)
+            {
+                sb.Append("<div class=\"orchestration-boilerplate-section\">");
+                sb.Append($"<strong>{System.Net.WebUtility.HtmlEncode(label)}</strong><br/>");
+                sb.Append(System.Net.WebUtility.HtmlEncode(body).Replace("\n", "<br/>"));
+                sb.Append("</div>");
+            }
+            sb.Append("</div></details>");
+            boilerplateBuffer.Clear();
+        }
+
+        // Process sections: expanded sections get their own collapsible (open by default),
+        // everything else goes into the boilerplate group.
+        foreach (var (header, body) in sections)
+        {
+            if (string.IsNullOrEmpty(header) && string.IsNullOrWhiteSpace(body))
+                continue;
+
+            string mode;
+            if (header == null)
+                mode = "boilerplate"; // Preamble (identity, charter text, etc.)
+            else
+            {
+                var matchingKey = WorkerPromptSectionMap.Keys
+                    .FirstOrDefault(k => header.StartsWith(k, StringComparison.OrdinalIgnoreCase));
+                mode = matchingKey != null ? WorkerPromptSectionMap[matchingKey] : "boilerplate";
+            }
+
+            if (mode == "expanded")
+            {
+                // Flush any boilerplate accumulated before this section
+                FlushWorkerBoilerplate();
+                // Render expanded section (open by default)
+                sb.Append("<details class=\"orchestrator-dynamic-details\" open>");
+                sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(header)}</summary>");
                 sb.Append("<div class=\"orchestrator-dynamic-content\">");
                 sb.Append(MarkdownRenderer.ToHtml(body));
                 sb.Append("</div></details>");
@@ -524,7 +659,7 @@
                 boilerplateBuffer.Add((label, body));
             }
         }
-        FlushBoilerplate();
+        FlushWorkerBoilerplate();
         return sb.ToString();
     }
 
@@ -564,6 +699,84 @@
             return header;
 
         return $"Worker Results — {string.Join(", ", workers)}";
+    }
+
+    /// <summary>
+    /// Renders Worker Results by splitting on ### WorkerName headers so each worker gets
+    /// its own collapsible section. Each section shows the worker name and status (✅/❌)
+    /// in the summary, collapsed by default.
+    /// </summary>
+    private static void RenderPerWorkerSections(System.Text.StringBuilder sb, string sectionHeader, string body)
+    {
+        // Split the body by ### headers to get individual worker results
+        var workerSections = new List<(string header, string body)>();
+        string? preamble = null;
+        var bodyLines = body.Split('\n');
+        string? currentWorkerHeader = null;
+        var currentWorkerBody = new System.Text.StringBuilder();
+
+        foreach (var line in bodyLines)
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith("### "))
+            {
+                // Save previous worker section
+                if (currentWorkerHeader != null)
+                    workerSections.Add((currentWorkerHeader, currentWorkerBody.ToString().TrimEnd()));
+                else if (currentWorkerBody.Length > 0)
+                    preamble = currentWorkerBody.ToString().TrimEnd();
+
+                currentWorkerHeader = trimmed.Substring(4).Trim();
+                currentWorkerBody.Clear();
+                continue;
+            }
+            currentWorkerBody.AppendLine(line);
+        }
+        if (currentWorkerHeader != null)
+            workerSections.Add((currentWorkerHeader, currentWorkerBody.ToString().TrimEnd()));
+        else if (currentWorkerBody.Length > 0 && preamble == null)
+            preamble = currentWorkerBody.ToString().TrimEnd();
+
+        // If no worker subsections found, fall back to rendering as a single block
+        if (workerSections.Count == 0)
+        {
+            var summary = BuildCollapsedSummary(sectionHeader, body);
+            sb.Append("<details class=\"orchestrator-dynamic-details\">");
+            sb.Append($"<summary class=\"orchestrator-section-header\">📋 {System.Net.WebUtility.HtmlEncode(summary)}</summary>");
+            sb.Append("<div class=\"orchestrator-dynamic-content\">");
+            sb.Append(MarkdownRenderer.ToHtml(body));
+            sb.Append("</div></details>");
+            return;
+        }
+
+        // Render an outer label showing the overall summary
+        var overallSummary = BuildCollapsedSummary(sectionHeader, body);
+        sb.Append($"<div class=\"worker-results-header\">📋 {System.Net.WebUtility.HtmlEncode(overallSummary)}</div>");
+
+        // Render any preamble text before the first worker
+        if (!string.IsNullOrWhiteSpace(preamble))
+        {
+            sb.Append("<div class=\"worker-results-preamble\">");
+            sb.Append(MarkdownRenderer.ToHtml(preamble));
+            sb.Append("</div>");
+        }
+
+        // Render each worker as its own collapsible section
+        foreach (var (workerHeader, workerBody) in workerSections)
+        {
+            // Extract status icon from header like "srdev-1 (✅ completed, 45.2s)"
+            var statusIcon = workerHeader.Contains("✅") ? "✅" : workerHeader.Contains("❌") ? "❌" : "⏳";
+            var workerDisplayName = workerHeader;
+            var parenIdx = workerHeader.IndexOf('(');
+            if (parenIdx > 0)
+                workerDisplayName = workerHeader[..parenIdx].Trim();
+
+            sb.Append("<details class=\"worker-result-details\">");
+            sb.Append($"<summary class=\"worker-result-header\">{statusIcon} {System.Net.WebUtility.HtmlEncode(workerDisplayName)}</summary>");
+            sb.Append("<div class=\"worker-result-content\">");
+            sb.Append(MarkdownRenderer.ToHtml(workerBody));
+            sb.Append("</div></details>");
+        }
     }
 
     /// <summary>
