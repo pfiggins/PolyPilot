@@ -763,6 +763,7 @@ public partial class CopilotService : IAsyncDisposable
                     WorkingDirectory = codespaceWorkDir,
                     Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
                     OnPermissionRequest = AutoApprovePermissions,
+                    InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
                 };
 
                 CopilotSession newSession;
@@ -779,6 +780,7 @@ public partial class CopilotService : IAsyncDisposable
                         WorkingDirectory = codespaceWorkDir,
                         Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
                         OnPermissionRequest = AutoApprovePermissions,
+                        InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
                     };
                     newSession = await client.CreateSessionAsync(freshConfig, ct);
                     state.Info.SessionId = newSession.SessionId;

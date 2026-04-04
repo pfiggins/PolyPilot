@@ -341,7 +341,8 @@ public partial class CopilotService
                 Model = resumeModel,
                 WorkingDirectory = resumeWorkDir,
                 Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                OnPermissionRequest = AutoApprovePermissions
+                OnPermissionRequest = AutoApprovePermissions,
+                InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
             };
 
             CopilotSession copilotSession;
@@ -363,7 +364,8 @@ public partial class CopilotService
                     Model = resumeModel,
                     WorkingDirectory = resumeWorkDir,
                     Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                    OnPermissionRequest = AutoApprovePermissions
+                    OnPermissionRequest = AutoApprovePermissions,
+                    InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
                 }, cancellationToken);
                 state.Info.SessionId = copilotSession.SessionId;
                 FlushSaveActiveSessionsToDisk();
