@@ -92,6 +92,9 @@ public partial class CopilotService : IAsyncDisposable
     // Serializes the IsConnectionError reconnect path so concurrent workers
     // don't destroy each other's freshly-created client (thundering herd fix).
     private readonly SemaphoreSlim _clientReconnectLock = new(1, 1);
+    // Tracks the most recent sibling re-resume Task so callers (e.g., pre-dispatch
+    // health check) can wait for all siblings to finish recovering before proceeding.
+    private volatile Task? _siblingResumeTask;
     // Serializes per-session lazy/eager SDK reconnects so background restore and
     // the first user send can't both resume the same placeholder concurrently.
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionConnectLocks = new();
@@ -679,8 +682,9 @@ public partial class CopilotService : IAsyncDisposable
     }
 
     /// <summary>Ping interval to prevent the headless server from killing idle sessions.
-    /// The server has a ~35 minute idle timeout; pinging every 15 minutes keeps sessions alive.</summary>
-    internal const int KeepalivePingIntervalSeconds = 15 * 60; // 15 minutes
+    /// The server has a ~35 minute idle timeout; pinging every 5 minutes keeps sessions alive
+    /// and reduces stale connection issues when mobile clients reconnect after backgrounding.</summary>
+    internal const int KeepalivePingIntervalSeconds = 5 * 60; // 5 minutes
 
     private void StartKeepalivePing()
     {
@@ -3473,7 +3477,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                     // enumerated from a background thread.
                                     var sessionSnapshots = Organization.Sessions.ToList();
                                     var groupSnapshots = Organization.Groups.ToList();
-                                    _ = Task.Run(async () =>
+                                    _siblingResumeTask = Task.Run(async () =>
                                     {
                                         // Throttle concurrency to avoid overwhelming the server with
                                         // many simultaneous ResumeSessionAsync calls. Flooding the server

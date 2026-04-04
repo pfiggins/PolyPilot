@@ -1736,6 +1736,12 @@ public partial class CopilotService
         var members = GetMultiAgentGroupMembers(groupId);
         if (members.Count == 0) { Debug($"[DISPATCH] SendToMultiAgentGroupAsync: no members for group '{group.Name}'"); return; }
 
+        // Pre-dispatch connection health check: validate that the CLI connection is alive
+        // before entering the dispatch loop. This prevents the cascading failure pattern where
+        // a stale connection (common after mobile app backgrounding) triggers client recreation
+        // mid-dispatch, causing mass sibling re-resume and watchdog timeouts.
+        await EnsureConnectionHealthyForDispatchAsync(cancellationToken);
+
         // Serialize dispatches to the same group (bridge + event queue drain race).
         // For Orchestrator mode: non-blocking check — queue if busy, with user feedback.
         // For other modes: blocking wait (they complete quickly).
@@ -2812,6 +2818,72 @@ public partial class CopilotService
 
     /// <summary>Max times to retry after permission recovery cancels the ResponseCompletion TCS.</summary>
     internal const int MaxPermissionRecoveryRetries = 3;
+
+    /// <summary>
+    /// Pre-dispatch connection health check. Sends a lightweight ping to the CLI server
+    /// to validate the connection is alive. If the ping fails (stale connection after mobile
+    /// backgrounding), triggers client recreation and sibling re-resume BEFORE entering the
+    /// dispatch loop. This prevents the cascading failure where a dead connection is discovered
+    /// mid-dispatch, causing watchdog timeouts and truncated orchestrator responses.
+    /// </summary>
+    private async Task EnsureConnectionHealthyForDispatchAsync(CancellationToken ct)
+    {
+        if (IsDemoMode || IsRemoteMode) return;
+        var client = _client;
+        if (client == null) return;
+
+        try
+        {
+            await client.PingAsync("pre-dispatch", ct);
+            Debug("[DISPATCH] Pre-dispatch health check passed");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Debug($"[DISPATCH] Pre-dispatch health check FAILED ({ex.Message}) — triggering reconnect before dispatch");
+
+            // Force a lightweight send that will trigger the reconnect path in SendPromptAsync.
+            // Instead, directly invoke the health check + recovery path.
+            await CheckConnectionHealthAsync(ct);
+
+            // Wait for sibling re-resume to complete (if one is running) instead of a fixed delay.
+            // The re-resume runs in a background Task.Run with a semaphore (3 concurrent).
+            var siblingTask = _siblingResumeTask;
+            if (siblingTask != null && !siblingTask.IsCompleted)
+            {
+                Debug("[DISPATCH] Waiting for sibling re-resume to complete before dispatch...");
+                try
+                {
+                    await siblingTask.WaitAsync(TimeSpan.FromSeconds(15), ct);
+                    Debug("[DISPATCH] Sibling re-resume completed");
+                }
+                catch (TimeoutException)
+                {
+                    Debug("[DISPATCH] Sibling re-resume timed out after 15s — proceeding anyway");
+                }
+                catch (Exception sibEx) when (sibEx is not OperationCanceledException)
+                {
+                    Debug($"[DISPATCH] Sibling re-resume faulted: {sibEx.Message} — proceeding anyway");
+                }
+            }
+
+            // Verify recovery succeeded
+            client = _client;
+            if (client != null)
+            {
+                try
+                {
+                    await client.PingAsync("pre-dispatch-verify", ct);
+                    Debug("[DISPATCH] Pre-dispatch reconnect succeeded — connection verified");
+                }
+                catch (Exception verifyEx)
+                {
+                    Debug($"[DISPATCH] Pre-dispatch reconnect verification FAILED: {verifyEx.Message}");
+                    // Continue anyway — the dispatch path has its own reconnect logic
+                }
+            }
+        }
+    }
 
     private async Task<string> SendPromptAndWaitAsync(string sessionName, string prompt, CancellationToken cancellationToken, string? originalPrompt = null)
     {
