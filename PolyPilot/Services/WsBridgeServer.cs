@@ -30,7 +30,11 @@ public class WsBridgeServer : IDisposable
     private const int SessionsListDebounceMs = 500;
 
     // Bridge message type filter — cached from settings, reloadable at runtime
-    private volatile HashSet<ChatMessageType> _filteredTypes = new() { ChatMessageType.System };
+    private volatile HashSet<ChatMessageType> _filteredTypes = new()
+    {
+        ChatMessageType.System, ChatMessageType.ToolCall, ChatMessageType.Reasoning,
+        ChatMessageType.ShellOutput, ChatMessageType.Diff, ChatMessageType.Reflection
+    };
     private const int OrgStateDebounceMs = 2000;
 
     public int BridgePort => _bridgePort;

@@ -133,7 +133,7 @@ public class ConnectionSettings
     /// and their corresponding streaming events are suppressed.
     /// Stored as ChatMessageType enum names (e.g. "System", "Reasoning", "ToolCall").
     /// </summary>
-    public List<string> BridgeFilteredMessageTypes { get; set; } = new() { "System" };
+    public List<string> BridgeFilteredMessageTypes { get; set; } = new() { "System", "ToolCall", "Reasoning", "ShellOutput", "Diff", "Reflection" };
 
     /// <summary>
     /// Normalizes a remote URL by ensuring it has an http(s):// scheme.

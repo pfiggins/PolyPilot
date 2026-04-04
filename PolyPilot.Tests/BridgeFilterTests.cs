@@ -89,15 +89,15 @@ public class BridgeFilterTests : IDisposable
     }
 
     [Fact]
-    public void IsBridgeFiltered_DefaultFilter_AllowsToolCall()
+    public void IsBridgeFiltered_DefaultFilter_ExcludesToolCall()
     {
-        Assert.False(_server.IsBridgeFiltered(ChatMessageType.ToolCall));
+        Assert.True(_server.IsBridgeFiltered(ChatMessageType.ToolCall));
     }
 
     [Fact]
-    public void IsBridgeFiltered_DefaultFilter_AllowsReasoning()
+    public void IsBridgeFiltered_DefaultFilter_ExcludesReasoning()
     {
-        Assert.False(_server.IsBridgeFiltered(ChatMessageType.Reasoning));
+        Assert.True(_server.IsBridgeFiltered(ChatMessageType.Reasoning));
     }
 
     // ========== ReloadBridgeFilter Tests ==========
@@ -252,10 +252,15 @@ public class BridgeFilterTests : IDisposable
     // ========== Settings Persistence Tests ==========
 
     [Fact]
-    public void BridgeFilteredMessageTypes_DefaultHasSystem()
+    public void BridgeFilteredMessageTypes_DefaultFiltersVerboseTypes()
     {
         var settings = new ConnectionSettings();
         Assert.Contains("System", settings.BridgeFilteredMessageTypes);
+        Assert.Contains("ToolCall", settings.BridgeFilteredMessageTypes);
+        Assert.Contains("Reasoning", settings.BridgeFilteredMessageTypes);
+        Assert.Contains("ShellOutput", settings.BridgeFilteredMessageTypes);
+        Assert.Contains("Diff", settings.BridgeFilteredMessageTypes);
+        Assert.Contains("Reflection", settings.BridgeFilteredMessageTypes);
     }
 
     [Fact]
