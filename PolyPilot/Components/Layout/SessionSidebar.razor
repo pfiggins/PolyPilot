@@ -306,10 +306,10 @@ else
 
     private static string PhaseLabel(OrchestratorPhase phase, string? detail) => phase switch
     {
-        OrchestratorPhase.Planning => "Planning...",
+        OrchestratorPhase.Planning => "Planning..." + (detail != null ? $" ({detail})" : ""),
         OrchestratorPhase.Dispatching => "Dispatching..." + (detail != null ? $" {detail}" : ""),
         OrchestratorPhase.WaitingForWorkers => "Waiting for workers...",
-        OrchestratorPhase.Synthesizing => "Synthesizing...",
+        OrchestratorPhase.Synthesizing => detail != null ? detail : "Synthesizing...",
         _ => ""
     };
 

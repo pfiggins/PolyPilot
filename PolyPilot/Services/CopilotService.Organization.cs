@@ -2176,11 +2176,16 @@ public partial class CopilotService
                 results = await allDone;
             }
 
+            var spSuccessCount = results.Count(r => r.Success);
+            AddOrchestratorSystemMessage(orchestratorName,
+                $"📋 Collected {spSuccessCount}/{results.Length} worker result(s) — synthesizing...");
+
             // After early dispatch, the orchestrator may still be doing tool work.
             await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
 
             // Phase 4: Synthesize — send worker results back to orchestrator
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing, null));
+            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+                $"Synthesizing {spSuccessCount} result(s)"));
 
             var synthesisPrompt = BuildSynthesisPrompt(prompt, results.ToList());
             await SendPromptAsync(orchestratorName, synthesisPrompt, cancellationToken: cancellationToken, originalPrompt: prompt);
@@ -4546,12 +4551,18 @@ public partial class CopilotService
             foreach (var r in results.Where(r => r.Success))
                 dispatchedWorkers.Add(r.WorkerName);
 
+            var successCount = results.Count(r => r.Success);
+            var totalCount = results.Length;
+            AddOrchestratorSystemMessage(orchestratorName,
+                $"📋 Collected {successCount}/{totalCount} worker result(s) — synthesizing...");
+
             // After early dispatch, the orchestrator may still be doing tool work.
             // Wait for it to go idle before sending the synthesis prompt.
             await WaitForSessionIdleAsync(orchestratorName, ct);
 
             // Phase 4: Synthesize + Evaluate
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing, iterDetail));
+            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+                $"Synthesizing {successCount} result(s) — {iterDetail}"));
 
             var synthEvalPrompt = BuildSynthesisWithEvalPrompt(prompt, results.ToList(), reflectState,
                 group.RoutingContext, dispatchedWorkers, workerNames);
@@ -4581,6 +4592,8 @@ public partial class CopilotService
                 }
 
                 // Send to evaluator for independent scoring
+                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+                    $"Evaluating quality — {iterDetail}"));
                 var evalOnlyPrompt = BuildEvaluatorPrompt(prompt, synthesisResponse, reflectState);
                 var evalResponse = await SendPromptAndWaitAsync(evaluatorName, evalOnlyPrompt, ct, originalPrompt: prompt);
 
