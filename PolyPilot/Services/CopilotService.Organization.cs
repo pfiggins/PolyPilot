@@ -1769,35 +1769,80 @@ public partial class CopilotService
             await dispatchLock.WaitAsync(cancellationToken);
         }
 
+        // Dispatch-level retry: when the inner dispatch methods fail with a connection
+        // error, the individual send's reconnect+retry may also fail (e.g., client recreation
+        // produces an immediately-broken client during flaky mobile reconnection). Instead of
+        // losing the user's message, wait for the system to stabilize and retry the dispatch.
+        const int maxDispatchRetries = 2;
+        var dispatchRetryDelayMs = 3000;
         try
         {
-            Debug($"[DISPATCH] SendToMultiAgentGroupAsync: group='{group.Name}', mode={group.OrchestratorMode}, members={members.Count}");
-
-            switch (group.OrchestratorMode)
+        for (int dispatchAttempt = 0; ; dispatchAttempt++)
+        {
+            try
             {
-                case MultiAgentMode.Broadcast:
-                    await SendBroadcastAsync(group, members, prompt, cancellationToken);
-                    break;
+                Debug($"[DISPATCH] SendToMultiAgentGroupAsync: group='{group.Name}', mode={group.OrchestratorMode}, members={members.Count}{(dispatchAttempt > 0 ? $" (retry {dispatchAttempt}/{maxDispatchRetries})" : "")}");
 
-                case MultiAgentMode.Sequential:
-                    await SendSequentialAsync(group, members, prompt, cancellationToken);
-                    break;
+                switch (group.OrchestratorMode)
+                {
+                    case MultiAgentMode.Broadcast:
+                        await SendBroadcastAsync(group, members, prompt, cancellationToken);
+                        break;
 
-                case MultiAgentMode.Orchestrator:
-                    await SendViaOrchestratorAsync(groupId, members, prompt, cancellationToken);
-                    // Drain any prompts queued while this dispatch was running
-                    await DrainOrchestratorQueueAsync(groupId, members, cancellationToken);
-                    break;
+                    case MultiAgentMode.Sequential:
+                        await SendSequentialAsync(group, members, prompt, cancellationToken);
+                        break;
 
-                case MultiAgentMode.OrchestratorReflect:
-                    await SendViaOrchestratorReflectAsync(groupId, members, prompt, cancellationToken);
-                    break;
+                    case MultiAgentMode.Orchestrator:
+                        await SendViaOrchestratorAsync(groupId, members, prompt, cancellationToken);
+                        // Drain any prompts queued while this dispatch was running
+                        await DrainOrchestratorQueueAsync(groupId, members, cancellationToken);
+                        break;
+
+                    case MultiAgentMode.OrchestratorReflect:
+                        await SendViaOrchestratorReflectAsync(groupId, members, prompt, cancellationToken);
+                        break;
+                }
+                break; // success — exit retry loop
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (dispatchAttempt < maxDispatchRetries && IsConnectionError(ex))
+            {
+                Debug($"[DISPATCH] Connection error during dispatch (attempt {dispatchAttempt + 1}/{maxDispatchRetries + 1}): {ex.GetType().Name}: {ex.Message}");
+                var orchestratorName = GetOrchestratorSession(groupId);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"⚡ Connection error during dispatch — retrying in {dispatchRetryDelayMs / 1000}s (attempt {dispatchAttempt + 2}/{maxDispatchRetries + 1})...");
+                }
+
+                // Wait for the system to stabilize before retrying. The failed send triggers
+                // client recreation and sibling re-resume in the background; give that time to
+                // complete. Use exponential backoff (3s, 6s) to handle flaky connections.
+                await Task.Delay(dispatchRetryDelayMs, cancellationToken);
+                dispatchRetryDelayMs = Math.Min(dispatchRetryDelayMs * 2, 15000);
+
+                // Wait for any in-progress sibling re-resume to complete
+                var siblingTask = _siblingResumeTask;
+                if (siblingTask != null && !siblingTask.IsCompleted)
+                {
+                    Debug("[DISPATCH] Waiting for sibling re-resume before dispatch retry...");
+                    try { await siblingTask.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken); }
+                    catch (TimeoutException) { Debug("[DISPATCH] Sibling re-resume timed out — proceeding with retry"); }
+                    catch (Exception sibEx) when (sibEx is not OperationCanceledException)
+                    { Debug($"[DISPATCH] Sibling re-resume faulted: {sibEx.Message}"); }
+                }
+
+                // Re-validate connection before retrying
+                await EnsureConnectionHealthyForDispatchAsync(cancellationToken);
+                continue; // retry the dispatch
+            }
+            catch (Exception ex)
+            {
+                Debug($"[DISPATCH] SendToMultiAgentGroupAsync FAILED: {ex.GetType().Name}: {ex.Message}");
+                throw;
             }
         }
-        catch (Exception ex)
-        {
-            Debug($"[DISPATCH] SendToMultiAgentGroupAsync FAILED: {ex.GetType().Name}: {ex.Message}");
-            throw;
         }
         finally
         {
@@ -2840,11 +2885,29 @@ public partial class CopilotService
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            Debug($"[DISPATCH] Pre-dispatch health check FAILED ({ex.Message}) — triggering reconnect before dispatch");
+            Debug($"[DISPATCH] Pre-dispatch health check FAILED ({ex.Message}) — triggering recovery before dispatch");
 
-            // Force a lightweight send that will trigger the reconnect path in SendPromptAsync.
-            // Instead, directly invoke the health check + recovery path.
-            await CheckConnectionHealthAsync(ct);
+            // Trigger persistent server recovery directly (not via CheckConnectionHealthAsync which
+            // fires recovery in a background Task.Run that we can't await). We need to wait for
+            // recovery to complete before the dispatch retry sends to workers.
+            if (CurrentMode == ConnectionMode.Persistent)
+            {
+                Debug("[DISPATCH] Attempting persistent server recovery...");
+                var recovered = await TryRecoverPersistentServerAsync();
+                if (recovered)
+                {
+                    Debug("[DISPATCH] Persistent server recovery succeeded");
+                }
+                else
+                {
+                    Debug("[DISPATCH] Persistent server recovery failed — dispatch may fail");
+                }
+            }
+            else
+            {
+                // Non-persistent: call health check which attempts reconnect inline
+                await CheckConnectionHealthAsync(ct);
+            }
 
             // Wait for sibling re-resume to complete (if one is running) instead of a fixed delay.
             // The re-resume runs in a background Task.Run with a semaphore (3 concurrent).
