@@ -9,8 +9,8 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="8.0.1" />
-    <PackageReference Include="GitHub.Copilot.SDK" Version="0.2.0" />
-    <PackageReference Include="Markdig" Version="1.1.1" />
+    <PackageReference Include="GitHub.Copilot.SDK" Version="0.2.1" />
+    <PackageReference Include="Markdig" Version="1.1.2" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.5" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
@@ -27,6 +27,7 @@
   <!-- Include source files from main project that are testable without MAUI -->
   <ItemGroup>
     <Compile Include="../PolyPilot/Models/ChatMessage.cs" Link="Shared/ChatMessage.cs" />
+    <Compile Include="../PolyPilot/Models/ChatCopyPayloads.cs" Link="Shared/ChatCopyPayloads.cs" />
     <Compile Include="../PolyPilot/Models/AgentSessionInfo.cs" Link="Shared/AgentSessionInfo.cs" />
     <Compile Include="../PolyPilot/Models/SynchronizedMessageQueue.cs" Link="Shared/SynchronizedMessageQueue.cs" />
     <Compile Include="../PolyPilot/Models/AuditLogEntry.cs" Link="Shared/AuditLogEntry.cs" />
@@ -70,6 +71,7 @@
     <Compile Include="../PolyPilot/Services/WsBridgeServer.cs" Link="Shared/WsBridgeServer.cs" />
     <Compile Include="../PolyPilot/Services/WsBridgeClient.cs" Link="Shared/WsBridgeClient.cs" />
     <Compile Include="../PolyPilot/Services/DevTunnelService.cs" Link="Shared/DevTunnelService.cs" />
+    <Compile Include="../PolyPilot/Services/PrLinkService.cs" Link="Shared/PrLinkService.cs" />
     <Compile Include="../PolyPilot/Services/FiestaService.cs" Link="Shared/FiestaService.cs" />
     <Compile Include="../PolyPilot/Services/TailscaleService.cs" Link="Shared/TailscaleService.cs" />
     <Compile Include="../PolyPilot/Services/GitHubReferenceLinker.cs" Link="Shared/GitHubReferenceLinker.cs" />

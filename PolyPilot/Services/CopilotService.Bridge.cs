@@ -501,6 +501,7 @@ public partial class CopilotService
                 {
                     Name = rs.Name,
                     Model = rs.Model,
+                    ReasoningEffort = rs.ReasoningEffort,
                     CreatedAt = rs.CreatedAt,
                     SessionId = rs.SessionId,
                     WorkingDirectory = rs.WorkingDirectory,
@@ -535,6 +536,7 @@ public partial class CopilotService
                         state.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
                         state.Info.ToolCallCount = rs.ToolCallCount;
                         state.Info.ProcessingPhase = rs.ProcessingPhase;
+                        state.Info.PrNumber = rs.PrNumber;
                     }
                     else
                     {
@@ -548,6 +550,7 @@ public partial class CopilotService
                 }
                 if (!string.IsNullOrEmpty(rs.Model))
                     state.Info.Model = rs.Model;
+                state.Info.ReasoningEffort = rs.ReasoningEffort;
             }
         }
 
@@ -756,6 +759,7 @@ public partial class CopilotService
                     syncState.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
                     syncState.Info.ToolCallCount = rs.ToolCallCount;
                     syncState.Info.ProcessingPhase = rs.ProcessingPhase;
+                    syncState.Info.PrNumber = rs.PrNumber;
                     // Clear stuck streaming guard if server says session is idle
                     if (!rs.IsProcessing)
                         _remoteStreamingSessions.TryRemove(rs.Name, out _);

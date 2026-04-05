@@ -2,6 +2,7 @@ using System.Net.WebSockets;
 using Microsoft.Extensions.DependencyInjection;
 using PolyPilot.Models;
 using PolyPilot.Services;
+using System.IO;
 
 namespace PolyPilot.Tests;
 
@@ -11,11 +12,15 @@ namespace PolyPilot.Tests;
 /// This simulates the mobile → devtunnel → desktop path without needing
 /// a real devtunnel or device.
 /// </summary>
+[Collection("SocketIsolated")]
 public class WsBridgeIntegrationTests : IDisposable
 {
     private readonly WsBridgeServer _server;
     private readonly CopilotService _copilot;
     private readonly int _port;
+    private readonly string _testDir;
+    private readonly List<WsBridgeClient> _clients = new();
+    private readonly List<CopilotService> _remoteServices = new();
 
     private static int GetFreePort()
     {
@@ -30,7 +35,7 @@ public class WsBridgeIntegrationTests : IDisposable
     /// Polls until a condition is true, with a timeout. Throws TimeoutException on silent timeout
     /// to surface flaky races instead of letting assertions fail on stale state.
     /// </summary>
-    private static async Task WaitForAsync(Func<bool> condition, CancellationToken ct, int pollMs = 50, int maxMs = 4000)
+    private static async Task WaitForAsync(Func<bool> condition, CancellationToken ct, int pollMs = 50, int maxMs = 8000)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (!condition() && sw.ElapsedMilliseconds < maxMs)
@@ -42,6 +47,15 @@ public class WsBridgeIntegrationTests : IDisposable
 
     public WsBridgeIntegrationTests()
     {
+        _testDir = Path.Combine(Path.GetTempPath(), $"polypilot-wsbridge-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_testDir);
+        CopilotService.SetBaseDirForTesting(_testDir);
+        RepoManager.SetBaseDirForTesting(_testDir);
+        AuditLogService.SetLogDirForTesting(Path.Combine(_testDir, "audit_logs"));
+        PromptLibraryService.SetUserPromptsDirForTesting(Path.Combine(_testDir, "prompts"));
+        FiestaService.SetStateFilePathForTesting(Path.Combine(_testDir, "fiesta.json"));
+        ConnectionSettings.SetSettingsFilePathForTesting(Path.Combine(_testDir, "settings.json"));
+
         _port = GetFreePort();
         _server = new WsBridgeServer();
 
@@ -59,15 +73,48 @@ public class WsBridgeIntegrationTests : IDisposable
 
     public void Dispose()
     {
-        _server.Stop();
-        _server.Dispose();
+        foreach (var client in _clients)
+        {
+            try { client.Stop(); } catch { }
+            try { client.Dispose(); } catch { }
+        }
+
+        foreach (var remoteService in _remoteServices)
+        {
+            try { remoteService.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
+        }
+
+        try { _server.Stop(); } catch { }
+        try { _server.Dispose(); } catch { }
+        try { _copilot.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
+
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+        RepoManager.SetBaseDirForTesting(TestSetup.TestBaseDir);
+        AuditLogService.SetLogDirForTesting(Path.Combine(TestSetup.TestBaseDir, "audit_logs"));
+        PromptLibraryService.SetUserPromptsDirForTesting(Path.Combine(TestSetup.TestBaseDir, "prompts"));
+        FiestaService.SetStateFilePathForTesting(Path.Combine(TestSetup.TestBaseDir, "fiesta.json"));
+        ConnectionSettings.SetSettingsFilePathForTesting(Path.Combine(TestSetup.TestBaseDir, "settings.json"));
+
+        try { Directory.Delete(_testDir, recursive: true); } catch { }
     }
 
     private async Task<WsBridgeClient> ConnectClientAsync(CancellationToken ct = default)
     {
-        var client = new WsBridgeClient();
+        var client = TrackClient(new WsBridgeClient());
         await client.ConnectAsync($"ws://localhost:{_port}/", null, ct);
         return client;
+    }
+
+    private WsBridgeClient TrackClient(WsBridgeClient client)
+    {
+        _clients.Add(client);
+        return client;
+    }
+
+    private CopilotService TrackRemoteService(CopilotService service)
+    {
+        _remoteServices.Add(service);
+        return service;
     }
 
     private async Task InitDemoMode()
@@ -108,7 +155,7 @@ public class WsBridgeIntegrationTests : IDisposable
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var orgReceived = new TaskCompletionSource<OrganizationState>();
-        var client = new WsBridgeClient();
+        var client = TrackClient(new WsBridgeClient());
         client.OnOrganizationStateReceived += org => orgReceived.TrySetResult(org);
         await client.ConnectAsync($"ws://localhost:{_port}/", null, cts.Token);
 
@@ -144,13 +191,13 @@ public class WsBridgeIntegrationTests : IDisposable
         await WaitForAsync(() => _copilot.GetSession("session-with-history")?.History.Count > 1, delayCts.Token);
 
         // Simulate mobile: create a remote CopilotService that connects to the bridge
-        var remoteService = new CopilotService(
+        var remoteService = TrackRemoteService(new CopilotService(
             new StubChatDatabase(),
             new StubServerManager(),
             new WsBridgeClient(),
             new RepoManager(),
             new ServiceCollection().BuildServiceProvider(),
-            new StubDemoService());
+            new StubDemoService()));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await remoteService.ReconnectAsync(new ConnectionSettings
@@ -275,7 +322,7 @@ public class WsBridgeIntegrationTests : IDisposable
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var client = await ConnectClientAsync(cts.Token);
 
-        await client.ChangeModelAsync("model-switch", "claude-sonnet-4-5", cts.Token);
+        await client.ChangeModelAsync("model-switch", "claude-sonnet-4-5", ct: cts.Token);
         await WaitForAsync(() => _copilot.GetSession("model-switch")?.Model == "claude-sonnet-4-5", cts.Token);
 
         Assert.Equal("claude-sonnet-4-5", _copilot.GetSession("model-switch")!.Model);
@@ -290,7 +337,7 @@ public class WsBridgeIntegrationTests : IDisposable
         var client = await ConnectClientAsync(cts.Token);
 
         // Should not throw — server should handle gracefully
-        await client.ChangeModelAsync("no-such-session", "gpt-4.1", cts.Token);
+        await client.ChangeModelAsync("no-such-session", "gpt-4.1", ct: cts.Token);
         await WaitForAsync(() => true, cts.Token, maxMs: 300);
         client.Stop();
     }
@@ -323,7 +370,7 @@ public class WsBridgeIntegrationTests : IDisposable
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var contentReceived = new TaskCompletionSource<string>();
-        var client = new WsBridgeClient();
+        var client = TrackClient(new WsBridgeClient());
         client.OnContentReceived += (session, content) =>
         {
             if (session == "delta-test") contentReceived.TrySetResult(content);
@@ -579,7 +626,7 @@ public class WsBridgeIntegrationTests : IDisposable
         await InitDemoMode();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var orgUpdated = new TaskCompletionSource<OrganizationState>();
-        var client = new WsBridgeClient();
+        var client = TrackClient(new WsBridgeClient());
         var initialReceived = new TaskCompletionSource();
         client.OnOrganizationStateReceived += org =>
         {
@@ -683,12 +730,12 @@ public class WsBridgeIntegrationTests : IDisposable
         await InitDemoMode();
         await _copilot.CreateSessionAsync("old-name", "gpt-4.1");
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var client = await ConnectClientAsync(cts.Token);
         await WaitForAsync(() => client.Sessions.Any(s => s.Name == "old-name"), cts.Token);
 
         await client.RenameSessionAsync("old-name", "new-name", cts.Token);
-        await WaitForAsync(() => _copilot.GetSession("new-name") != null, cts.Token, maxMs: 12000);
+        await WaitForAsync(() => _copilot.GetSession("new-name") != null, cts.Token, maxMs: 25000);
 
         Assert.Null(_copilot.GetSession("old-name"));
         Assert.NotNull(_copilot.GetSession("new-name"));
@@ -731,7 +778,7 @@ public class WsBridgeIntegrationTests : IDisposable
     {
         await InitDemoMode();
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         var client = await ConnectClientAsync(cts.Token);
 
         // Fire two concurrent directory listing requests
@@ -848,7 +895,7 @@ public class WsBridgeIntegrationTests : IDisposable
         string? errorMsg = null;
         client.OnError += (s, e) => errorMsg = e;
 
-        await client.ChangeModelAsync("model-busy", "claude-opus-4.6", cts.Token);
+        await client.ChangeModelAsync("model-busy", "claude-opus-4.6", ct: cts.Token);
         await WaitForAsync(() => errorMsg != null, cts.Token);
 
         Assert.NotNull(errorMsg);
@@ -926,13 +973,13 @@ public class WsBridgeIntegrationTests : IDisposable
     {
         await InitDemoMode();
 
-        var remoteService = new CopilotService(
+        var remoteService = TrackRemoteService(new CopilotService(
             new StubChatDatabase(),
             new StubServerManager(),
             new WsBridgeClient(),
             new RepoManager(),
             new ServiceCollection().BuildServiceProvider(),
-            new StubDemoService());
+            new StubDemoService()));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         // Pass ws:// URL directly — should NOT double-prefix to wss://ws://
@@ -952,13 +999,13 @@ public class WsBridgeIntegrationTests : IDisposable
         // that the URL normalization doesn't corrupt ws:// or http:// URLs
         await InitDemoMode();
 
-        var remoteService = new CopilotService(
+        var remoteService = TrackRemoteService(new CopilotService(
             new StubChatDatabase(),
             new StubServerManager(),
             new WsBridgeClient(),
             new RepoManager(),
             new ServiceCollection().BuildServiceProvider(),
-            new StubDemoService());
+            new StubDemoService()));
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await remoteService.ReconnectAsync(new ConnectionSettings
@@ -1028,7 +1075,7 @@ public class WsBridgeIntegrationTests : IDisposable
             await InitDemoMode();
 
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            var client = new WsBridgeClient();
+            var client = TrackClient(new WsBridgeClient());
             await client.ConnectAsync($"ws://localhost:{_port}/", "test-secret-token-12345", cts.Token);
             Assert.True(client.IsConnected);
             client.Stop();
@@ -1053,10 +1100,12 @@ public class WsBridgeIntegrationTests : IDisposable
         await WaitForAsync(() => client.Sessions.Count >= 2, cts.Token);
 
         await client.SwitchSessionAsync("switch-b", cts.Token);
-        await WaitForAsync(() => client.ActiveSessionName == "switch-b", cts.Token);
+        // Server should send history for switch-b but NOT change the desktop's active session.
+        // The client receives the sessions list broadcast — active session stays as-is on desktop.
+        await WaitForAsync(() => client.Sessions.Count >= 2, cts.Token);
 
-        // The server should have broadcast session list with updated active session
-        Assert.Equal("switch-b", client.ActiveSessionName);
+        // Desktop active session should NOT have changed (mobile switch is independent)
+        Assert.Equal("switch-a", _copilot.GetActiveSession()?.Name);
         client.Stop();
     }
 

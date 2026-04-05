@@ -1,5 +1,24 @@
 # PolyPilot — Copilot Instructions
 
+## SDK-First Development
+
+Before implementing new session lifecycle, orchestration, watchdog, or event handling code, check the Copilot SDK API surface. The `copilot-sdk-reference` skill has the complete v0.2.1 API reference (453 types, 76 events, 6 hooks, 16 RPC APIs). The `processing-state-safety` and `multi-agent-orchestration` skills each contain SDK migration matrices for their domains. Prefer SDK APIs over custom implementations. When custom code is necessary, add a `// SDK-gap: <reason>` comment explaining why.
+
+### SDK Update Audit (run when bumping `GitHub.Copilot.SDK` version)
+
+When the user says **"Run the SDK update audit"** or updates the SDK NuGet package version:
+
+1. **Diff the XML docs** to find new/removed/changed types:
+   ```bash
+   diff <(grep 'member name="T:' ~/.nuget/packages/github.copilot.sdk/OLD_VERSION/lib/net8.0/GitHub.Copilot.SDK.xml | sort) \
+        <(grep 'member name="T:' ~/.nuget/packages/github.copilot.sdk/NEW_VERSION/lib/net8.0/GitHub.Copilot.SDK.xml | sort)
+   ```
+2. **Update `.claude/skills/copilot-sdk-reference/SKILL.md`** — add new types, events, RPC APIs, hooks, SessionConfig properties. Update version number and version history table.
+3. **Re-check migration matrices** in `processing-state-safety` and `multi-agent-orchestration` skills — any "Not adopted" items now have better SDK support? Any new APIs that replace custom code?
+4. **Update `.github/copilot-instructions.md`** — SDK Event Flow, SDK Data Types, and any behavioral claims that changed.
+5. **Check for JS-only features that moved to .NET** — especially `AgentStop`/`SubagentStop` hooks.
+6. **Create a PR** with all changes and run the multi-model review process.
+
 ## Build & Deploy Commands
 
 ### Mac Catalyst (primary dev target)
@@ -16,7 +35,7 @@ dotnet build -f net10.0-maccatalyst   # Build only
 > **🚨 RULES FOR CALLING RELAUNCH.SH 🚨**
 > 1. Do NOT chain ANYTHING after `./relaunch.sh` in the same bash call — no `&&`, `;`, `|`, `sleep`.
 > 2. You have ~10 seconds after relaunch.sh returns to make additional quick tool calls
->    (e.g., `maui-devflow wait`, `tail`, short verification commands). Use this window
+>    (e.g., `maui devflow wait`, `tail`, short verification commands). Use this window
 >    to keep working — verify the relaunch, reconnect to MauiDevFlow, test your changes.
 > 3. If one tool call gets interrupted by the kill, that's OK — the CLI keeps your session
 >    alive. Just continue on the next turn.
@@ -32,11 +51,11 @@ Your turn may get interrupted if a tool call is in-flight when the kill happens 
 the CLI keeps your session alive. On your next turn, verify and continue:
 ```bash
 # Next turn: verify relaunch + reconnect to MauiDevFlow
-tail -3 ~/.polypilot/relaunch.log && maui-devflow wait --timeout 30
+tail -3 ~/.polypilot/relaunch.log && maui devflow wait --timeout 30
 ```
 ```bash
 # Then test your changes via CDP
-maui-devflow cdp Runtime evaluate '...'
+maui devflow cdp Runtime evaluate '...'
 ```
 
 **NEVER do this:**
@@ -123,13 +142,13 @@ dotnet build -f net10.0-ios -t:Run -p:_DeviceName=:v2:udid=<UDID>
 ```
 
 ### MauiDevFlow (UI inspection & debugging)
-The app integrates `Redth.MauiDevFlow.Agent` + `Redth.MauiDevFlow.Blazor` for remote UI inspection. See `.claude/skills/maui-ai-debugging/SKILL.md` for the full command reference.
+The app integrates `Microsoft.Maui.DevFlow.Agent` + `Microsoft.Maui.DevFlow.Blazor` for remote UI inspection. See `.claude/skills/maui-ai-debugging/SKILL.md` for the full command reference.
 ```bash
-maui-devflow MAUI status           # Agent connection
-maui-devflow cdp status            # CDP/Blazor WebView
-maui-devflow MAUI tree             # Visual tree
-maui-devflow cdp snapshot          # DOM snapshot (best for AI)
-maui-devflow MAUI logs             # Application ILogger output
+maui devflow MAUI status           # Agent connection
+maui devflow cdp status            # CDP/Blazor WebView
+maui devflow MAUI tree             # Visual tree
+maui devflow cdp snapshot          # DOM snapshot (best for AI)
+maui devflow MAUI logs             # Application ILogger output
 ```
 For Android, always run `adb reverse tcp:9223 tcp:9223` after deploy.
 
@@ -237,13 +256,32 @@ Disabled in `Platforms/MacCatalyst/Entitlements.plist` — required for spawning
 When a prompt is sent, the SDK emits events processed by `HandleSessionEvent` in order:
 1. `SessionUsageInfoEvent` → server acknowledged, sets `ProcessingPhase=1`
 2. `AssistantTurnStartEvent` → model generating, sets `ProcessingPhase=2`
-3. `AssistantMessageDeltaEvent` → streaming content chunks
-4. `AssistantMessageEvent` → full message (may include tool requests)
-5. `ToolExecutionStartEvent` → tool activity starts, sets `ProcessingPhase=3`, increments `ToolCallCount` on complete
-6. `ToolExecutionCompleteEvent` → tool done, increments `ToolCallCount`
-7. `AssistantIntentEvent` → intent/plan updates
-8. `AssistantTurnEndEvent` → end of a sub-turn, tool loop continues. `FlushCurrentResponse` persists accumulated text before the next sub-turn.
-9. `SessionIdleEvent` → turn complete, response finalized. **Unless** `Data.BackgroundTasks` has active agents/shells — then flushes text, logs `[IDLE-DEFER]`, and keeps `IsProcessing=true` (PR #399).
+3. `AssistantReasoningDeltaEvent` → streaming reasoning chunks (if model supports reasoning)
+4. `AssistantReasoningEvent` → complete reasoning content
+5. `AssistantMessageDeltaEvent` → streaming content chunks
+6. `AssistantMessageEvent` → full message (may include tool requests)
+7. `ToolExecutionStartEvent` → tool activity starts, sets `ProcessingPhase=3`, increments `ToolCallCount` on complete
+8. `ToolExecutionCompleteEvent` → tool done, increments `ToolCallCount`
+9. `AssistantIntentEvent` → intent/plan updates
+10. `AssistantTurnEndEvent` → end of a sub-turn, tool loop continues. `FlushCurrentResponse` persists accumulated text before the next sub-turn.
+11. `SessionIdleEvent` → turn complete, response finalized. **Unless** `Data.BackgroundTasks` has active agents/shells — then flushes text, logs `[IDLE-DEFER]`, and keeps `IsProcessing=true` (PR #399).
+
+Additional SDK events (not in the main flow but emitted during sessions):
+- `AssistantUsageEvent` — per-call token usage, cost, latency metrics
+- `AssistantStreamingDeltaEvent` — low-level streaming delta
+- `SubagentStartedEvent` / `SubagentCompletedEvent` / `SubagentFailedEvent` / `SubagentSelectedEvent` / `SubagentDeselectedEvent` — subagent lifecycle
+- `SessionPlanChangedEvent` — plan file created/updated/deleted
+- `SessionModeChangedEvent` — mode switched (interactive/plan/autopilot)
+- `SessionModelChangeEvent` — model switched mid-session (includes `PreviousModel`/`NewModel` and `PreviousReasoningEffort`/`ReasoningEffort`)
+- `SessionCompactionStartEvent` / `SessionCompactionCompleteEvent` — context compaction
+- `SessionTruncationEvent` — context truncated
+- `SessionHandoffEvent` — session handoff (source, context, repository info)
+- `SkillInvokedEvent` — a skill was invoked
+- `SessionBackgroundTasksChangedEvent` — background task status changed
+- `CapabilitiesChangedEvent` — session capabilities changed (new in v0.2.1)
+- `SamplingRequestedEvent` / `SamplingCompletedEvent` — MCP sampling (new in v0.2.1)
+
+See the `copilot-sdk-reference` skill (PR #486) for the complete list of 76 event types.
 
 ### Processing Status Indicator
 `AgentSessionInfo` tracks three fields for the processing status UI:
@@ -262,7 +300,7 @@ The UI shows: "Sending…" → "Server connected…" → "Thinking…" → "Work
 **CRITICAL**: Every code path that sets `IsProcessing = false` must clear 9 companion fields and call `FlushCurrentResponse`. This is the most recurring bug category (13 PRs of fix/regression cycles). **Read `.claude/skills/processing-state-safety/SKILL.md` before modifying ANY processing path.** There are 15+ such paths across CopilotService.cs, Events.cs, Bridge.cs, Organization.cs, and Providers.cs.
 
 ### Content Persistence
-`FlushCurrentResponse` is also called on `AssistantTurnEndEvent` to persist accumulated response text at each sub-turn boundary. This prevents content loss if the app restarts between `turn_end` and `session.idle` (e.g., "zero-idle sessions" where the SDK never emits `session.idle`). The flush includes a dedup guard to prevent duplicate messages from event replay on resume.
+`FlushCurrentResponse` is also called on `AssistantTurnEndEvent` to persist accumulated response text at each sub-turn boundary. This prevents content loss if the app restarts between `turn_end` and `session.idle`. When the IDLE-DEFER logic defers `session.idle` (active background tasks), the flush ensures content from the foreground turn is saved. The flush includes a dedup guard to prevent duplicate messages from event replay on resume.
 
 ### Processing Watchdog
 The processing watchdog (`RunProcessingWatchdogAsync` in `CopilotService.Events.cs`) detects stuck sessions by checking how long since the last SDK event. It checks every 15 seconds and has three timeout tiers:
@@ -275,7 +313,9 @@ The processing watchdog (`RunProcessingWatchdogAsync` in `CopilotService.Events.
 
 For multi-agent sessions, Case B also checks **file-size-growth**: if events.jsonl hasn't grown for `WatchdogCaseBMaxStaleChecks` (2) consecutive deferrals, the session is force-completed — the connection is dead. This catches `ConnectionLostException` scenarios where mtime stays fresh but no new data arrives, reducing detection from 30+ min to ~360s (3 cycles: 1 baseline + 2 stale checks). The 1800s freshness window is preserved.
 
-Note: Some sessions never receive `session.idle` events (SDK/CLI bug). In these "zero-idle" cases, `IsProcessing` is only cleared by the watchdog or user abort. The turn_end flush (see Content Persistence above) ensures response content is not lost.
+Note: `session.idle` is an ephemeral event (`ephemeral: true` in the SDK schema) — it is delivered over the live event stream but intentionally NOT written to `events.jsonl`. When `session.idle` includes active `backgroundTasks` (sub-agents, shells), the IDLE-DEFER logic defers completion until a subsequent idle arrives with empty/null backgroundTasks. In rare cases where `IsProcessing` was already cleared (by watchdog timeout or reconnect) before the deferred idle arrives, the session may appear stuck until the watchdog fires again — see issue #403.
+
+When `session.idle` with active `backgroundTasks` arrives but `IsProcessing` is already `false`, the handler re-arms: sets `IsProcessing = true`, `HasUsedToolsThisTurn = true` (600s timeout), restarts watchdog, logs `[IDLE-DEFER-REARM]`. This prevents zero-idle symptoms where IDLE-DEFER fires once but subsequent idles are no-ops.
 
 When the watchdog fires, it marshals state mutations to the UI thread via `InvokeOnUI()` and adds a system warning message.
 
@@ -285,6 +325,7 @@ The event diagnostics log (`~/.polypilot/event-diagnostics.log`) uses these tags
 - `[EVT]` — SDK event received (only SessionIdleEvent, AssistantTurnEndEvent, SessionErrorEvent)
 - `[IDLE]` — SessionIdleEvent dispatched to CompleteResponse
 - `[IDLE-DEFER]` — SessionIdleEvent deferred due to active background tasks (agents/shells)
+- `[IDLE-DEFER-REARM]` — SessionIdleEvent re-armed IsProcessing after it was already cleared
 - `[COMPLETE]` — CompleteResponse executed or skipped
 - `[RECONNECT]` — session replaced after disconnect
 - `[ERROR]` — SessionErrorEvent or SendAsync/reconnect failure cleared IsProcessing
@@ -304,18 +345,22 @@ All mutations to `state.Info.IsProcessing` must be marshaled to the UI thread. S
 - **SendAsync error paths**: Run on UI thread inline (in SendPromptAsync's catch blocks)
 
 ### Model Selection
-The model is set at **session creation time** via `SessionConfig.Model`. The SDK does **not** support changing models per-message or mid-session — `MessageOptions` has no `Model` property. 
+The model is set at **session creation time** via `SessionConfig.Model`. The SDK provides `session.Rpc.Model.SwitchToAsync(model, reasoningEffort?)` for mid-session model switching, but PolyPilot has not adopted it — currently the session must be destroyed and recreated to change models. `MessageOptions` has no `Model` property (no per-message model selection).
 
 When a user changes the model via the UI dropdown:
 - `session.Model` is updated locally (affects UI display only)
 - The SDK continues using the original model from session creation
-- To truly switch models, the session must be destroyed and recreated
+- To truly switch models, the session must be destroyed and recreated (or `SwitchToAsync` could be adopted)
+
+`GetSessionModel` prioritizes: (1) user's explicit choice (`session.Model`), (2) backend-reported model from usage info, (3) `DefaultModel` fallback. `ShouldAcceptObservedModel()` in `ModelHelper.cs` prevents `SessionUsageInfoEvent` and `AssistantUsageEvent` from overwriting an explicit user model selection — the observed model is only accepted if no explicit choice was made or if the observed model matches the explicit choice.
 
 ### SDK Data Types
-- `AssistantUsageData` properties (`InputTokens`, `OutputTokens`, etc.) are `Double?` not `int?`
+- `AssistantUsageData` properties (`InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheWriteTokens`) are `Double?` not `int?`
 - Use `Convert.ToInt32(value)` for conversion, not `value as int?`
-- `QuotaSnapshots` is `Dictionary<string, object>` with `JsonElement` values
-- Premium quota fields: `isUnlimitedEntitlement`, `entitlementRequests`, `usedRequests`, `remainingPercentage`, `resetDate`
+- `AssistantUsageData` also includes: `Model`, `Cost` (billing multiplier), `Duration` (ms), `TtftMs` (time to first token), `InterTokenLatencyMs`, `ReasoningEffort`, `Initiator` (e.g., "sub-agent", "mcp-sampling"), `CopilotUsage`, `ApiCallId`, `ProviderCallId`, `ParentToolCallId`
+- `QuotaSnapshots` is `Dictionary<string, object>` with `JsonElement` values — the typed fields (`EntitlementRequests`, `UsedRequests`, `RemainingPercentage`, `Overage`, `OverageAllowedWithExhaustedQuota`, `ResetDate`) are defined on `Rpc.AccountGetQuotaResultQuotaSnapshotsValue`
+- `SessionIdleData` includes `BackgroundTasks` (agents + shells) and `Aborted` (bool?, true when turn was cancelled via abort)
+- `MessageOptions` has 3 properties: `Prompt`, `Attachments`, `Mode` — no `Model` or `ReasoningEffort` (those are session-level via `SwitchToAsync`)
 
 ### Blazor Input Performance
 Avoid `@bind:event="oninput"` — causes round-trip lag per keystroke. Use plain HTML inputs with JS event listeners and read values via `JS.InvokeAsync<string>("eval", "document.getElementById('id')?.value")` on submit.
@@ -324,6 +369,9 @@ Avoid `@bind:event="oninput"` — causes round-trip lag per keystroke. Use plain
 `SaveActiveSessionsToDisk`, `SaveOrganization`, and `SaveUiState` use timer-based debounce (2s/2s/1s) — **must flush in DisposeAsync**. `LoadPersistedSessions()` scans all session directories (750+) — **never call from render-triggered paths**. `GetOrganizedSessions()` is cached with hash-key invalidation. `_sessionSwitching` flag must stay true until `SafeRefreshAsync` reads it. See `.claude/skills/performance-optimization/SKILL.md` for detailed invariants.
 
 For detailed stuck-session debugging knowledge (8 invariants from 7 PRs of fix cycles), see `.claude/skills/processing-state-safety/SKILL.md`.
+
+### Smart Completion Scan
+**Smart completion scan:** `assistant.turn_end` and `assistant.message` are not unconditionally terminal — they appear between every tool round. `IsSessionStillProcessing` uses `IsCleanNoToolSubturn()` to scan backward from the last event within the current sub-turn (bounded by `assistant.turn_start`/`session.resume`/`session.start`). If any `tool.execution_*` event is found in the current sub-turn, the session is considered still processing. Clean no-tool turns are detected immediately, eliminating the 600s watchdog delay for simple conversations.
 
 ### Session Persistence
 - Active sessions: `~/.polypilot/active-sessions.json` (includes `LastPrompt` — last user message if session was processing during save)

@@ -110,13 +110,19 @@
             var grpProgress = CopilotService.GetMultiAgentProgress(expandedGroup.Id);
             var expandedGroupId = expandedGroup.Id;
             <div class="ma-expanded-toolbar" @onclick:stopPropagation="true">
-                <span class="ma-expanded-toolbar-label">🤖 @expandedGroup.Name</span>
-                <select class="ma-mode-select" @onchange="(e) => OnMultiAgentModeChanged(expandedGroupId, e)">
-                    <option value="Broadcast" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Broadcast)">📡 Broadcast</option>
-                    <option value="Sequential" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Sequential)">⏩ Sequential</option>
-                    <option value="Orchestrator" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Orchestrator)">🎯 Orchestrate</option>
-                    <option value="OrchestratorReflect" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">🔄 Reflect</option>
-                </select>
+                <span class="ma-expanded-toolbar-label">
+                    <span class="dashboard-ma-group-icon" aria-hidden="true"></span>
+                    <span>@expandedGroup.Name</span>
+                </span>
+                <span class="ma-mode-picker" @onclick:stopPropagation="true">
+                    <span class="dashboard-ma-mode-icon @GetDashboardMultiAgentModeIconClass(expandedGroup.OrchestratorMode)" aria-hidden="true"></span>
+                    <select class="ma-mode-select" aria-label="Orchestration mode" @onchange="(e) => OnMultiAgentModeChanged(expandedGroupId, e)">
+                        <option value="Broadcast" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Broadcast)">Broadcast</option>
+                        <option value="Sequential" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Sequential)">Sequential</option>
+                        <option value="Orchestrator" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.Orchestrator)">Orchestrate</option>
+                        <option value="OrchestratorReflect" selected="@(expandedGroup.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">Reflect</option>
+                    </select>
+                </span>
                 @if (expandedGroup.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
                 {
                     <span class="reflect-iter-inline">
@@ -146,14 +152,19 @@
                 }
             </div>
         }
-        @* Keep-alive: render all active sessions, JS owns 'active' class for instant switching *@
+        @* Keep-alive: render slot divs for all sessions (JS needs them for instant CSS toggle),
+           but only populate expensive ExpandedSessionView content for MRU/expanded/processing sessions *@
         @foreach (var session in sessions)
         {
+            var renderContent = ShouldRenderSlot(session.Name);
             <KeepAliveSession Id="@($"slot-{session.Name.Replace(" ", "-")}")"
                               IsVisible="@(session.Name == expandedSession)"
-                              WarmWhenHidden="@(completedSessions.Contains(session.Name) || (session.IsProcessing && (streamingBySession.ContainsKey(session.Name) || currentToolBySession.ContainsKey(session.Name) || activityBySession.ContainsKey(session.Name))))"
+                              HasContent="renderContent"
+                              WarmWhenHidden="@(renderContent && (completedSessions.Contains(session.Name) || (session.IsProcessing && (streamingBySession.ContainsKey(session.Name) || currentToolBySession.ContainsKey(session.Name) || activityBySession.ContainsKey(session.Name)))))"
                               HiddenWarmIntervalMs="250"
                               @key="session.Name">
+                @if (renderContent)
+                {
                 <ExpandedSessionView Session="session"
                                      IsCompleted="@completedSessions.Contains(session.Name)"
                                      IsLoadingHistory="@(CopilotService.IsRemoteMode && session.MessageCount > 0 && session.History.Count == 0)"
@@ -188,6 +199,9 @@
                                      OnRemovePendingImage="RemovePendingImage"
                                      OnSetInputMode="(mode) => SetInputMode(session.Name, mode)"
                                      OnSetModel="(model) => SetExpandedModel(session, model)"
+                                     OnSetReasoningEffort="(effort) => SetReasoningEffort(session, effort)"
+                                     SupportedReasoningEfforts="CopilotService.GetSupportedReasoningEfforts(GetExpandedModel(session))"
+                                     DefaultReasoningEffort="@CopilotService.GetDefaultReasoningEffort(GetExpandedModel(session))"
                                      OnFontSizeChange="HandleFontSizeChange"
                                      OnLoadMore="LoadMoreExpandedMessages"
                                      OnLoadFullHistory="LoadFullRemoteHistory"
@@ -195,21 +209,27 @@
                                      OnStopFiesta="StopFiestaForSession"
                                      OnStopReflection="() => StopReflectionForSession(session.Name)"
                                      OnReconnectRequested="() => CopilotService.RecoverSessionAsync(session.Name)" />
+                }
             </KeepAliveSession>
         }
     }
     else
     {
         <div class="dashboard-header">
-            <h2>Session Orchestrator</h2>
-            <span class="session-count">@sessions.Count active sessions</span>
-            @if (CopilotService.IsRemoteMode)
-            {
-                <span class="bridge-status @(CopilotService.IsBridgeConnected ? "connected" : "disconnected")" 
-                      title="@(CopilotService.IsBridgeConnected ? "Bridge connected" : "Bridge disconnected — reconnecting...")">
-                    @(CopilotService.IsBridgeConnected ? "🟢" : "🔴")
-                </span>
-            }
+            <div class="dashboard-header-main">
+                <h2>Session Orchestrator</h2>
+                <div class="dashboard-header-meta">
+                    <span class="session-count">@sessions.Count active sessions</span>
+                    @if (CopilotService.IsRemoteMode)
+                    {
+                        <span class="bridge-status @(CopilotService.IsBridgeConnected ? "connected" : "disconnected")"
+                              title="@(CopilotService.IsBridgeConnected ? "Bridge connected" : "Bridge disconnected — reconnecting...")">
+                            <span class="bridge-status-dot" aria-hidden="true"></span>
+                            <span class="bridge-status-text">@(CopilotService.IsBridgeConnected ? "Bridge online" : "Reconnecting")</span>
+                        </span>
+                    }
+                </div>
+            </div>
             <div class="toolbar-actions">
                 <button class="toolbar-overflow-btn" @onclick="() => toolbarMenuOpen = !toolbarMenuOpen"
                         @onclick:stopPropagation="true" title="More options">⋯</button>
@@ -230,30 +250,42 @@
                     }
                     else
                     {
-                        <button class="grid-density-btn" @onclick="() => { isAddingDashGroup = true; }" title="New group">+ Group</button>
-                        <button class="grid-density-btn multi-agent-btn" @onclick="() => { isAddingMultiAgentGroup = true; }" title="New multi-agent group">🤖 + Multi-Agent</button>
+                        <button class="grid-density-btn toolbar-action-btn" @onclick="() => { isAddingDashGroup = true; }" title="New group">
+                            <span class="toolbar-action-icon add-group" aria-hidden="true"></span>
+                            <span>Group</span>
+                        </button>
+                        <button class="grid-density-btn toolbar-action-btn multi-agent-btn" @onclick="() => { isAddingMultiAgentGroup = true; }" title="New multi-agent group">
+                            <span class="toolbar-action-icon multi-agent" aria-hidden="true"></span>
+                            <span>Multi-Agent</span>
+                        </button>
                     }
                     <span class="grid-columns-control">
+                        <span class="toolbar-control-label">Grid</span>
                         <button class="grid-col-btn" @onclick="DecrementGridColumns" disabled="@(_gridColumns <= 2)" title="Fewer columns">−</button>
                         <span class="grid-col-label" title="Cards per row">@_gridColumns col</span>
                         <button class="grid-col-btn" @onclick="IncrementGridColumns" disabled="@(_gridColumns >= 6)" title="More columns">+</button>
                     </span>
                     <span class="grid-columns-control">
+                        <span class="toolbar-control-label">Height</span>
                         <button class="grid-col-btn" @onclick="DecrementCardHeight" disabled="@(_cardMinHeight <= 150)" title="Shorter cards">−</button>
-                        <span class="grid-col-label" title="Card min height">↕ @(_cardMinHeight)px</span>
+                        <span class="grid-col-label" title="Card min height">@(_cardMinHeight)px</span>
                         <button class="grid-col-btn" @onclick="IncrementCardHeight" disabled="@(_cardMinHeight >= 600)" title="Taller cards">+</button>
                     </span>
                     <span class="font-size-controls">
+                        <span class="toolbar-control-label">Text</span>
                         <button class="font-size-btn" @onclick="DecreaseFontSize" disabled="@(fontSize <= 12)" title="Decrease font size (⌘−)">A−</button>
                         <span class="font-size-label" @onclick="ResetFontSize" title="Reset font size (⌘0)">@(fontSize)px</span>
                         <button class="font-size-btn" @onclick="IncreaseFontSize" disabled="@(fontSize >= 24)" title="Increase font size (⌘+)">A+</button>
                     </span>
-                    <select class="sort-select" @onchange="OnSortModeChanged">
-                        <option value="LastActive" selected="@(CopilotService.Organization.SortMode == SessionSortMode.LastActive)">↕ Last Active</option>
-                        <option value="CreatedAt" selected="@(CopilotService.Organization.SortMode == SessionSortMode.CreatedAt)">↕ Created</option>
-                        <option value="Alphabetical" selected="@(CopilotService.Organization.SortMode == SessionSortMode.Alphabetical)">↕ A–Z</option>
-                        <option value="Manual" selected="@(CopilotService.Organization.SortMode == SessionSortMode.Manual)">↕ Manual</option>
-                    </select>
+                    <label class="toolbar-sort-wrap">
+                        <span class="toolbar-control-label">Sort</span>
+                        <select class="sort-select" aria-label="Sort sessions" @onchange="OnSortModeChanged">
+                            <option value="LastActive" selected="@(CopilotService.Organization.SortMode == SessionSortMode.LastActive)">Last active</option>
+                            <option value="CreatedAt" selected="@(CopilotService.Organization.SortMode == SessionSortMode.CreatedAt)">Created</option>
+                            <option value="Alphabetical" selected="@(CopilotService.Organization.SortMode == SessionSortMode.Alphabetical)">A-Z</option>
+                            <option value="Manual" selected="@(CopilotService.Organization.SortMode == SessionSortMode.Manual)">Manual</option>
+                        </select>
+                    </label>
                 </div>
             </div>
         </div>
@@ -264,7 +296,10 @@
             @if (focusSessions.Count > 0)
             {
             <div class="focus-strip-header">
-                <span class="focus-strip-label">🎯 Focus</span>
+                <span class="focus-strip-label">
+                    <span class="focus-strip-icon" aria-hidden="true"></span>
+                    <span>Focus</span>
+                </span>
                 <span class="focus-strip-count">@focusSessions.Count</span>
                 <span class="focus-strip-hint">Use ⬆⬇ to reorder · ✕ to remove</span>
             </div>
@@ -343,18 +378,21 @@
                      @onclick="() => CopilotService.ToggleGroupCollapsed(group.Id)">
                     @if (group.IsMultiAgent)
                     {
-                        <span class="group-divider-badge">🤖</span>
+                        <span class="group-divider-badge" aria-hidden="true"></span>
                     }
                     <span class="group-divider-name">@group.Name</span>
                     @if (group.IsMultiAgent)
                     {
                         <span class="group-divider-mode" @onclick:stopPropagation="true">
-                            <select class="ma-mode-select" @onchange="(e) => OnMultiAgentModeChanged(group.Id, e)">
-                                <option value="Broadcast" selected="@(group.OrchestratorMode == MultiAgentMode.Broadcast)">📡 Broadcast</option>
-                                <option value="Sequential" selected="@(group.OrchestratorMode == MultiAgentMode.Sequential)">⏩ Sequential</option>
-                                <option value="Orchestrator" selected="@(group.OrchestratorMode == MultiAgentMode.Orchestrator)">🎯 Orchestrate</option>
-                                <option value="OrchestratorReflect" selected="@(group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">🔄 Reflect</option>
-                            </select>
+                            <span class="ma-mode-picker" @onclick:stopPropagation="true">
+                                <span class="dashboard-ma-mode-icon @GetDashboardMultiAgentModeIconClass(group.OrchestratorMode)" aria-hidden="true"></span>
+                                <select class="ma-mode-select" aria-label="Orchestration mode" @onchange="(e) => OnMultiAgentModeChanged(group.Id, e)">
+                                    <option value="Broadcast" selected="@(group.OrchestratorMode == MultiAgentMode.Broadcast)">Broadcast</option>
+                                    <option value="Sequential" selected="@(group.OrchestratorMode == MultiAgentMode.Sequential)">Sequential</option>
+                                    <option value="Orchestrator" selected="@(group.OrchestratorMode == MultiAgentMode.Orchestrator)">Orchestrate</option>
+                                    <option value="OrchestratorReflect" selected="@(group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)">Reflect</option>
+                                </select>
+                            </span>
                         </span>
                     }
                     <span class="group-divider-count">@groupSessions.Count sessions</span>
@@ -524,6 +562,13 @@
     private string? mobileConnectError;
     private bool _needsScrollToBottom;
     private volatile bool _sessionSwitching; // true during ExpandSession to skip redundant JS interop
+    
+    // Keep-alive slot cap: only render DOM for the N most recently accessed sessions.
+    // All other sessions are evicted from the DOM to reduce node count.
+    // Session state lives in CopilotService — no data loss on eviction.
+    private const int MaxKeepAliveSlots = 5;
+    private LinkedList<string> _mruSessions = new();
+    private HashSet<string> _mruSet = new(); // O(1) lookup companion for _mruSessions
     private bool _loadMoreObserverInitialized;
     private bool isCompactGrid;  // true = compact cards, false = spacious cards
     private int _gridColumns = 3;  // number of cards per row (2-6)
@@ -628,6 +673,7 @@
                 if (!string.IsNullOrEmpty(uiState.ExpandedSession))
                 {
                     expandedSession = uiState.ExpandedSession;
+                    TouchMru(uiState.ExpandedSession);
                     _explicitlyCollapsed = false;
                     _initialGridSet = true; // Prevent RefreshState from overriding
                     // Don't set active session yet - will do after Initialize
@@ -744,6 +790,11 @@
             WsBridgeServer.ServerPassword = connSettings.ServerPassword;
             WsBridgeServer.SetCopilotService(CopilotService);
             WsBridgeServer.Start(DevTunnelService.BridgePort, connSettings.Port);
+            if (WsBridgeServer.IsRunning && !WsBridgeServer.SupportsRemoteConnections)
+            {
+                Console.WriteLine("[AutoStart] Direct sharing bound to localhost only; stopping so the app doesn't advertise an unusable LAN endpoint.");
+                WsBridgeServer.Stop();
+            }
         }
     }
 
@@ -872,7 +923,7 @@
         }
         catch (Exception ex)
         {
-            mobileConnectError = ex.Message;
+            mobileConnectError = Models.ErrorMessageHelper.Humanize(ex);
         }
 
         mobileConnecting = false;
@@ -949,6 +1000,132 @@
                             var card = inputs[idx].closest('.session-card');
                             if (card && card.dataset.session && window.__dashRef) {
                                 window.__dashRef.invokeMethodAsync('JsSelectSession', card.dataset.session);
+                            }
+                        }
+                        // Emacs-style Ctrl keybindings for text navigation (macOS)
+                        if (isInput && e.ctrlKey && !e.metaKey && !e.altKey && /^mac/i.test(navigator.userAgentData?.platform ?? navigator.platform)) {
+                            var ta = e.target;
+                            var text = ta.value;
+                            var pos = ta.selectionStart;
+                            // Surrogate-pair-aware helpers: determine how many UTF-16 code units
+                            // the character at `idx` occupies (2 for supplementary chars / emoji, else 1).
+                            // Note: these handle surrogate pairs (2 UTF-16 code units per codepoint) but
+                            // not multi-codepoint grapheme clusters (e.g., flag emoji 🇺🇸, ZWJ sequences
+                            // 👨‍👩‍👧). This matches native macOS Emacs Ctrl-F/B/D behavior.
+                            function charLen(s, idx) {
+                                var code = s.charCodeAt(idx);
+                                return (code >= 0xD800 && code <= 0xDBFF && idx + 1 < s.length) ? 2 : 1;
+                            }
+                            // Length of the character *ending* at idx-1 (for backward movement).
+                            function charLenBefore(s, idx) {
+                                if (idx <= 0) return 0;
+                                var code = s.charCodeAt(idx - 1);
+                                return (code >= 0xDC00 && code <= 0xDFFF && idx - 2 >= 0) ? 2 : 1;
+                            }
+                            // Ctrl-A / Ctrl-Shift-A: beginning of line (+ select)
+                            if (e.key === 'a' || e.key === 'A') {
+                                e.preventDefault();
+                                var lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+                                ta.setSelectionRange(lineStart, e.shiftKey ? ta.selectionEnd : lineStart);
+                                return;
+                            }
+                            // Ctrl-E / Ctrl-Shift-E: end of line (+ select)
+                            if (e.key === 'e' || e.key === 'E') {
+                                e.preventDefault();
+                                var lineEnd = text.indexOf('\n', pos);
+                                if (lineEnd === -1) lineEnd = text.length;
+                                ta.setSelectionRange(e.shiftKey ? ta.selectionStart : lineEnd, lineEnd);
+                                return;
+                            }
+                            // Ctrl-F / Ctrl-Shift-F: forward one character (+ select)
+                            if (e.key === 'f' || e.key === 'F') {
+                                e.preventDefault();
+                                var np = Math.min(pos + charLen(text, pos), text.length);
+                                ta.setSelectionRange(e.shiftKey ? ta.selectionStart : np, np);
+                                return;
+                            }
+                            // Ctrl-B / Ctrl-Shift-B: backward one character (+ select)
+                            if (e.key === 'b' || e.key === 'B') {
+                                e.preventDefault();
+                                var np = Math.max(pos - charLenBefore(text, pos), 0);
+                                ta.setSelectionRange(np, e.shiftKey ? ta.selectionEnd : np);
+                                return;
+                            }
+                            // Ctrl-D: delete forward
+                            if (e.key === 'd' && !e.shiftKey) {
+                                e.preventDefault();
+                                if (pos < text.length) {
+                                    var cl = charLen(text, pos);
+                                    ta.value = text.slice(0, pos) + text.slice(pos + cl);
+                                    ta.setSelectionRange(pos, pos);
+                                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
+                                return;
+                            }
+                            // Ctrl-H: delete backward
+                            if (e.key === 'h' && !e.shiftKey) {
+                                e.preventDefault();
+                                if (pos > 0) {
+                                    var cl = charLenBefore(text, pos);
+                                    ta.value = text.slice(0, pos - cl) + text.slice(pos);
+                                    ta.setSelectionRange(pos - cl, pos - cl);
+                                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
+                                return;
+                            }
+                            // Ctrl-K: kill to end of line
+                            if (e.key === 'k' && !e.shiftKey) {
+                                e.preventDefault();
+                                var lineEnd = text.indexOf('\n', pos);
+                                if (lineEnd === -1) lineEnd = text.length;
+                                if (lineEnd === pos && pos < text.length) lineEnd = pos + 1;
+                                ta.value = text.slice(0, pos) + text.slice(lineEnd);
+                                ta.setSelectionRange(pos, pos);
+                                ta.dispatchEvent(new Event('input', {bubbles: true}));
+                                return;
+                            }
+                            // Ctrl-N: next line
+                            if (e.key === 'n' && !e.shiftKey) {
+                                e.preventDefault();
+                                var lineEnd = text.indexOf('\n', pos);
+                                if (lineEnd !== -1) {
+                                    var colStart = text.lastIndexOf('\n', pos - 1) + 1;
+                                    var col = pos - colStart;
+                                    var nextLineStart = lineEnd + 1;
+                                    var nextLineEnd = text.indexOf('\n', nextLineStart);
+                                    if (nextLineEnd === -1) nextLineEnd = text.length;
+                                    ta.setSelectionRange(Math.min(nextLineStart + col, nextLineEnd), Math.min(nextLineStart + col, nextLineEnd));
+                                }
+                                return;
+                            }
+                            // Ctrl-P: previous line
+                            if (e.key === 'p' && !e.shiftKey) {
+                                e.preventDefault();
+                                var colStart = text.lastIndexOf('\n', pos - 1) + 1;
+                                if (colStart > 0) {
+                                    var col = pos - colStart;
+                                    var prevLineEnd = colStart - 1;
+                                    var prevLineStart = text.lastIndexOf('\n', prevLineEnd - 1) + 1;
+                                    ta.setSelectionRange(Math.min(prevLineStart + col, prevLineEnd), Math.min(prevLineStart + col, prevLineEnd));
+                                }
+                                return;
+                            }
+                            // Ctrl-T: transpose characters (surrogate-pair-aware)
+                            // At end of text, transposes the two characters before cursor (standard Emacs behavior).
+                            if (e.key === 't' && !e.shiftKey) {
+                                e.preventDefault();
+                                var tp = pos;
+                                if (tp >= text.length && tp > 0) tp = tp - charLenBefore(text, tp);
+                                if (tp > 0 && tp < text.length) {
+                                    var clBefore = charLenBefore(text, tp);
+                                    var clAt = charLen(text, tp);
+                                    var charBefore = text.slice(tp - clBefore, tp);
+                                    var charAt = text.slice(tp, tp + clAt);
+                                    ta.value = text.slice(0, tp - clBefore) + charAt + charBefore + text.slice(tp + clAt);
+                                    ta.setSelectionRange(tp + clAt, tp + clAt);
+                                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
+                                return;
                             }
                         }
                         if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
@@ -1280,6 +1457,7 @@
                 if (selected != null && sessions.Any(s => s.Name == selected))
                 {
                     expandedSession = selected;
+                    TouchMru(selected);
                     _lastActiveSession = selected;
                     _focusedInputId = $"input-{selected.Replace(" ", "-")}";
                 }
@@ -1297,12 +1475,14 @@
             if (sessions.Count == 1 && expandedSession == null && !_explicitlyCollapsed)
             {
                 expandedSession = sessions[0].Name;
+                TouchMru(sessions[0].Name);
                 CopilotService.SwitchSession(sessions[0].Name);
             }
             if (sessionSwitched && active != null && sessions.Any(s => s.Name == active))
             {
                 _lastActiveSession = active;
                 expandedSession = active;
+                TouchMru(active);
                 _focusedInputId = $"input-{active!.Replace(" ", "-")}";
                 _needsScrollToBottom = true;
                 CopilotService.SaveUiState("/dashboard", activeSession: active, expandedSession: active, expandedGrid: !isCompactGrid);
@@ -1312,6 +1492,7 @@
             {
                 _lastActiveSession = active;
                 expandedSession = active;
+                TouchMru(active);
                 _needsScrollToBottom = true;
             }
             else if (sessionSwitched && active == null)
@@ -1616,7 +1797,7 @@
                 if (dispatch.DispatchCount > 0)
                 {
                     hostSession.History.Add(ChatMessage.SystemMessage(
-                        $"🎉 Dispatched to {dispatch.DispatchCount} worker{(dispatch.DispatchCount == 1 ? "" : "s")} in Fiesta mode."));
+                        $"Fiesta dispatched to {dispatch.DispatchCount} worker{(dispatch.DispatchCount == 1 ? "" : "s")}."));
                     hostSession.MessageCount = hostSession.History.Count;
                 }
             }
@@ -1915,7 +2096,7 @@
                     "- `/version` — Show version info\n" +
                     "- `/diff [args]` — Show git diff\n" +
                     "- `/status` — Show git status\n" +
-                    "- `/prompt` — List saved prompts (`/prompt use|save|edit|show|delete`)\n" +
+                    "- `/prompt` — Manage prompts (`/prompt use <name> [-- context]`, save, edit, show, delete)\n" +
                     "- `/usage` — Show token usage and quota for this session\n" +
                     "- `/agent [name]` — List or select a CLI agent\n" +
                     "- `/fleet <prompt>` — Start fleet mode (parallel subagent execution)\n" +
@@ -1992,6 +2173,7 @@
                 {
                     CopilotService.SetActiveSession(created.Name);
                     expandedSession = created.Name;
+                    TouchMru(created.Name);
                     _explicitlyCollapsed = false;
                 }
                 await InvokeAsync(SafeRefreshAsync);
@@ -2017,6 +2199,10 @@
                     var success = CopilotService.RenameSession(sessionName, arg);
                     if (success)
                     {
+                        // Always clean up MRU for old name, not just when expanded
+                        _mruSessions.Remove(sessionName);
+                        _mruSet.Remove(sessionName);
+                        TouchMru(arg);
                         if (expandedSession == sessionName)
                             expandedSession = arg;
                         sessions = CopilotService.GetAllSessions().ToList();
@@ -2350,19 +2536,58 @@
             case "use":
                 if (string.IsNullOrEmpty(target))
                 {
-                    session.History.Add(ChatMessage.ErrorMessage("Usage: `/prompt use <name>`"));
+                    session.History.Add(ChatMessage.ErrorMessage("Usage: `/prompt use <name> [-- additional context]`"));
                     break;
                 }
-                var prompt = PromptLibraryService.GetPrompt(target, session.WorkingDirectory);
-                if (prompt == null)
+                // Greedy name match + optional " -- " context separator
+                SavedPrompt? usePrompt = null;
+                string? userContext = null;
+                {
+                    var allPrompts = PromptLibraryService.DiscoverPrompts(session.WorkingDirectory);
+                    // First try explicit " -- " separator
+                    var sepIdx = target.IndexOf(" -- ", StringComparison.Ordinal);
+                    if (sepIdx >= 0)
+                    {
+                        var promptName = target[..sepIdx].TrimEnd();
+                        usePrompt = allPrompts.FirstOrDefault(p =>
+                            string.Equals(p.Name, promptName, StringComparison.OrdinalIgnoreCase));
+                        if (usePrompt != null)
+                        {
+                            var notes = target[(sepIdx + 4)..].TrimStart();
+                            userContext = string.IsNullOrWhiteSpace(notes) ? null : notes;
+                        }
+                    }
+                    // Fall back to greedy longest-name-first match (same as edit command)
+                    if (usePrompt == null)
+                    {
+                        var useWords = target.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        for (var i = useWords.Length; i >= 1; i--)
+                        {
+                            var candidateName = string.Join(' ', useWords[..i]);
+                            var candidate = allPrompts.FirstOrDefault(p =>
+                                string.Equals(p.Name, candidateName, StringComparison.OrdinalIgnoreCase));
+                            if (candidate != null)
+                            {
+                                usePrompt = candidate;
+                                var remainder = string.Join(' ', useWords[i..]).TrimStart('-', ' ');
+                                userContext = string.IsNullOrWhiteSpace(remainder) ? null : remainder;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (usePrompt == null)
                 {
                     session.History.Add(ChatMessage.ErrorMessage($"Prompt **{target}** not found."));
                     break;
                 }
+                var finalContent = userContext != null
+                    ? $"{usePrompt.Content}\n\n---\nAdditional context: {userContext}"
+                    : usePrompt.Content;
                 session.MessageCount = session.History.Count;
                 _needsScrollToBottom = true;
                 await InvokeAsync(SafeRefreshAsync);
-                _ = CopilotService.SendPromptAsync(sessionName, prompt.Content);
+                _ = CopilotService.SendPromptAsync(sessionName, finalContent);
                 return;
 
             case "save":
@@ -2426,7 +2651,7 @@
                 }
                 if (existingPrompt.Source != PromptSource.User)
                 {
-                    session.History.Add(ChatMessage.ErrorMessage($"Prompt **{existingPrompt.Name}** is a project prompt and cannot be edited. Only user prompts (`~/.polypilot/prompts/`) can be edited."));
+                    session.History.Add(ChatMessage.ErrorMessage($"Prompt **{existingPrompt.Name}** is a {existingPrompt.SourceLabel} prompt and cannot be edited. Only user prompts (`~/.polypilot/prompts/`) can be edited."));
                     break;
                 }
                 if (editContent != null)
@@ -2499,7 +2724,7 @@
                     }));
                     session.History.Add(ChatMessage.SystemMessage(
                         $"**{prompts.Count} prompt{(prompts.Count != 1 ? "s" : "")} available:**\n{listing}\n\n" +
-                        "Use: `/prompt use <name>` · Edit: `/prompt edit <name>` · Show: `/prompt show <name>` · Delete: `/prompt delete <name>`"));
+                        "Use: `/prompt use <name> [-- context]` · Edit: `/prompt edit <name>` · Show: `/prompt show <name>` · Delete: `/prompt delete <name>`"));
                 }
                 break;
         }
@@ -2684,7 +2909,7 @@
                     .ToList();
                 var workerText = workers.Count > 0 ? string.Join(", ", workers) : "(none)";
                 session.History.Add(ChatMessage.SystemMessage(
-                    $"🎉 Fiesta **{fiestaName}** started with {workerText}. Mention workers to dispatch work."));
+                    $"Fiesta **{fiestaName}** started with {workerText}. Mention workers to dispatch work."));
                 session.MessageCount = session.History.Count;
             }
         }
@@ -2735,7 +2960,7 @@
             var key = $"{sessionName}:{update.TaskId}";
             if (!_fiestaStreamingMessages.TryGetValue(key, out var liveMessage))
             {
-                liveMessage = ChatMessage.SystemMessage($"🎉 @{update.WorkerName}: ");
+                liveMessage = ChatMessage.SystemMessage($"Fiesta · @{update.WorkerName}: ");
                 session.History.Add(liveMessage);
                 _fiestaStreamingMessages[key] = liveMessage;
             }
@@ -2743,7 +2968,7 @@
             switch (update.Kind)
             {
                 case FiestaTaskUpdateKind.Started:
-                    liveMessage.Content = $"🎉 @{update.WorkerName}: {update.Content}";
+                    liveMessage.Content = $"Fiesta · @{update.WorkerName}: {update.Content}";
                     break;
                 case FiestaTaskUpdateKind.Delta:
                     liveMessage.Content += update.Content;
@@ -2863,11 +3088,55 @@
         await JS.InvokeVoidAsync("clickElement", fileId);
     }
 
+    private void TouchMru(string sessionName)
+    {
+        if (_mruSet.Contains(sessionName))
+        {
+            _mruSessions.Remove(sessionName);
+        }
+        _mruSessions.AddFirst(sessionName);
+        _mruSet.Add(sessionName);
+        // Evict oldest beyond cap — but never evict processing sessions
+        while (_mruSessions.Count > MaxKeepAliveSlots)
+        {
+            // Scan from tail for a non-processing candidate to evict
+            var node = _mruSessions.Last;
+            LinkedListNode<string>? evictTarget = null;
+            while (node != null)
+            {
+                var s = sessions.FirstOrDefault(s => s.Name == node.Value);
+                if (s?.IsProcessing != true)
+                {
+                    evictTarget = node;
+                    break;
+                }
+                node = node.Previous;
+            }
+            if (evictTarget == null)
+                break; // all entries are processing — allow temporary overflow
+            _mruSessions.Remove(evictTarget);
+            _mruSet.Remove(evictTarget.Value);
+        }
+    }
+
+    private bool ShouldRenderSlot(string sessionName)
+    {
+        // Always render: MRU sessions, the currently expanded session, the active session,
+        // and processing sessions. ActiveSessionName is checked as fallback because
+        // expandedSession may lag behind by one render cycle after sidebar clicks.
+        if (_mruSet.Contains(sessionName) || sessionName == expandedSession 
+            || sessionName == CopilotService.ActiveSessionName)
+            return true;
+        var session = sessions.FirstOrDefault(s => s.Name == sessionName);
+        return session?.IsProcessing == true;
+    }
+
     private async Task ExpandSession(string sessionName)
     {
         // Fire-and-forget draft save — don't block the switch on JS interop
         _ = SaveDraftsAndCursor();
         expandedSession = sessionName;
+        TouchMru(sessionName);
         _needsScrollToBottom = true;
         _sessionSwitching = true; // tells RefreshState to skip redundant work
         // Suppress Blazor renders for 300ms to let browser paint the CSS toggle uninterrupted
@@ -2960,7 +3229,15 @@
         var newName = await JS.InvokeAsync<string>("getElementValue", "cardRenameInput");
         if (!string.IsNullOrWhiteSpace(newName) && newName.Trim() != oldName)
         {
-            CopilotService.RenameSession(oldName, newName.Trim());
+            var success = CopilotService.RenameSession(oldName, newName.Trim());
+            if (success)
+            {
+                _mruSessions.Remove(oldName);
+                _mruSet.Remove(oldName);
+                TouchMru(newName.Trim());
+                if (expandedSession == oldName)
+                    expandedSession = newName.Trim();
+            }
         }
     }
 
@@ -3017,6 +3294,15 @@
             CopilotService.SetMultiAgentMode(groupId, mode);
         }
     }
+
+    private static string GetDashboardMultiAgentModeIconClass(MultiAgentMode mode) => mode switch
+    {
+        MultiAgentMode.Broadcast => "broadcast",
+        MultiAgentMode.Sequential => "sequential",
+        MultiAgentMode.Orchestrator => "orchestrator",
+        MultiAgentMode.OrchestratorReflect => "reflect",
+        _ => "orchestrator"
+    };
 
     private static string GetInputPlaceholder(MultiAgentMode mode) => mode switch
     {
@@ -3235,6 +3521,9 @@
     private async Task CloseSession(string sessionName)
     {
         await CopilotService.CloseSessionAsync(sessionName);
+        // Clean up MRU to prevent stale entries occupying slots
+        _mruSessions.Remove(sessionName);
+        _mruSet.Remove(sessionName);
         if (expandedSession == sessionName)
         {
             expandedSession = null;
@@ -3252,6 +3541,7 @@
         CopilotService.SwitchSession(sessionName);
         await SaveDraftsAndCursor();
         expandedSession = sessionName;
+        TouchMru(sessionName);
         _needsScrollToBottom = true;
         _focusedInputId = $"input-{sessionName.Replace(" ", "-")}";
         _cursorStart = 0;
@@ -3287,6 +3577,7 @@
     {
         await SaveDraftsAndCursor();
         expandedSession = sessionName;
+        TouchMru(sessionName);
         CopilotService.SwitchSession(sessionName);
         var s = CopilotService.GetSession(sessionName);
         if (s != null) s.LastReadMessageCount = s.History.Count;
@@ -3314,6 +3605,7 @@
         if (idx < 0) idx = 0;
         idx = reverse ? (idx - 1 + sessions.Count) % sessions.Count : (idx + 1) % sessions.Count;
         expandedSession = sessions[idx].Name;
+        TouchMru(sessions[idx].Name);
         CopilotService.SwitchSession(expandedSession);
         var cs = CopilotService.GetSession(expandedSession);
         if (cs != null) cs.LastReadMessageCount = cs.History.Count;
@@ -3364,6 +3656,7 @@
                     {
                         await SaveDraftsAndCursor();
                         expandedSession = session.Name;
+                        TouchMru(session.Name);
                         _focusedInputId = $"input-{session.Name.Replace(" ", "-")}";
                     }
                     CopilotService.SwitchSession(session.Name);
@@ -3426,19 +3719,22 @@
     // === Model, plan mode, font, token helpers ===
 
     private IReadOnlyList<string> availableModels =>
-        CopilotService.AvailableModels.Count > 0 ? CopilotService.AvailableModels : ModelHelper.FallbackModels;
+        CopilotService.AvailableModels.Count > 0
+            ? ModelHelper.BuildSelectionList(CopilotService.AvailableModels, CopilotService.DefaultModel)
+            : ModelHelper.BuildSelectionList(ModelHelper.FallbackModels, CopilotService.DefaultModel);
 
     private string GetSessionModel(AgentSessionInfo session)
     {
-        // Priority: 1) Usage info (TRUTH) - what the backend is actually using
-        if (usageBySession.TryGetValue(session.Name, out var u) && !string.IsNullOrEmpty(u.Model))
-            return u.Model;
-
-        // Priority: 2) Session model property (initial configuration)
+        // Priority: 1) Session model property (user's explicit choice, persisted across restarts)
         if (!string.IsNullOrEmpty(session.Model) && session.Model != "resumed")
             return session.Model;
 
-        return availableModels[0];
+        // Priority: 2) Usage info - what the backend reported
+        if (usageBySession.TryGetValue(session.Name, out var u) && !string.IsNullOrEmpty(u.Model))
+            return u.Model;
+
+        // Fallback: default model (never alphabetical first which may be haiku)
+        return CopilotService.DefaultModel;
     }
 
     private string GetExpandedModel(AgentSessionInfo session)
@@ -3454,6 +3750,7 @@
         if (session.History.Count == 0)
         {
             await CopilotService.RecreateSessionAsync(session.Name, model);
+            CopilotService.SetSessionPreferredModel(session.Name, model);
             sessions = CopilotService.GetAllSessions().ToList();
             await InvokeAsync(SafeRefreshAsync);
             return;
@@ -3463,6 +3760,8 @@
         var success = await CopilotService.ChangeModelAsync(session.Name, model);
         if (success)
         {
+            // Update PreferredModel so multi-agent dispatch respects the user's choice
+            CopilotService.SetSessionPreferredModel(session.Name, model);
             sessions = CopilotService.GetAllSessions().ToList();
             await InvokeAsync(SafeRefreshAsync);
         }
@@ -3480,6 +3779,17 @@
     {
         inputModeBySession[sessionName] = IsValidInputMode(mode) ? mode : "chat";
         CopilotService.SaveUiState("/dashboard", inputModes: inputModeBySession);
+    }
+
+    private async Task SetReasoningEffort(AgentSessionInfo session, string? effort)
+    {
+        if (string.IsNullOrEmpty(effort) || session.IsProcessing) return;
+        var success = await CopilotService.ChangeModelAsync(session.Name, session.Model, reasoningEffort: effort);
+        if (success)
+        {
+            sessions = CopilotService.GetAllSessions().ToList();
+            await InvokeAsync(SafeRefreshAsync);
+        }
     }
 
     private void IncreaseFontSize() { if (fontSize < 24) { fontSize += 2; ApplyFontSize(); ShowFontBubble(); } }

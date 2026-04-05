@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -14,15 +15,23 @@ namespace PolyPilot.Services;
 public class WsBridgeServer : IDisposable
 {
     private HttpListener? _listener;
+    private TcpListener? _proxyListener;
     private CancellationTokenSource? _cts;
     private Task? _acceptTask;
+    private Task? _proxyAcceptTask;
+    private readonly SemaphoreSlim _restartLock = new(1, 1);
     private int _bridgePort;
+    private int _internalListenerPort;
     private CopilotService? _copilot;
     private FiestaService? _fiestaService;
     private RepoManager? _repoManager;
+    private PrLinkService? _prLinkService;
     private readonly ConcurrentDictionary<string, WebSocket> _clients = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _clientSendLocks = new();
     private long _lastPairRequestAcceptedAtTicks = DateTime.MinValue.Ticks;
+    private readonly ConcurrentQueue<PendingBridgePrompt> _pendingBridgePrompts = new();
+    private readonly SemaphoreSlim _drainLock = new(1, 1);
+    private record PendingBridgePrompt(string SessionName, string Message, string? AgentMode);
 
     // Debounce timers to prevent flooding mobile clients during streaming
     private Timer? _sessionsListDebounce;
@@ -38,7 +47,8 @@ public class WsBridgeServer : IDisposable
     private const int OrgStateDebounceMs = 2000;
 
     public int BridgePort => _bridgePort;
-    public bool IsRunning => _listener?.IsListening == true;
+    public bool IsRunning => _listener?.IsListening == true && _proxyListener != null;
+    public bool SupportsRemoteConnections { get; private set; }
 
     /// <summary>
     /// Access token that clients must provide via X-Tunnel-Authorization header or query param.
@@ -80,47 +90,120 @@ public class WsBridgeServer : IDisposable
         if (IsRunning) return;
 
         _bridgePort = bridgePort;
+        SupportsRemoteConnections = false;
         _cts = new CancellationTokenSource();
         ReloadBridgeFilter();
 
-        if (TryBindListener(bridgePort))
+        if (TryBindBridgePipeline(bridgePort))
         {
-            _acceptTask = AcceptLoopAsync(_cts.Token);
+            Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode, network via loopback proxy localhost:{_internalListenerPort})");
             OnStateChanged?.Invoke();
         }
         else
         {
-            // Port likely in TIME_WAIT from a previous instance (relaunch).
-            // Start the accept loop anyway — it will retry via TryRestartListenerAsync
-            // with exponential backoff until the port is released (typically 5-15s).
-            Console.WriteLine($"[WsBridge] Port {bridgePort} busy — will retry in accept loop");
-            _acceptTask = AcceptLoopAsync(_cts.Token);
+            Console.WriteLine($"[WsBridge] Port {bridgePort} unavailable — will retry in accept loops");
         }
+
+        _acceptTask = AcceptLoopAsync(_cts.Token);
+        _proxyAcceptTask = ProxyAcceptLoopAsync(_cts.Token);
     }
 
     /// <summary>
-    /// Try to bind the HttpListener on the given port. Tries wildcard first (LAN access),
-    /// falls back to localhost. Returns true if the listener is now listening.
+    /// Start a loopback HttpListener plus a public TCP proxy that forwards requests to it
+    /// after rewriting the Host header. This avoids HTTP.sys URL ACL requirements for
+    /// wildcard/external prefixes on Windows while preserving the existing bridge logic.
     /// </summary>
-    private bool TryBindListener(int port)
+    private bool TryBindBridgePipeline(int publicPort)
     {
-        foreach (var prefix in new[] { $"http://+:{port}/", $"http://localhost:{port}/" })
+        if (!TryBindInternalListener())
+            return false;
+
+        if (!TryBindProxyListener(publicPort))
         {
+            StopListenersOnly();
+            return false;
+        }
+
+        SupportsRemoteConnections = true;
+        return true;
+    }
+
+    private bool TryBindInternalListener()
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            var port = GetFreeLoopbackPort();
             try
             {
                 var listener = new HttpListener();
-                listener.Prefixes.Add(prefix);
+                listener.Prefixes.Add($"http://localhost:{port}/");
                 listener.Start();
                 _listener = listener;
-                Console.WriteLine($"[WsBridge] Listening on port {port} (state-sync mode)");
+                _internalListenerPort = port;
+                Console.WriteLine($"[WsBridge] Internal listener on localhost:{port}");
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WsBridge] Bind on {prefix} failed: {ex.Message}");
+                Console.WriteLine($"[WsBridge] Internal bind on localhost:{port} failed: {ex.Message}");
             }
         }
+
         return false;
+    }
+
+    private bool TryBindProxyListener(int port)
+    {
+        try
+        {
+            var proxy = new TcpListener(IPAddress.IPv6Any, port);
+            proxy.Server.DualMode = true;
+            proxy.Start();
+            _proxyListener = proxy;
+            Console.WriteLine($"[WsBridge] Public proxy listening on port {port} (dual-stack)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] Public dual-stack bind on port {port} failed: {ex.Message}");
+        }
+
+        try
+        {
+            var proxy = new TcpListener(IPAddress.Any, port);
+            proxy.Start();
+            _proxyListener = proxy;
+            Console.WriteLine($"[WsBridge] Public proxy listening on port {port} (IPv4)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] Public bind on port {port} failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Finds a free loopback port by binding to port 0 and reading the assigned port.
+    /// There is a small TOCTOU race window between releasing this listener and the caller
+    /// rebinding the port — another process could claim it in between. The caller mitigates
+    /// this with a 5-attempt retry loop in TryBindBridgePipeline.
+    /// </summary>
+    private static int GetFreeLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private void StopListenersOnly()
+    {
+        try { _proxyListener?.Stop(); } catch { }
+        _proxyListener = null;
+        try { _listener?.Close(); } catch { }
+        _listener = null;
+        _internalListenerPort = 0;
+        SupportsRemoteConnections = false;
     }
 
     /// <summary>
@@ -227,6 +310,70 @@ public class WsBridgeServer : IDisposable
         _repoManager ??= repoManager;
     }
 
+    public void SetPrLinkService(PrLinkService prLinkService)
+    {
+        _prLinkService ??= prLinkService;
+    }
+
+    /// <summary>
+    /// Enqueue a bridge prompt directly (test helper).
+    /// </summary>
+    internal void EnqueuePendingPromptForTesting(string sessionName, string message, string? agentMode = null)
+        => _pendingBridgePrompts.Enqueue(new PendingBridgePrompt(sessionName, message, agentMode));
+
+    /// <summary>
+    /// Replay bridge prompts that were queued during session restore.
+    /// Called by CopilotService after IsRestoring transitions to false.
+    /// Serialized via _drainLock to prevent concurrent drains from reordering prompts.
+    /// </summary>
+    public async Task DrainPendingPromptsAsync()
+    {
+        await _drainLock.WaitAsync();
+        try
+        {
+            while (_pendingBridgePrompts.TryDequeue(out var pending))
+            {
+                Console.WriteLine($"[BRIDGE] Replaying queued prompt for '{pending.SessionName}'");
+                try
+                {
+                    await DispatchBridgePromptAsync(pending.SessionName, pending.Message, pending.AgentMode);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[BRIDGE] Failed to replay prompt for '{pending.SessionName}': {ex.Message}");
+                }
+            }
+        }
+        finally
+        {
+            _drainLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Dispatch a bridge prompt with orchestrator routing on the UI thread.
+    /// Shared by both the live send_message handler and the drain replay loop.
+    /// </summary>
+    private async Task DispatchBridgePromptAsync(string sessionName, string message, string? agentMode, CancellationToken ct = default)
+    {
+        await _copilot!.InvokeOnUIAsync(async () =>
+        {
+            var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
+            if (orchGroupId != null)
+            {
+                var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
+                if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+                    _copilot.StartGroupReflection(orchGroupId, message, orchGroup.MaxReflectIterations ?? 5);
+                Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
+                await _copilot.SendToMultiAgentGroupAsync(orchGroupId, message, ct);
+            }
+            else
+            {
+                await _copilot.SendPromptAsync(sessionName, message, cancellationToken: ct, agentMode: agentMode);
+            }
+        });
+    }
+
     public void Stop()
     {
         _cts?.Cancel();
@@ -239,8 +386,7 @@ public class WsBridgeServer : IDisposable
         _clients.Clear();
         foreach (var kvp in _clientSendLocks) kvp.Value.Dispose();
         _clientSendLocks.Clear();
-        try { _listener?.Stop(); } catch { }
-        _listener = null;
+        StopListenersOnly();
         Console.WriteLine("[WsBridge] Stopped");
         OnStateChanged?.Invoke();
     }
@@ -250,8 +396,7 @@ public class WsBridgeServer : IDisposable
         int restartDelayMs = 1000;
         while (!ct.IsCancellationRequested)
         {
-            // Restart listener if it stopped (e.g. after Mac lock-screen suspend).
-            if (_listener?.IsListening != true)
+            if (_listener?.IsListening != true || _proxyListener == null)
             {
                 bool restarted = await TryRestartListenerAsync(ct);
                 if (!restarted)
@@ -268,7 +413,13 @@ public class WsBridgeServer : IDisposable
 
             try
             {
-                var context = await _listener!.GetContextAsync();
+                // Capture local references before awaiting — StopListenersOnly() can null
+                // these fields from another thread (error handlers in ProxyAcceptLoopAsync).
+                var listener = _listener;
+                var proxy = _proxyListener;
+                if (listener?.IsListening != true || proxy == null) continue;
+
+                var context = await listener.GetContextAsync();
 
                 if (context.Request.IsWebSocketRequest &&
                     context.Request.Url?.AbsolutePath == "/pair")
@@ -332,16 +483,20 @@ public class WsBridgeServer : IDisposable
                     context.Response.Close();
                 }
             }
-            catch (ObjectDisposedException) { break; }
-            catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException)
+            {
+                if (ct.IsCancellationRequested) break;
+            }
+            catch (OperationCanceledException)
+            {
+                if (ct.IsCancellationRequested) break;
+            }
             catch (HttpListenerException ex)
             {
                 if (ct.IsCancellationRequested) break;
-                // Listener can be killed by macOS when the screen locks or the machine
-                // sleeps. Mark it as stopped and let the restart path above revive it.
                 Console.WriteLine($"[WsBridge] Listener error ({ex.ErrorCode}): {ex.Message} — will restart");
-                try { _listener?.Stop(); } catch { }
-                _listener = null;
+                await _restartLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try { StopListenersOnly(); } finally { _restartLock.Release(); }
             }
             catch (Exception ex)
             {
@@ -351,26 +506,218 @@ public class WsBridgeServer : IDisposable
     }
 
     /// <summary>
-    /// Attempt to (re)start the HttpListener on the bridge port.
-    /// Tries the wildcard prefix first, falls back to localhost.
-    /// Returns true if the listener is now listening.
+    /// Accepts public TCP clients and forwards their traffic to the loopback HttpListener.
+    /// </summary>
+    private async Task ProxyAcceptLoopAsync(CancellationToken ct)
+    {
+        int restartDelayMs = 1000;
+        while (!ct.IsCancellationRequested)
+        {
+            if (_proxyListener == null || _listener?.IsListening != true)
+            {
+                bool restarted = await TryRestartListenerAsync(ct);
+                if (!restarted)
+                {
+                    restartDelayMs = Math.Min(restartDelayMs * 2, 30_000);
+                    await Task.Delay(restartDelayMs, ct).ConfigureAwait(false);
+                    continue;
+                }
+                restartDelayMs = 1000;
+            }
+
+            try
+            {
+                // Capture a local reference before awaiting — StopListenersOnly() can null
+                // _proxyListener from another thread (error handlers in AcceptLoopAsync).
+                var proxy = _proxyListener;
+                if (proxy == null) continue;
+
+                var client = await proxy.AcceptTcpClientAsync(ct);
+                _ = Task.Run(() => ProxyClientAsync(client, ct), CancellationToken.None);
+            }
+            catch (ObjectDisposedException)
+            {
+                if (ct.IsCancellationRequested) break;
+                await _restartLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try { StopListenersOnly(); } finally { _restartLock.Release(); }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (SocketException ex)
+            {
+                if (ct.IsCancellationRequested) break;
+                Console.WriteLine($"[WsBridge] Proxy accept error: {ex.Message} — will restart");
+                await _restartLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try { StopListenersOnly(); } finally { _restartLock.Release(); }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WsBridge] Proxy error: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempt to (re)start both sides of the bridge pipeline.
     /// </summary>
     private async Task<bool> TryRestartListenerAsync(CancellationToken ct)
     {
-        try { _listener?.Stop(); } catch { }
-        _listener = null;
-
-        // Wait for the OS to release the port after the old process died.
-        // macOS TIME_WAIT can hold the port for several seconds after kill.
-        try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { return false; }
-
-        if (TryBindListener(_bridgePort))
+        await _restartLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            Console.WriteLine($"[WsBridge] Restarted listening on port {_bridgePort}");
-            OnStateChanged?.Invoke();
-            return true;
+            if (_listener?.IsListening == true && _proxyListener != null)
+                return true;
+
+            StopListenersOnly();
+
+            // Wait for the OS to release the port after the old process died.
+            try { await Task.Delay(2000, ct).ConfigureAwait(false); } catch (OperationCanceledException) { return false; }
+
+            if (TryBindBridgePipeline(_bridgePort))
+            {
+                Console.WriteLine($"[WsBridge] Restarted listening on port {_bridgePort}");
+                OnStateChanged?.Invoke();
+                return true;
+            }
+
+            return false;
         }
-        return false;
+        finally
+        {
+            _restartLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Proxies a single public client connection to the loopback HttpListener.
+    /// </summary>
+    private async Task ProxyClientAsync(TcpClient client, CancellationToken ct)
+    {
+        using var downstream = client;
+        var internalPort = _internalListenerPort;
+        if (internalPort == 0)
+            return;
+
+        try
+        {
+            downstream.NoDelay = true;
+
+            using var upstream = new TcpClient();
+            upstream.NoDelay = true;
+            await upstream.ConnectAsync("localhost", internalPort, ct).ConfigureAwait(false);
+
+            using var downstreamStream = downstream.GetStream();
+            using var upstreamStream = upstream.GetStream();
+
+            var request = await ReadProxyRequestAsync(downstreamStream, ct).ConfigureAwait(false);
+            if (request == null)
+            {
+                Console.WriteLine("[WsBridge] Proxy request dropped (incomplete headers or exceeded 64KB limit)");
+                return;
+            }
+
+            var remoteIp = (downstream.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
+            var forwarded = RewriteProxyRequest(request.Value.Buffer, request.Value.HeaderLength, remoteIp, internalPort);
+            await upstreamStream.WriteAsync(forwarded, ct).ConfigureAwait(false);
+            await upstreamStream.FlushAsync(ct).ConfigureAwait(false);
+
+            var clientToServer = downstreamStream.CopyToAsync(upstreamStream, 81920, ct);
+            var serverToClient = upstreamStream.CopyToAsync(downstreamStream, 81920, ct);
+            var completed = await Task.WhenAny(clientToServer, serverToClient).ConfigureAwait(false);
+
+            // Suppress unobserved exceptions on the losing task — when one direction
+            // completes, the using blocks dispose the streams, causing the other
+            // CopyToAsync to throw ObjectDisposedException.
+            var other = completed == clientToServer ? serverToClient : clientToServer;
+            _ = other.ContinueWith(static t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] Proxy client error: {ex.Message}");
+        }
+    }
+
+    private static async Task<(byte[] Buffer, int HeaderLength)?> ReadProxyRequestAsync(Stream stream, CancellationToken ct)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
+        var token = timeoutCts.Token;
+
+        var buffer = new byte[4096];
+        using var ms = new MemoryStream();
+
+        while (ms.Length < 64 * 1024)
+        {
+            var read = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
+            if (read == 0)
+                return null;
+
+            ms.Write(buffer, 0, read);
+            var data = ms.GetBuffer();
+            var length = (int)ms.Length;
+            var headerLength = FindHeaderTerminator(data, length);
+            if (headerLength >= 0)
+                return (ms.ToArray(), headerLength);
+        }
+
+        return null;
+    }
+
+    private static int FindHeaderTerminator(byte[] buffer, int length)
+    {
+        for (var i = 3; i < length; i++)
+        {
+            if (buffer[i - 3] == '\r' && buffer[i - 2] == '\n' && buffer[i - 1] == '\r' && buffer[i] == '\n')
+                return i + 1;
+        }
+
+        return -1;
+    }
+
+    private static byte[] RewriteProxyRequest(byte[] requestBytes, int headerLength, string? remoteIp, int internalPort)
+    {
+        var headerText = Encoding.ASCII.GetString(requestBytes, 0, headerLength);
+        var lines = headerText.Split("\r\n", StringSplitOptions.None);
+        var builder = new StringBuilder(headerText.Length + 128);
+        bool wroteHost = false;
+
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrEmpty(line))
+                continue;
+
+            if (line.StartsWith("Host:", StringComparison.OrdinalIgnoreCase))
+            {
+                builder.Append("Host: localhost:").Append(internalPort).Append("\r\n");
+                wroteHost = true;
+                continue;
+            }
+
+            // Strip any client-supplied X-Forwarded-For — this is a single-hop proxy,
+            // so we replace (not append) to prevent spoofing of IsLoopbackRequest.
+            if (line.StartsWith("X-Forwarded-For:", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            builder.Append(line).Append("\r\n");
+        }
+
+        if (!wroteHost)
+            builder.Append("Host: localhost:").Append(internalPort).Append("\r\n");
+        if (!string.IsNullOrEmpty(remoteIp))
+            builder.Append("X-Forwarded-For: ").Append(remoteIp).Append("\r\n");
+
+        builder.Append("\r\n");
+        var headerBytes = Encoding.ASCII.GetBytes(builder.ToString());
+        if (headerLength >= requestBytes.Length)
+            return headerBytes;
+
+        var rewritten = new byte[headerBytes.Length + (requestBytes.Length - headerLength)];
+        Buffer.BlockCopy(headerBytes, 0, rewritten, 0, headerBytes.Length);
+        Buffer.BlockCopy(requestBytes, headerLength, rewritten, headerBytes.Length, requestBytes.Length - headerLength);
+        return rewritten;
     }
 
     /// <summary>
@@ -431,8 +778,23 @@ public class WsBridgeServer : IDisposable
 
     private static bool IsLoopbackRequest(HttpListenerRequest request)
     {
-        var remoteAddr = request.RemoteEndPoint?.Address;
+        var remoteAddr = GetClientAddress(request);
         return remoteAddr != null && IPAddress.IsLoopback(remoteAddr);
+    }
+
+    private static IPAddress? GetClientAddress(HttpListenerRequest request)
+    {
+        var forwardedFor = request.Headers["X-Forwarded-For"];
+        if (!string.IsNullOrWhiteSpace(forwardedFor))
+        {
+            var firstHop = forwardedFor
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault();
+            if (firstHop != null && IPAddress.TryParse(firstHop, out var parsed))
+                return parsed;
+        }
+
+        return request.RemoteEndPoint?.Address;
     }
 
     private async Task HandleClientAsync(HttpListenerContext httpContext, CancellationToken ct)
@@ -563,28 +925,19 @@ public class WsBridgeServer : IDisposable
                         var sendSession = sendReq.SessionName;
                         var sendMessage = sendReq.Message;
                         var sendAgentMode = sendReq.AgentMode;
-                        // Check orchestrator routing and dispatch atomically on the UI thread.
-                        // GetOrchestratorGroupId and SendToMultiAgentGroupAsync both read
-                        // Organization.Sessions/Groups (plain List<T>, UI-thread-only).
-                        _ = _copilot.InvokeOnUIAsync(async () =>
+
+                        // Queue prompts that arrive during session restore — they'd hit half-loaded sessions
+                        if (_copilot.IsRestoring)
                         {
-                            try
-                            {
-                                var orchGroupId = _copilot.GetOrchestratorGroupId(sendSession);
-                                if (orchGroupId != null)
-                                {
-                                    // Mirror Dashboard.razor's AutoStartReflectionIfNeeded behavior
-                                    var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
-                                    if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
-                                        _copilot.StartGroupReflection(orchGroupId, sendMessage, orchGroup.MaxReflectIterations ?? 5);
-                                    Console.WriteLine($"[WsBridge] Routing '{sendSession}' through orchestration pipeline (group={orchGroupId})");
-                                    await _copilot.SendToMultiAgentGroupAsync(orchGroupId, sendMessage, ct);
-                                }
-                                else
-                                {
-                                    await _copilot.SendPromptAsync(sendSession, sendMessage, cancellationToken: ct, agentMode: sendAgentMode);
-                                }
-                            }
+                            _pendingBridgePrompts.Enqueue(new PendingBridgePrompt(sendSession, sendMessage, sendAgentMode));
+                            Console.WriteLine($"[BRIDGE] Queued prompt for '{sendSession}' during restore ({_pendingBridgePrompts.Count} pending)");
+                            break;
+                        }
+
+                        // Dispatch with orchestrator routing on the UI thread (fire-and-forget).
+                        _ = Task.Run(async () =>
+                        {
+                            try { await DispatchBridgePromptAsync(sendSession, sendMessage, sendAgentMode, ct); }
                             catch (Exception ex) { Console.WriteLine($"[WsBridge] SendPromptAsync error for '{sendSession}': {ex.Message}"); }
                         });
                     }
@@ -623,8 +976,8 @@ public class WsBridgeServer : IDisposable
                     var switchReq = msg.GetPayload<SwitchSessionPayload>();
                     if (switchReq != null)
                     {
-                        _copilot.SetActiveSession(switchReq.SessionName);
-                        BroadcastSessionsList();
+                        // Don't switch the desktop's active session — mobile has its own view.
+                        // Only send history back to the requesting client.
                         await SendSessionHistoryToClient(clientId, ws, switchReq.SessionName, CopilotService.HistoryLimitForBridge, ct);
                     }
                     break;
@@ -698,7 +1051,7 @@ public class WsBridgeServer : IDisposable
                     if (changeModelReq != null && !string.IsNullOrWhiteSpace(changeModelReq.SessionName))
                     {
                         Console.WriteLine($"[WsBridge] Client changing model for '{changeModelReq.SessionName}' to '{changeModelReq.NewModel}'");
-                        var modelChanged = await _copilot.ChangeModelAsync(changeModelReq.SessionName, changeModelReq.NewModel);
+                        var modelChanged = await _copilot.ChangeModelAsync(changeModelReq.SessionName, changeModelReq.NewModel, changeModelReq.ReasoningEffort);
                         if (!modelChanged)
                         {
                             await SendToClientAsync(clientId, ws,
@@ -738,46 +1091,7 @@ public class WsBridgeServer : IDisposable
 
                 case BridgeMessageTypes.ListDirectories:
                     var dirReq = msg.GetPayload<ListDirectoriesPayload>();
-                    var dirPath = dirReq?.Path;
-                    if (string.IsNullOrWhiteSpace(dirPath))
-                        dirPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-                    var dirResult = new DirectoriesListPayload { Path = dirPath!, RequestId = dirReq?.RequestId };
-                    try
-                    {
-                        if (!Path.IsPathRooted(dirPath!) || dirPath!.Contains(".."))
-                        {
-                            dirResult.Error = "Invalid path";
-                        }
-                        else if (!Directory.Exists(dirPath))
-                        {
-                            dirResult.Error = "Directory not found";
-                        }
-                        else
-                        {
-                            dirResult.IsGitRepo = Directory.Exists(Path.Combine(dirPath, ".git"));
-                            dirResult.Directories = Directory.GetDirectories(dirPath)
-                                .Select(d => new DirectoryInfo(d))
-                                .Where(d => !d.Name.StartsWith('.'))
-                                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
-                                .Select(d => new DirectoryEntry
-                                {
-                                    Name = d.Name,
-                                    IsGitRepo = Directory.Exists(Path.Combine(d.FullName, ".git"))
-                                })
-                                .ToList();
-                        }
-                    }
-                    catch (UnauthorizedAccessException)
-                    {
-                        dirResult.Error = "Access denied";
-                    }
-                    catch (Exception ex)
-                    {
-                        dirResult.Error = ex.Message;
-                    }
-                    await SendToClientAsync(clientId, ws,
-                        BridgeMessage.Create(BridgeMessageTypes.DirectoriesList, dirResult), ct);
+                    _ = Task.Run(() => HandleListDirectoriesRequestAsync(clientId, ws, dirReq, ct), CancellationToken.None);
                     break;
 
                 case BridgeMessageTypes.MultiAgentBroadcast:
@@ -1092,6 +1406,61 @@ public class WsBridgeServer : IDisposable
     public Task SendBridgeMessageAsync(string clientId, WebSocket ws, BridgeMessage msg, CancellationToken ct) =>
         SendToClientAsync(clientId, ws, msg, ct);
 
+    private async Task HandleListDirectoriesRequestAsync(string clientId, WebSocket ws, ListDirectoriesPayload? dirReq, CancellationToken ct)
+    {
+        var dirPath = dirReq?.Path;
+        if (string.IsNullOrWhiteSpace(dirPath))
+            dirPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        var dirResult = new DirectoriesListPayload { Path = dirPath!, RequestId = dirReq?.RequestId };
+        try
+        {
+            if (!Path.IsPathRooted(dirPath!) || dirPath!.Contains(".."))
+            {
+                dirResult.Error = "Invalid path";
+            }
+            else if (!Directory.Exists(dirPath))
+            {
+                dirResult.Error = "Directory not found";
+            }
+            else
+            {
+                dirResult.IsGitRepo = Directory.Exists(Path.Combine(dirPath, ".git"));
+                dirResult.Directories = Directory.GetDirectories(dirPath)
+                    .Select(d => new DirectoryInfo(d))
+                    .Where(d => !d.Name.StartsWith('.'))
+                    .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(d => new DirectoryEntry
+                    {
+                        Name = d.Name,
+                        IsGitRepo = Directory.Exists(Path.Combine(d.FullName, ".git"))
+                    })
+                    .ToList();
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            dirResult.Error = "Access denied";
+        }
+        catch (Exception ex)
+        {
+            dirResult.Error = ex.Message;
+        }
+
+        try
+        {
+            await SendToClientAsync(clientId, ws,
+                BridgeMessage.Create(BridgeMessageTypes.DirectoriesList, dirResult), ct);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] Failed to send directory list: {ex.Message}");
+        }
+    }
+
     private async Task SendToClientAsync(string clientId, WebSocket ws, BridgeMessage msg, CancellationToken ct)
     {
         if (ws.State != WebSocketState.Open) return;
@@ -1216,6 +1585,7 @@ public class WsBridgeServer : IDisposable
         {
             Name = s.Name,
             Model = s.Model,
+            ReasoningEffort = s.ReasoningEffort,
             CreatedAt = s.CreatedAt,
             MessageCount = s.History.Count,
             IsProcessing = s.IsProcessing,
@@ -1225,6 +1595,7 @@ public class WsBridgeServer : IDisposable
             ProcessingStartedAt = s.ProcessingStartedAt,
             ToolCallCount = s.ToolCallCount,
             ProcessingPhase = s.ProcessingPhase,
+            PrNumber = s.PrNumber ?? ResolvePrNumber(s),
         }).ToList();
 
         return new SessionsListPayload
@@ -1236,6 +1607,47 @@ public class WsBridgeServer : IDisposable
             ServerMachineName = Environment.MachineName,
             AvailableModels = _copilot.AvailableModels.Count > 0 ? _copilot.AvailableModels : null,
         };
+    }
+
+    private int? ResolvePrNumber(AgentSessionInfo session)
+    {
+        // Try worktree lookup first
+        if (_repoManager != null && _copilot != null)
+        {
+            // Snapshot Organization.Sessions — it's a plain List<T> mutated on the UI thread,
+            // but this method runs on ThreadPool threads (timer/WebSocket). ToList() avoids
+            // InvalidOperationException from concurrent modification.
+            var wtId = session.WorktreeId;
+            if (wtId == null)
+            {
+                try
+                {
+                    var sessionMetas = _copilot.Organization.Sessions.ToList();
+                    wtId = sessionMetas.FirstOrDefault(m => m.SessionName == session.Name)?.WorktreeId;
+                }
+                catch (InvalidOperationException) { /* concurrent modification — skip fallback */ }
+            }
+            if (wtId != null)
+            {
+                var prNum = _repoManager.Worktrees.FirstOrDefault(w => w.Id == wtId)?.PrNumber;
+                if (prNum.HasValue) return prNum;
+            }
+        }
+        // Fall back to PrLinkService cache (read-only, no fetch).
+        // Only populated after desktop has viewed the session's ExpandedSessionView,
+        // which calls PrLinkService.GetPrUrlForDirectoryAsync(). Cache TTL is 5 minutes.
+        // Sessions never opened on desktop will have no cached PR URL.
+        if (_prLinkService != null && !string.IsNullOrEmpty(session.WorkingDirectory))
+        {
+            var url = _prLinkService.GetCachedPrUrl(session.WorkingDirectory);
+            if (url != null)
+            {
+                var lastSlash = url.LastIndexOf('/');
+                if (lastSlash >= 0 && lastSlash < url.Length - 1 && int.TryParse(url[(lastSlash + 1)..], out var num))
+                    return num;
+            }
+        }
+        return null;
     }
 
     private void DebouncedBroadcastState()
@@ -1439,6 +1851,7 @@ public class WsBridgeServer : IDisposable
         _sessionsListDebounce?.Dispose();
         _orgStateDebounce?.Dispose();
         _cts?.Dispose();
+        _restartLock.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -1558,7 +1971,7 @@ public class WsBridgeServer : IDisposable
         {
             var wsCtx = await ctx.AcceptWebSocketAsync(null);
             ws = wsCtx.WebSocket;
-            var remoteIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+            var remoteIp = GetClientAddress(ctx.Request)?.ToString() ?? "unknown";
             Console.WriteLine($"[WsBridge] Pair handshake from {remoteIp}");
 
             if (_fiestaService != null)

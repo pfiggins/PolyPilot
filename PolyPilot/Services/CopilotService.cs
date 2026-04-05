@@ -47,6 +47,8 @@ public partial class CopilotService : IAsyncDisposable
         if (active) _recentTurnEndSessions[sessionName] = DateTime.UtcNow;
         else _recentTurnEndSessions.TryRemove(sessionName, out _);
     }
+    /// <summary>Test-only: simulate IsRestoring state for bridge queue tests.</summary>
+    internal void SetIsRestoringForTesting(bool value) => IsRestoring = value;
     // Sessions for which history has already been requested — prevents duplicate request storms
     private readonly ConcurrentDictionary<string, byte> _requestedHistorySessions = new();
     // External session IDs currently being resumed — prevents duplicate SDK connections from rapid double-clicks
@@ -108,6 +110,10 @@ public partial class CopilotService : IAsyncDisposable
     internal const int WatchdogServerRecoveryThreshold = 2;
     // Prevents concurrent TryRecoverPersistentServerAsync invocations from racing on _client.
     private readonly SemaphoreSlim _recoveryLock = new(1, 1);
+    // Coalesces model refresh requests so reconnect/recovery bursts share one fetch pipeline.
+    private readonly object _availableModelsFetchSync = new();
+    private Task _availableModelsFetchTask = Task.CompletedTask;
+    private bool _availableModelsFetchQueued;
     // Tracks when recovery last succeeded so concurrent callers that lose the lock can return true
     // if recovery just completed (within 30s), rather than showing a false-permanent error.
     private DateTime _lastRecoveryCompletedAt = DateTime.MinValue;
@@ -198,7 +204,7 @@ public partial class CopilotService : IAsyncDisposable
     private static string OrganizationFile { get { lock (_pathLock) return _organizationFile ??= Path.Combine(PolyPilotBaseDir, "organization.json"); } }
 
     /// <summary>
-    /// Override base directory for tests to prevent writing to real ~/.polypilot/.
+    /// Override base directories for tests to prevent writing to real ~/.polypilot/ or ~/.copilot/.
     /// Clears all derived path caches so they re-resolve from the new base.
     /// </summary>
     internal static void SetBaseDirForTesting(string path)
@@ -206,11 +212,11 @@ public partial class CopilotService : IAsyncDisposable
         lock (_pathLock)
         {
             _polyPilotBaseDir = path;
+            _copilotBaseDir = path;
             _activeSessionsFile = null;
             _sessionAliasesFile = null;
             _uiStateFile = null;
             _organizationFile = null;
-            _copilotBaseDir = null;
             _sessionStatePath = null;
             _pendingOrchestrationFile = null;
             _zeroIdleCaptureDir = null;
@@ -253,7 +259,8 @@ public partial class CopilotService : IAsyncDisposable
 
     public string DefaultModel { get; set; } = "claude-opus-4.6";
     public bool IsInitialized { get; private set; }
-    public bool IsRestoring { get; private set; }
+    private volatile bool _isRestoring;
+    public bool IsRestoring { get => _isRestoring; private set => _isRestoring = value; }
     public bool NeedsConfiguration { get; private set; }
     public bool IsRemoteMode { get; private set; }
     public bool IsBridgeConnected => _bridgeClient.IsConnected;
@@ -267,6 +274,36 @@ public partial class CopilotService : IAsyncDisposable
             ? _bridgeClient.AvailableModels
             : _localAvailableModels;
     private List<string> _localAvailableModels = new();
+    /// <summary>
+    /// Maps model slug (Id) → display name from the SDK's ListModelsAsync.
+    /// Used for richer display when the algorithmic prettification isn't sufficient.
+    /// </summary>
+    public Dictionary<string, string> ModelDisplayNames { get; private set; } = new();
+
+    /// <summary>
+    /// Maps model slug → supported reasoning effort levels (e.g., ["low", "medium", "high", "xhigh"]).
+    /// Only populated for models where ModelInfo.SupportedReasoningEfforts is non-null.
+    /// </summary>
+    public Dictionary<string, List<string>> ModelReasoningEfforts { get; private set; } = new();
+
+    /// <summary>
+    /// Maps model slug → default reasoning effort level.
+    /// </summary>
+    public Dictionary<string, string> ModelDefaultReasoningEffort { get; private set; } = new();
+
+    /// <summary>Returns the default reasoning effort for a model, or null if the model doesn't support it.</summary>
+    public string? GetDefaultReasoningEffort(string? modelSlug)
+    {
+        if (string.IsNullOrEmpty(modelSlug)) return null;
+        return ModelDefaultReasoningEffort.TryGetValue(modelSlug, out var effort) ? effort : null;
+    }
+
+    /// <summary>Returns the supported reasoning effort levels for a model, or empty if not supported.</summary>
+    public IReadOnlyList<string> GetSupportedReasoningEfforts(string? modelSlug)
+    {
+        if (string.IsNullOrEmpty(modelSlug)) return Array.Empty<string>();
+        return ModelReasoningEfforts.TryGetValue(modelSlug, out var efforts) ? efforts : Array.Empty<string>();
+    }
 
     private readonly RepoManager _repoManager;
     private readonly CodespaceService _codespaceService;
@@ -1105,7 +1142,9 @@ public partial class CopilotService : IAsyncDisposable
         _ = CheckAuthStatusAsync();
 
         // Load organization state FIRST (groups, pinning, sorting) so reconcile during restore doesn't wipe it
+        var startupSw = System.Diagnostics.Stopwatch.StartNew();
         LoadOrganization();
+        Debug($"[STARTUP-TIMING] LoadOrganization: {startupSw.ElapsedMilliseconds}ms");
 
         // Session restore runs in the background so the UI renders immediately.
         // With many sessions (40+), sequential ResumeSessionAsync calls can take
@@ -1116,7 +1155,13 @@ public partial class CopilotService : IAsyncDisposable
         // Without Task.Run, the async continuations run on the UI thread. LoadHistoryFromDisk's
         // .GetAwaiter().GetResult() then blocks the UI thread waiting for async file I/O whose
         // continuation needs the UI thread → classic SyncContext deadlock → blue screen.
-        _ = Task.Run(() => RestoreSessionsInBackgroundAsync(cancellationToken));
+        Debug($"[STARTUP-TIMING] Pre-restore: {startupSw.ElapsedMilliseconds}ms");
+        _ = Task.Run(async () =>
+        {
+            var restoreSw = System.Diagnostics.Stopwatch.StartNew();
+            await RestoreSessionsInBackgroundAsync(cancellationToken);
+            Debug($"[STARTUP-TIMING] RestoreSessionsInBackground: {restoreSw.ElapsedMilliseconds}ms");
+        });
 
         // Initialize any registered providers (from DI / plugin loader)
         await InitializeProvidersAsync(cancellationToken);
@@ -1276,6 +1321,8 @@ public partial class CopilotService : IAsyncDisposable
             return;
         }
 
+        _ = FetchAvailableModelsAsync();
+
         // Restore previous sessions
         LoadOrganization();
         await RestorePreviousSessionsAsync(cancellationToken);
@@ -1367,6 +1414,7 @@ public partial class CopilotService : IAsyncDisposable
             _client = CreateClient(settings);
             await _client.StartAsync(CancellationToken.None);
             IsInitialized = true;
+            _ = FetchAvailableModelsAsync();
 
             Debug("[SERVER-RECOVERY] Server recovery successful — new server started and client reconnected");
             FallbackNotice = "Persistent server was automatically restarted due to repeated failures. Your sessions should work again.";
@@ -1465,6 +1513,7 @@ public partial class CopilotService : IAsyncDisposable
                 await _client.StartAsync(cancellationToken);
                 IsInitialized = true;
                 NeedsConfiguration = false;
+                _ = FetchAvailableModelsAsync();
                 Debug("[SERVER-RESTART] Server restarted and client connected");
             }
             catch (Exception ex)
@@ -2308,7 +2357,7 @@ The user can also check configured servers with the /mcp command.
         var resumeModel = Models.ModelHelper.NormalizeToSlug(GetSessionModelFromDisk(sessionId) ?? model ?? DefaultModel);
         if (string.IsNullOrEmpty(resumeModel)) resumeModel = DefaultModel;
         Debug($"Resuming session '{displayName}' with model: '{resumeModel}', cwd: '{resumeWorkingDirectory}'");
-        var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions };
+        var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions, InfiniteSessions = new InfiniteSessionConfig { Enabled = true } };
         var copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
 
         // Detect session ID mismatch: the persistent server may return a different
@@ -2582,6 +2631,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Auto-approve all tool permission requests so worker sessions (which have no
             // interactive user) can execute tools without getting "Permission denied".
             OnPermissionRequest = AutoApprovePermissions,
+            InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
+            ReasoningEffort = GetDefaultReasoningEffort(sessionModel),
         };
         if (mcpServers != null)
             Debug($"Session config includes {mcpServers.Count} MCP server(s): {string.Join(", ", mcpServers.Keys)}");
@@ -2595,6 +2646,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         {
             Name = name,
             Model = sessionModel,
+            ReasoningEffort = GetDefaultReasoningEffort(sessionModel),
             CreatedAt = DateTime.UtcNow,
             WorkingDirectory = sessionDir,
             GitBranch = GetGitBranch(sessionDir),
@@ -3004,6 +3056,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         // Link session to worktree
         sessionInfo.WorktreeId = wt.Id;
+        sessionInfo.PrNumber = wt.PrNumber;
         _repoManager.LinkSessionToWorktree(wt.Id, sessionInfo.Name);
 
         // Organize into repo group
@@ -3057,20 +3110,20 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
     /// The session history is preserved server-side (same session ID); we just reconnect
     /// asking for a different model.
     /// </summary>
-    public async Task<bool> ChangeModelAsync(string sessionName, string newModel, CancellationToken cancellationToken = default)
+    public async Task<bool> ChangeModelAsync(string sessionName, string newModel, string? reasoningEffort = null, CancellationToken cancellationToken = default)
     {
         if (IsRemoteMode)
         {
             if (!_bridgeClient.IsConnected) return false;
             var remoteModel = Models.ModelHelper.NormalizeToSlug(newModel);
             if (string.IsNullOrEmpty(remoteModel)) return false;
-            // Guard: don't change model while processing or if already the same
+            // Guard: don't change if both model AND effort are unchanged
             if (!_sessions.TryGetValue(sessionName, out var remoteState)) return false;
             if (remoteState.Info.IsProcessing) return false;
-            if (remoteState.Info.Model == remoteModel) return true;
+            if (remoteState.Info.Model == remoteModel && remoteState.Info.ReasoningEffort == reasoningEffort) return true;
             try
             {
-                await _bridgeClient.ChangeModelAsync(sessionName, remoteModel, cancellationToken);
+                await _bridgeClient.ChangeModelAsync(sessionName, remoteModel, reasoningEffort, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -3079,6 +3132,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             }
             // Update local state optimistically
             remoteState.Info.Model = remoteModel;
+            remoteState.Info.ReasoningEffort = reasoningEffort;
             OnStateChanged?.Invoke();
             return true;
         }
@@ -3089,13 +3143,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         var normalizedModel = Models.ModelHelper.NormalizeToSlug(newModel);
         if (string.IsNullOrEmpty(normalizedModel)) return false;
 
-        // Already on this model — no-op
-        if (state.Info.Model == normalizedModel) return true;
+        // Skip if both model AND effort are unchanged
+        if (state.Info.Model == normalizedModel && state.Info.ReasoningEffort == reasoningEffort) return true;
 
-        // Demo mode: just update the model label (no SDK session to resume)
+        // Demo mode: just update locally (no SDK session)
         if (IsDemoMode)
         {
             state.Info.Model = normalizedModel;
+            state.Info.ReasoningEffort = reasoningEffort;
             OnStateChanged?.Invoke();
             return true;
         }
@@ -3109,44 +3164,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         try
         {
-            // Dispose old session connection (may already be disposed if disconnected)
-            try { await state.Session.DisposeAsync(); } catch { }
+            // Use the SDK's Model.SwitchToAsync for a lightweight mid-session model switch.
+            // This preserves the session, conversation history, and event handlers — no need
+            // to dispose/recreate the session or rewire event callbacks.
+            await state.Session.Rpc.Model.SwitchToAsync(normalizedModel, reasoningEffort, cancellationToken);
 
-            // Use the correct client (codespace tunnel client for codespace sessions, main client otherwise)
-            var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
-            var client = GetClientForGroup(meta?.GroupId);
-
-            // For codespace sessions, use the codespace working directory instead of the local path
-            var switchWorkDir = state.Info.WorkingDirectory;
-            if (meta?.GroupId != null)
-            {
-                var switchGroup = Organization.Groups.FirstOrDefault(g => g.Id == meta.GroupId);
-                if (switchGroup?.IsCodespace == true && switchGroup.CodespaceWorkingDirectory != null)
-                    switchWorkDir = switchGroup.CodespaceWorkingDirectory;
-            }
-
-            // Resume the same session ID with the new model
-            var resumeConfig = new ResumeSessionConfig
-            {
-                Model = normalizedModel,
-                WorkingDirectory = switchWorkDir,
-                Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                OnPermissionRequest = AutoApprovePermissions,
-            };
-            var newSession = await client.ResumeSessionAsync(state.Info.SessionId, resumeConfig, cancellationToken);
-
-            // Build replacement state, preserving info/history
             state.Info.Model = normalizedModel;
-            var oldState = state;
-            var newState = new SessionState
-            {
-                Session = newSession,
-                Info = state.Info
-            };
-            newSession.On(evt => HandleSessionEvent(newState, evt));
-            _sessions[sessionName] = newState;
-            DisposePrematureIdleSignal(oldState);
-
+            state.Info.ReasoningEffort = reasoningEffort;
             Debug($"Model switched for '{sessionName}' to {normalizedModel}");
             SaveActiveSessionsToDisk();
             OnStateChanged?.Invoke();
@@ -3531,6 +3555,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                         OnPermissionRequest = AutoApprovePermissions,
                                                         McpServers = mcpServers,
                                                         SkillDirectories = skillDirs,
+                                                        InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
                                                     };
                                                     var m = Models.ModelHelper.NormalizeToSlug(capturedOtherState.Info.Model);
                                                     if (!string.IsNullOrEmpty(m)) cfg.Model = m;
@@ -3660,6 +3685,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     reconnectConfig.OnPermissionRequest = AutoApprovePermissions;
                     reconnectConfig.McpServers = reconnectMcpServers;
                     reconnectConfig.SkillDirectories = reconnectSkillDirs;
+                    reconnectConfig.InfiniteSessions = new InfiniteSessionConfig { Enabled = true };
                     if (!string.IsNullOrEmpty(reconnectModel))
                         reconnectConfig.Model = reconnectModel;
                     if (!string.IsNullOrEmpty(state.Info.WorkingDirectory))
@@ -3995,7 +4021,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Mode = SystemMessageMode.Append,
                 Content = systemContent.ToString()
             },
-            OnPermissionRequest = AutoApprovePermissions
+            OnPermissionRequest = AutoApprovePermissions,
+            InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
         };
         if (mcpServers != null)
             Debug($"[FRESH-CONFIG] Includes {mcpServers.Count} MCP server(s)");
@@ -5085,6 +5112,7 @@ public class UiState
     public Dictionary<string, string> Drafts { get; set; } = new();
     /// <summary>Sidebar width in pixels. Default 320, range 200-600.</summary>
     public int SidebarWidth { get; set; } = 320;
+    public bool SidebarRailMode { get; set; }
 }
 
 public class ActiveSessionEntry
@@ -5092,6 +5120,7 @@ public class ActiveSessionEntry
     public string SessionId { get; set; } = "";
     public string DisplayName { get; set; } = "";
     public string Model { get; set; } = "";
+    public string? ReasoningEffort { get; set; }
     public string? WorkingDirectory { get; set; }
     public string? LastPrompt { get; set; }
     public string? GroupId { get; set; }

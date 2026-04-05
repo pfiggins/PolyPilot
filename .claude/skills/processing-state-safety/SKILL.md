@@ -8,11 +8,12 @@ description: >
   SDK event handlers, (4) Debugging stuck sessions showing "Thinking..." forever
   or spinner stuck, (5) Modifying IsResumed, HasUsedToolsThisTurn, or ActiveToolCallCount,
   (6) Adding diagnostic log tags, (7) Modifying session restore paths
-  (RestoreSingleSessionAsync) that must initialize watchdog-dependent state,
+  (RestorePreviousSessionsAsync / EnsureSessionConnectedAsync) that must initialize
+  watchdog-dependent state,
   (8) Modifying ReconcileOrganization or any code that reads Organization.Sessions
   during the IsRestoring window, (9) Session appears hung or unresponsive after tool use.
   Covers: 18 invariants from 13 PRs of fix cycles,
-  the 16 code paths that set/clear IsProcessing, and common regression patterns.
+  the 21+ code paths that set/clear IsProcessing, and common regression patterns.
 ---
 
 # Processing State Safety
@@ -151,9 +152,9 @@ cross-thread fields without a tracking comment explaining the gap.
 causing stale renders.
 
 ### INV-9: Session restore must initialize all watchdog-dependent state
-The restore path (`RestoreSingleSessionAsync`) is separate from `SendPromptAsync`.
-Any field that affects watchdog timeout selection or dispatch routing must be
-initialized in BOTH paths:
+The restore path (`RestorePreviousSessionsAsync` + `EnsureSessionConnectedAsync`) is
+separate from `SendPromptAsync`. Any field that affects watchdog timeout selection or
+dispatch routing must be initialized in BOTH paths:
 - `IsMultiAgentSession` — set via `IsSessionInMultiAgentGroup()` before `StartProcessingWatchdog`
 - `HasReceivedEventsSinceResume` / `HasUsedToolsThisTurn` — set via `GetEventsFileRestoreHints()`
 - `IsResumed` — set on the `AgentSessionInfo` when `isStillProcessing` is true
@@ -315,10 +316,10 @@ complete the response while sub-agents are still working.
 5. **Missing state initialization on session restore** — `IsMultiAgentSession`,
    `IsResumed`, and other flags must be set on restored sessions BEFORE
    `StartProcessingWatchdog` is called. The restore path in
-   `RestoreSingleSessionAsync` is separate from `SendPromptAsync` and must
-   independently initialize all state the watchdog depends on. PR #284 fixed
-   `IsMultiAgentSession` not being set during restore, causing the watchdog
-   to use 120s instead of 600s for multi-agent workers.
+   `RestorePreviousSessionsAsync` / `EnsureSessionConnectedAsync` is separate
+   from `SendPromptAsync` and must independently initialize all state the watchdog
+   depends on. PR #284 fixed `IsMultiAgentSession` not being set during restore,
+   causing the watchdog to use 120s instead of 600s for multi-agent workers.
 
 **Retired mistake (was #2):** *ActiveToolCallCount as sole tool signal* — still relevant per
 INV-5, but the more impactful version is #2 above (suppressing the fallback entirely).
@@ -338,22 +339,64 @@ When a session shows "Thinking..." indefinitely:
 
 3. **Check `IsProcessing` state** — via MauiDevFlow CDP:
    ```bash
-   maui-devflow cdp Runtime evaluate "document.querySelector('.processing-indicator')?.textContent"
+   maui devflow cdp Runtime evaluate "document.querySelector('.processing-indicator')?.textContent"
    ```
 
 4. **Common stuck patterns:**
    | Symptom | Likely Cause | Fix |
    |---------|-------------|-----|
    | `[SEND]` then silence | SDK never responded, watchdog will catch at 120s | Wait or abort |
-   | `[EVT] TurnEnd` but no `[IDLE]` | Zero-idle SDK bug | Watchdog catches at 30s fallback (INV-10) |
-   | `[IDLE-DEFER]` then long silence | Background tasks (sub-agents/shells) active but never completed | Check agent status; watchdog will eventually catch (INV-18) |
+   | `[EVT] TurnEnd` but no `[IDLE]` | `session.idle` is ephemeral (never on disk). If live events stopped: IDLE-DEFER deferred the idle and `IsProcessing` was cleared before the follow-up arrived (#403) | Watchdog catches; #403 fix re-arms IsProcessing |
+   | `[IDLE-DEFER]` then long silence | Background tasks (sub-agents/shells) active | Check `[IDLE-DIAG]` for backgroundTasks count; watchdog will eventually catch (INV-18) |
+   | `[IDLE-DEFER]` with `IsProcessing=False` | IDLE-DEFER fired but IsProcessing was already cleared by watchdog/reconnect | #403 IDLE-DEFER-REARM fix re-arms IsProcessing |
    | `[COMPLETE]` fired but spinner persists | UI thread not notified | Check INV-2, INV-8 |
    | `[WATCHDOG]` clears but re-sticks | New turn started before watchdog callback ran | Check INV-3 generation guard |
+   | After relaunch: session shows "Working" for 600s | Session was active on CLI during relaunch; poll-then-resume waiting for `session.shutdown` (only disk-persisted terminal event) | Normal — watchdog clears at 600s. `session.idle` is ephemeral, never on disk |
 
 5. **Nuclear option** — user clicks Stop (AbortSessionAsync, path #5/#6).
+
+## Key Facts About session.idle
+
+- `session.idle` is **`ephemeral: true`** in the SDK schema — intentionally NOT written to events.jsonl
+- Events written to disk: `session.start`, `session.resume`, `session.shutdown` — NOT `session.idle`
+- PolyPilot receives `SessionIdleEvent` over the live SDK event stream
+- CLI correctly populates `backgroundTasks` field (proven with `[IDLE-DIAG]` instrumentation)
+- When `backgroundTasks` is active, IDLE-DEFER defers completion until a subsequent idle with empty backgroundTasks
+- After app relaunch, the poll-then-resume pattern watches events.jsonl for `session.shutdown` only (the only terminal event on disk)
 
 ## Regression History
 
 10 PRs of fix/regression cycles: #141 → #147 → #148 → #153 → #158 → #163 → #164 → #276 → #284 → #332.
-Additional safety PRs: #373 (orphaned state guards), #375 (premature idle re-arm), #399 (IDLE-DEFER for background tasks).
+Additional safety PRs: #373 (orphaned state guards), #375 (premature idle re-arm), #399 (IDLE-DEFER for background tasks), #472 (poll-then-resume + IDLE-DEFER-REARM + model selection).
 See `references/regression-history.md` for the full timeline with root causes.
+
+---
+
+## SDK-First Migration Guide
+
+Before adding or modifying watchdog, IsProcessing, or stuck-session detection code, check if the Copilot SDK (v0.2.0+) already provides the capability.
+
+### Migration Matrix
+
+| Need | SDK API | Status | Notes |
+|------|---------|--------|-------|
+| Monitor tool execution | `SessionHooks.OnPreToolUse` / `OnPostToolUse` | 🔴 **Not adopted** | Tool-boundary hooks — could supplement ActiveToolCallCount tracking and watchdog event monitoring |
+| Detect when agent turn ends | `AgentStop` hook (JS SDK only) | 🔴 **Not in .NET SDK** | JS SDK can block and force continuation; .NET SDK has `HookStartEvent`/`HookEndEvent` but no stop-gate |
+| Handle errors | `SessionHooks.OnErrorOccurred` | 🔴 **Not adopted** | Has retry count and user notification fields |
+| Session lifecycle | `SessionHooks.OnSessionStart` / `OnSessionEnd` | 🔴 **Not adopted** | Supplementary telemetry only — cannot replace restart/reconnect cleanup logic |
+| Context compaction | `session.Rpc.Compaction.CompactAsync()` | 🔴 **Not adopted** | Manual compaction trigger |
+| Auto-compaction | `SessionConfig.InfiniteSessions` | 🔴 **Not adopted** | Background compaction with configurable thresholds |
+
+### What to Keep Custom (and Why)
+
+| Custom Code | Why SDK Can't Replace It |
+|-------------|-------------------------|
+| **3-tier timeout watchdog** (30s/120s/600s) | SDK hooks fire on completion, not on absence. The watchdog detects "something should have happened but didn't" — fundamentally different from callbacks. |
+| **File-growth dead-connection detection** | SDK has no equivalent to monitoring `events.jsonl` file size to detect dead TCP connections where mtime stays fresh but no new data arrives. |
+| **Multi-agent Case B stale checks** | Custom logic that tracks consecutive deferrals across watchdog cycles for multi-agent sessions — no SDK equivalent. |
+| **IsProcessing 9-field cleanup invariant** | PolyPilot-specific UI state (ProcessingPhase, ToolCallCount, etc.) that the SDK knows nothing about. |
+| **Zero-idle TurnEnd fallback** (INV-10) | Compensates for SDK bug where SessionIdleEvent is never sent. SDK can't fix its own bug via hooks. |
+
+### Rule
+
+> **Before adding new watchdog/stuck-detection code:** Check this matrix. If the SDK has an API, use it. If not, add a `// SDK-gap: <reason>` comment explaining why custom code is needed.

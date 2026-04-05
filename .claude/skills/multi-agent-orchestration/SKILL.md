@@ -339,6 +339,7 @@ When modifying orchestration, verify:
 - [ ] **INV-O8**: Cancellation tokens propagated to all async operations
 - [ ] **INV-O9-reflect**: Reflect dispatch path uses OrchestratorCollectionTimeout (not bare Task.WhenAll)
 - [ ] **INV-O15**: IDLE-DEFER flushes CurrentResponse before breaking (content preservation)
+- [ ] **INV-O17**: IDLE-DEFER-REARM re-arms IsProcessing when idle arrives with backgroundTasks but IsProcessing is already false (PR #472)
 
 ---
 
@@ -849,6 +850,59 @@ These layers remain as fallbacks for edge cases where IDLE-DEFER doesn't fire:
 | `RecoverFromPrematureIdleIfNeededAsync` | Poll signal + events.jsonl freshness | Collect full response after partial TCS |
 | `IsEventsFileActive` | events.jsonl mtime < 15s | Detect ongoing CLI activity |
 
+### IDLE-DEFER-REARM (PR #472)
+
+When multiple `session.idle` events arrive for a session with active `backgroundTasks`,
+the first IDLE-DEFER correctly defers completion. But if `CompleteResponse` runs between
+the first and second idle (e.g., triggered by a watchdog or another code path), then
+`IsProcessing` is already `false` when the second idle arrives. Without re-arming,
+background agents would finish their work but no completion event would fire — the
+classic "zero-idle" symptom where the session appears stuck.
+
+**IDLE-DEFER-REARM** detects this scenario and re-arms processing:
+
+```csharp
+case SessionIdleEvent idle:
+    CancelTurnEndFallback(state);
+    
+    if (HasActiveBackgroundTasks(idle))
+    {
+        // ... existing IDLE-DEFER logic (flush, break) ...
+        
+        // REARM: If IsProcessing is already false, re-arm it so the
+        // next idle (without background tasks) triggers CompleteResponse.
+        if (!state.Info.IsProcessing)
+        {
+            state.Info.IsProcessing = true;
+            state.Info.HasUsedToolsThisTurn = true; // 600s tool timeout
+            RestartProcessingWatchdog(state);
+            Debug($"[IDLE-DEFER-REARM] ...");
+        }
+        break;
+    }
+    
+    CompleteResponse(state, idleGeneration);
+```
+
+**What the re-arm sets:**
+- `IsProcessing = true` — so the next non-deferred idle fires `CompleteResponse`
+- `HasUsedToolsThisTurn = true` — enables the 600s tool timeout instead of 120s,
+  since background agents may run for several minutes
+- Restarts the processing watchdog — provides a safety net if no further idle arrives
+- Logs `[IDLE-DEFER-REARM]` to `event-diagnostics.log`
+
+### `session.idle` Is Ephemeral — Never Persisted
+
+> **⚠️ `session.idle` is NEVER written to `events.jsonl` by design.** It is a
+> transient signal from the CLI, not a persisted event. Any restore or recovery
+> logic that depends on reading `session.idle` from disk is fundamentally flawed.
+> The poller in `PollEventsAndResumeWhenIdleAsync` watches for `session.shutdown`
+> instead, which IS persisted.
+
+This matters for IDLE-DEFER because after an app restart, there will be no
+`session.idle` replay — the watchdog and resume logic handle completion detection
+for interrupted sessions, not idle event replay.
+
 ---
 
 ## "Fix with Copilot" — Multi-Agent Awareness
@@ -1045,6 +1099,7 @@ Reflect mode runs multiple iterations. Expect this pattern:
 | Orchestration hangs on reconnect | Check for missing TrySetCanceled | TCS not canceled; see INV-O9 |
 | Many IDLE-DEFER entries | `grep "IDLE-DEFER" diagnostics.log` | Normal — worker has active sub-agents; wait for completion |
 | IDLE-DEFER but worker never completes | Check if background tasks are leaking | Sub-agent/shell not terminating; check CLI logs |
+| IDLE-DEFER-REARM entries | `grep "IDLE-DEFER-REARM" diagnostics.log` | Normal — IsProcessing was false when deferred idle arrived; re-armed for next completion |
 | Worker stuck 30+ min, events.jsonl fresh | Check file size across watchdog cycles | Dead connection — file-size-growth check should catch in ~360s (INV-O16) |
 | Worker gen=long.MinValue in SEND log | Worker state was orphaned before dispatch | Reconnect failed; ExecuteWorkerAsync now recovers with fresh session |
 
@@ -1096,3 +1151,45 @@ await service.ReconnectAsync(settings);
 ```
 
 When adding model classes, add `<Compile Include>` to `PolyPilot.Tests.csproj`.
+
+---
+
+## SDK-First Migration Guide
+
+Before adding or modifying orchestration, dispatch, or worker management code, check if the Copilot SDK (v0.2.0+) already provides the capability.
+
+### Migration Matrix
+
+| Need | SDK API | Status | Notes |
+|------|---------|--------|-------|
+| Start parallel workers | `session.Rpc.Fleet.StartAsync()` | 🟢 **Adopted** | Used for fleet mode; custom orchestration uses `SendPromptAsync` for dispatch with persistence |
+| Track subagent lifecycle | `SubagentStartedEvent` / `SubagentCompletedEvent` / `SubagentFailedEvent` | 🟡 **Events received** but not used for orchestration decisions |
+| Select/deselect agents | `session.Rpc.Agent.SelectAsync()` / `DeselectAsync()` | 🟢 **Adopted** | Used in CopilotService.cs for agent selection |
+| Manage skills per-session | `session.Rpc.Skills.ListAsync()` / `EnableAsync()` / `DisableAsync()` | 🔴 **Not adopted** | PolyPilot has custom `DiscoverAvailableSkills()` |
+| Read/write session plan | `session.Rpc.Plan.ReadAsync()` / `UpdateAsync()` / `DeleteAsync()` | 🔴 **Not adopted** | Could surface plan in UI, enable user editing |
+| Switch session mode | `session.Rpc.Mode.SetAsync(SessionModeGetResultMode.Plan)` | 🔴 **Not adopted** | Per-message mode set via `MessageOptions.Mode` (different API) |
+| Switch model mid-session | `session.Rpc.Model.SwitchToAsync()` | 🔴 **Not adopted** | Available but not used; model changes go through session recreation |
+| Set reasoning effort | `SessionConfig.ReasoningEffort` / `SessionModelSwitchToRequest.ReasoningEffort` | 🔴 **Not adopted** | Levels: "low", "medium", "high", "xhigh" |
+| Restrict worker tools | `SessionConfig.AvailableTools` / `ExcludedTools` | 🔴 **Not adopted** | Could enforce tool restrictions per worker role |
+| Register custom agents | `SessionConfig.CustomAgents` | 🔴 **Not adopted** | `CustomAgentConfig` with name, prompt, tools, MCP servers |
+| Request structured user input | `session.Rpc.Ui.ElicitationAsync()` | 🔴 **Not adopted** | Schema-based structured input |
+| Manage MCP servers | `session.Rpc.Mcp.ListAsync()` / `EnableAsync()` / `DisableAsync()` | 🔴 **Not adopted** | Per-session MCP management |
+| Worker system prompt injection | `SessionConfig.SystemMessage` with `SectionOverride` | 🔴 **Not adopted** | Can append/prepend/replace system prompt sections |
+| Handle slash commands | `session.Rpc.Commands.HandlePendingCommandAsync()` | 🔴 **Not adopted** | Programmatic slash command responses |
+| Workspace file management | `session.Rpc.Workspace.ListFiles/ReadFile/CreateFile` | 🔴 **Not adopted** | Session workspace (plan.md, context files) |
+| Hook into tool execution | `SessionConfig.Hooks` (PreToolUse/PostToolUse) | 🔴 **Not adopted** | Could enforce tool permissions per worker |
+| Force agent to continue | `SubagentStop` hook with `decision: "block"` | 🔴 **JS SDK only** | Block completion and force another turn — could prevent workers stopping too early |
+
+### What to Keep Custom (and Why)
+
+| Custom Code | Why SDK Can't Replace It |
+|-------------|-------------------------|
+| **PendingOrchestration persistence** | Restart recovery via JSON — SDK Fleet has no equivalent persistence across app restarts |
+| **@worker: block parsing** | PolyPilot-specific protocol for orchestrator→worker routing — not an SDK concern |
+| **Reflection loop with quality scoring** | Custom evaluation + Jaccard similarity for stall detection — no SDK equivalent |
+| **Worker result collection with timeouts** | Custom retry nudges, premature-idle recovery, partial result tolerance |
+| **Multi-agent group management** | UI concerns: group creation, preset picker, squad integration, organization persistence |
+
+### Rule
+
+> **Before adding new orchestration/dispatch code:** Check this matrix. If the SDK has an API, use it. If not, add a `// SDK-gap: <reason>` comment explaining why custom code is needed. When the SDK ships new versions, re-check this matrix for newly available APIs.

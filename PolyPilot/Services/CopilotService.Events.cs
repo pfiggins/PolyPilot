@@ -277,6 +277,23 @@ public partial class CopilotService
             return;
         }
 
+        // Watchdog health check: if the session is processing but the watchdog isn't running,
+        // restart it. This catches edge cases where the watchdog was cancelled by a stale
+        // CompleteResponse or race condition but IsProcessing wasn't cleared.
+        // Marshal to UI thread and double-check to avoid zombie watchdog if CompleteResponse
+        // clears IsProcessing between the check and the dispatch.
+        var wd = state.ProcessingWatchdog;
+        if (state.Info.IsProcessing && (wd == null || wd.IsCancellationRequested))
+        {
+            Debug($"[WATCHDOG-REVIVE] '{sessionName}' IsProcessing=true but watchdog is dead — scheduling restart");
+            InvokeOnUI(() =>
+            {
+                var wd2 = state.ProcessingWatchdog;
+                if (state.Info.IsProcessing && (wd2 == null || wd2.IsCancellationRequested))
+                    StartProcessingWatchdog(state, sessionName);
+            });
+        }
+
         void Invoke(Action action)
         {
             if (_syncContext != null)
@@ -397,6 +414,11 @@ public partial class CopilotService
                 var completeCallId = toolDone.Data.ToolCallId ?? "";
                 var completeToolName = toolDone.Data?.GetType().GetProperty("ToolName")?.GetValue(toolDone.Data)?.ToString();
                 var resultStr = FormatToolResult(toolDone.Data!.Result);
+                if (DiffParser.IsPlainTextViewTool(completeToolName) &&
+                    DiffParser.TryExtractNumberedViewOutput(resultStr, out var normalizedViewOutput))
+                {
+                    resultStr = normalizedViewOutput;
+                }
                 var hasError = toolDone.Data.Error != null;
                 // Extract the error message from the structured Error object.
                 // Error is a ToolExecutionCompleteDataError with Message/Code properties
@@ -611,17 +633,28 @@ public partial class CopilotService
                                 Debug($"[IDLE-FALLBACK] '{sessionName}' skipped — tools still active");
                                 return;
                             }
-                            // Guard: if tools were used this turn, more agent rounds may follow
-                            // (TurnEnd → thinking → TurnStart → more tools). Firing CompleteResponse
-                            // here would prematurely end the turn. Skip the fallback entirely and
-                            // let the watchdog handle any genuinely stuck sessions.
-                            if (state.HasUsedToolsThisTurn)
+                            var toolsUsedThisTurn = state.HasUsedToolsThisTurn;
+                            if (toolsUsedThisTurn)
                             {
-                                Debug($"[IDLE-FALLBACK] '{sessionName}' skipped — tools were used this turn (watchdog will handle if stuck)");
-                                return;
+                                // Tools finished, but the model may still be thinking between rounds
+                                // (TurnEnd → TurnStart gap). Wait an additional window so TurnStart
+                                // can cancel this fallback before we complete the turn prematurely.
+                                Debug($"[IDLE-FALLBACK] '{sessionName}' tools were used this turn — waiting additional " +
+                                      $"{TurnEndIdleToolFallbackAdditionalMs}ms for another round before completing");
+                                await Task.Delay(TurnEndIdleToolFallbackAdditionalMs, fallbackToken);
+                                if (fallbackToken.IsCancellationRequested) return;
+                                if (state.IsOrphaned) return;
+                                if (Volatile.Read(ref state.ActiveToolCallCount) > 0)
+                                {
+                                    Debug($"[IDLE-FALLBACK] '{sessionName}' skipped after extended wait — tools became active");
+                                    return;
+                                }
                             }
-                            Debug($"[IDLE-FALLBACK] '{sessionName}' SessionIdleEvent not received {TurnEndIdleFallbackMs}ms after TurnEnd — firing CompleteResponse");
-                            CaptureZeroIdleDiagnostics(state, sessionName, toolsUsed: false);
+                            var totalFallbackDelayMs = toolsUsedThisTurn
+                                ? TurnEndIdleFallbackMs + TurnEndIdleToolFallbackAdditionalMs
+                                : TurnEndIdleFallbackMs;
+                            Debug($"[IDLE-FALLBACK] '{sessionName}' SessionIdleEvent not received {totalFallbackDelayMs}ms after TurnEnd — firing CompleteResponse");
+                            CaptureZeroIdleDiagnostics(state, sessionName, toolsUsed: toolsUsedThisTurn);
                             InvokeOnUI(() => CompleteResponse(state, turnEndGen));
                         }
                         catch (OperationCanceledException) { /* expected on cancellation */ }
@@ -644,6 +677,14 @@ public partial class CopilotService
                 // Cancel the TurnEnd→Idle fallback — normal SessionIdleEvent arrived
                 CancelTurnEndFallback(state);
 
+                // Diagnostic: dump raw backgroundTasks payload to prove whether CLI populates it consistently
+                {
+                    var bt = idle.Data?.BackgroundTasks;
+                    var agentCount = bt?.Agents?.Length ?? -1;
+                    var shellCount = bt?.Shells?.Length ?? -1;
+                    Debug($"[IDLE-DIAG] '{sessionName}' session.idle payload: backgroundTasks={{agents={agentCount}, shells={shellCount}, null={bt == null}}}");
+                }
+
                 // KEY FIX: Check if the server reports active background tasks (sub-agents, shells).
                 // session.idle with background tasks means "foreground quiesced, background still running."
                 // Do NOT treat this as terminal — flush text and wait for the real idle.
@@ -658,6 +699,34 @@ public partial class CopilotService
                     {
                         if (state.IsOrphaned) return;
                         FlushCurrentResponse(state);
+
+                        // Background tasks (sub-agents) behave like tool calls — they can run
+                        // for several minutes. HasUsedToolsThisTurn triggers the 180s watchdog tier
+                        // (not 120s default), which then falls through to Case B with HasDeferredIdle
+                        // extending the freshness window to 1800s. The session survives as long as
+                        // events.jsonl shows activity.
+                        if (!state.HasUsedToolsThisTurn)
+                        {
+                            state.HasUsedToolsThisTurn = true;
+                            state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
+                        }
+
+                        // FIX #403: If IsProcessing was already cleared (by watchdog timeout,
+                        // reconnect, or prior EVT-REARM cycle), re-arm it. Without this, the
+                        // session appears done but background tasks are still running — the
+                        // orchestrator collects a truncated/empty response.
+                        // Guards mirror EVT-REARM: skip if orphaned or user-aborted.
+                        if (!state.Info.IsProcessing && !state.WasUserAborted)
+                        {
+                            Debug($"[IDLE-DEFER-REARM] '{sessionName}' re-arming IsProcessing — background tasks active but processing was cleared");
+                            state.Info.IsProcessing = true;
+                            state.Info.ProcessingPhase = 3; // Working (background tasks)
+                            state.Info.ProcessingStartedAt ??= DateTime.UtcNow;
+                            state.HasUsedToolsThisTurn = true; // 600s timeout (background tasks can run long)
+                            state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
+                            StartProcessingWatchdog(state, sessionName);
+                        }
+
                         NotifyStateChangedCoalesced();
                     });
                     break; // Don't complete — wait for next idle without background tasks
@@ -710,8 +779,18 @@ public partial class CopilotService
                 if (!string.IsNullOrEmpty(startModel))
                 {
                     var normalizedStartModel = Models.ModelHelper.NormalizeToSlug(startModel);
-                    state.Info.Model = normalizedStartModel;
-                    Debug($"Session model from start event: {startModel} → {normalizedStartModel}");
+                    // Only update if the user hasn't already set a model — the CLI may
+                    // report a default model (e.g. haiku) after abort/resume that overrides
+                    // the user's explicit choice.
+                    if (string.IsNullOrEmpty(state.Info.Model) || state.Info.Model == "resumed")
+                    {
+                        state.Info.Model = normalizedStartModel;
+                        Debug($"Session model from start event: {startModel} → {normalizedStartModel}");
+                    }
+                    else if (normalizedStartModel != state.Info.Model)
+                    {
+                        Debug($"Session model from start event ignored: {startModel} → {normalizedStartModel} (keeping user choice: {state.Info.Model})");
+                    }
                 }
                 Invoke(() => { if (!IsRestoring) SaveActiveSessionsToDisk(); });
                 break;
@@ -737,8 +816,15 @@ public partial class CopilotService
                 if (!string.IsNullOrEmpty(uModel))
                 {
                     var normalizedUModel = Models.ModelHelper.NormalizeToSlug(uModel);
-                    Debug($"[UsageInfo] Updating model from event: {state.Info.Model} -> {normalizedUModel}");
-                    state.Info.Model = normalizedUModel;
+                    if (Models.ModelHelper.ShouldAcceptObservedModel(state.Info.Model, normalizedUModel))
+                    {
+                        Debug($"[UsageInfo] Updating model from event: {state.Info.Model} -> {normalizedUModel}");
+                        state.Info.Model = normalizedUModel;
+                    }
+                    else
+                    {
+                        Debug($"[UsageInfo] Ignoring backend-reported model: {normalizedUModel} (keeping explicit session model: {state.Info.Model})");
+                    }
                 }
                 if (uCurrentTokens.HasValue) state.Info.ContextCurrentTokens = uCurrentTokens;
                 if (uTokenLimit.HasValue) state.Info.ContextTokenLimit = uTokenLimit;
@@ -772,7 +858,17 @@ public partial class CopilotService
                 }
                 catch { }
                 if (!string.IsNullOrEmpty(aModel))
-                    state.Info.Model = Models.ModelHelper.NormalizeToSlug(aModel);
+                {
+                    var normalizedAModel = Models.ModelHelper.NormalizeToSlug(aModel);
+                    if (Models.ModelHelper.ShouldAcceptObservedModel(state.Info.Model, normalizedAModel))
+                    {
+                        state.Info.Model = normalizedAModel;
+                    }
+                    else
+                    {
+                        Debug($"[AssistantUsage] Ignoring backend-reported model: {normalizedAModel} (keeping explicit session model: {state.Info.Model})");
+                    }
+                }
                 if (aInput.HasValue) state.Info.TotalInputTokens += aInput.Value;
                 if (aOutput.HasValue) state.Info.TotalOutputTokens += aOutput.Value;
                 if (aInput.HasValue || aOutput.HasValue || aPremiumQuota != null)
@@ -2745,7 +2841,8 @@ public partial class CopilotService
             var resumeConfig = new ResumeSessionConfig
             {
                 Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                OnPermissionRequest = AutoApprovePermissions
+                OnPermissionRequest = AutoApprovePermissions,
+                InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
             };
             if (!string.IsNullOrEmpty(resumeModel))
                 resumeConfig.Model = resumeModel;

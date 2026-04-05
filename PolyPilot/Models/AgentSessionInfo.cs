@@ -4,6 +4,8 @@ public class AgentSessionInfo
 {
     public required string Name { get; set; }
     public required string Model { get; set; }
+    /// <summary>Reasoning effort level: "low", "medium", "high", "xhigh", or null for model default.</summary>
+    public string? ReasoningEffort { get; set; }
     public DateTime CreatedAt { get; set; }
     public int MessageCount { get; set; }
     public bool IsProcessing { get; set; }
@@ -28,6 +30,8 @@ public class AgentSessionInfo
     public string? GitBranch { get; set; }
     /// <summary>Worktree ID if this session was created from a worktree.</summary>
     public string? WorktreeId { get; set; }
+    /// <summary>PR number associated with this session's worktree, if any.</summary>
+    public int? PrNumber { get; set; }
     
     // For resumed sessions
     public string? SessionId { get; set; }

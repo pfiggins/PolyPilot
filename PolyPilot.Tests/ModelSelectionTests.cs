@@ -117,11 +117,42 @@ public class ModelSelectionTests
     }
 
     [Fact]
-    public void FallbackModels_IncludeCurrentGptVariants()
+    public void BuildSelectionList_AppendsSelectionAndDefault_WhenDiscoveryIsEmpty()
     {
-        Assert.Contains("gpt-5.4", ModelHelper.FallbackModels);
-        Assert.Contains("gpt-5.4-mini", ModelHelper.FallbackModels);
-        Assert.Contains("gpt-5.3-codex", ModelHelper.FallbackModels);
+        var models = ModelHelper.BuildSelectionList(Array.Empty<string>(), "Custom Preview", "claude-opus-4.6");
+
+        Assert.Equal(new[] { "custom-preview", "claude-opus-4.6" }, models);
+    }
+
+    [Fact]
+    public void BuildSelectionList_NormalizesDiscoveredModels_AndAvoidsDuplicates()
+    {
+        var models = ModelHelper.BuildSelectionList(
+            new[] { "Claude Opus 4.6", "claude-opus-4.6", "Custom Preview" },
+            "custom-preview",
+            "claude-opus-4.6");
+
+        Assert.Equal(new[] { "claude-opus-4.6", "custom-preview" }, models);
+    }
+
+    [Fact]
+    public void ShouldAcceptObservedModel_EmptyCurrentModel_AcceptsObserved()
+    {
+        Assert.True(ModelHelper.ShouldAcceptObservedModel("", "claude-opus-4.6"));
+        Assert.True(ModelHelper.ShouldAcceptObservedModel("resumed", "claude-opus-4.6"));
+    }
+
+    [Fact]
+    public void ShouldAcceptObservedModel_SameModel_AcceptsObserved()
+    {
+        Assert.True(ModelHelper.ShouldAcceptObservedModel("Claude Opus 4.6", "claude-opus-4.6"));
+    }
+
+    [Fact]
+    public void ShouldAcceptObservedModel_DifferentObservedModel_PreservesExplicitChoice()
+    {
+        Assert.False(ModelHelper.ShouldAcceptObservedModel("gpt-5.4", "claude-opus-4.6"));
+        Assert.False(ModelHelper.ShouldAcceptObservedModel("claude-haiku-4.5", "claude-opus-4.6"));
     }
 
     [Fact]
@@ -493,6 +524,19 @@ public class ModelSelectionTests
         }
     }
 
+    [Fact]
+    public void BuildSelectionList_PreservesDiscoveryOrder_AndAppendsMissingRequiredModels()
+    {
+        var models = ModelHelper.BuildSelectionList(
+            new[] { "claude-sonnet-4.6", "Claude Opus 4.6", "gpt-5.4" },
+            "claude-opus-4.6",
+            "gpt-5-mini");
+
+        Assert.Equal(
+            new[] { "claude-sonnet-4.6", "claude-opus-4.6", "gpt-5.4", "gpt-5-mini" },
+            models);
+    }
+
     // --- PrettifyModel tests ---
     // The prettifier is duplicated in ExpandedSessionView.razor and ModelSelector.razor.
     // We test the logic inline here to catch regressions like the "Opus-4.5" bug.
@@ -577,5 +621,59 @@ public class ModelSelectionTests
         var pretty = PrettifyModel(slug);
         var backToSlug = ModelHelper.NormalizeToSlug(pretty);
         Assert.Equal(slug, backToSlug);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_PreferredAvailable_ReturnsPreferred()
+    {
+        var available = new List<string> { "claude-opus-4.6-1m", "claude-opus-4.6", "claude-sonnet-4.6" };
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", available, "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6-1m", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_PreferredUnavailable_ReturnsFallback()
+    {
+        var available = new List<string> { "claude-opus-4.6", "claude-sonnet-4.6" };
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", available, "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_NothingAvailable_ReturnsPreferred()
+    {
+        var available = new List<string> { "gpt-5.4", "gpt-5.1" };
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", available, "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6-1m", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_NullAvailableList_ReturnsPreferred()
+    {
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", null, "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6-1m", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_EmptyAvailableList_ReturnsPreferred()
+    {
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", new List<string>(), "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6-1m", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_CaseInsensitive()
+    {
+        var available = new List<string> { "Claude-Opus-4.6-1M" };
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", available, "claude-opus-4.6");
+        Assert.Equal("claude-opus-4.6-1m", result);
+    }
+
+    [Fact]
+    public void ResolvePreferredModel_MultipleFallbacks_ReturnsFirst()
+    {
+        var available = new List<string> { "claude-sonnet-4.6" };
+        var result = ModelHelper.ResolvePreferredModel("claude-opus-4.6-1m", available, "claude-opus-4.6", "claude-sonnet-4.6");
+        Assert.Equal("claude-sonnet-4.6", result);
     }
 }

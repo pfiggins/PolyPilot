@@ -303,6 +303,7 @@ public class StuckSessionRecoveryTests
     [InlineData("assistant.reasoning")]
     [InlineData("assistant.reasoning_delta")]
     [InlineData("assistant.intent")]
+    [InlineData("tool.execution_end")]       // tool just completed — still processing
     public void IsSessionStillProcessing_AllActiveEventTypes_ReturnTrue(string eventType)
     {
         var svc = CreateService();
@@ -326,11 +327,10 @@ public class StuckSessionRecoveryTests
 
     [Theory]
     [InlineData("session.idle")]
-    [InlineData("assistant.message")]
-    [InlineData("session.start")]
-    [InlineData("assistant.turn_end")]
-    [InlineData("tool.execution_end")]
-    public void IsSessionStillProcessing_InactiveEventTypes_ReturnFalse(string eventType)
+    [InlineData("session.error")]
+    [InlineData("session.shutdown")]
+    [InlineData("session.start")]         // created but never used — not actively processing
+    public void IsSessionStillProcessing_TerminalEventTypes_ReturnFalse(string eventType)
     {
         var svc = CreateService();
         var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
@@ -343,12 +343,139 @@ public class StuckSessionRecoveryTests
         {
             File.WriteAllText(eventsFile, $$$"""{"type":"{{{eventType}}}","data":{}}""");
             var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
-            Assert.False(result, $"Inactive event type '{eventType}' should not report still processing");
+            Assert.False(result, $"Terminal event type '{eventType}' should not report still processing");
         }
         finally
         {
             Directory.Delete(tmpDir, true);
         }
+    }
+
+    // --- Smart completion: assistant.turn_end/message without pending tools ---
+
+    [Fact]
+    public void IsSessionStillProcessing_TurnEndWithoutPendingTools_ReturnsFalse()
+    {
+        // Turn completed cleanly — no tool.execution_start after the last turn_end.
+        var svc = CreateService();
+        var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
+        var sessionId = Guid.NewGuid().ToString();
+        var sessionDir = Path.Combine(tmpDir, sessionId);
+        Directory.CreateDirectory(sessionDir);
+        var eventsFile = Path.Combine(sessionDir, "events.jsonl");
+
+        try
+        {
+            File.WriteAllText(eventsFile,
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{"content":"hello"}}""" + "\n" +
+                """{"type":"assistant.turn_end","data":{}}""");
+            var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
+            Assert.False(result, "Clean turn_end without pending tools should not report still processing");
+        }
+        finally { Directory.Delete(tmpDir, true); }
+    }
+
+    [Fact]
+    public void IsSessionStillProcessing_TurnEndWithPendingTools_ReturnsTrue()
+    {
+        // Turn ended after a tool round. This can still be between rounds, so restore
+        // must stay conservative and keep the session active until the next events arrive.
+        var svc = CreateService();
+        var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
+        var sessionId = Guid.NewGuid().ToString();
+        var sessionDir = Path.Combine(tmpDir, sessionId);
+        Directory.CreateDirectory(sessionDir);
+        var eventsFile = Path.Combine(sessionDir, "events.jsonl");
+
+        try
+        {
+            File.WriteAllText(eventsFile,
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{}}""" + "\n" +
+                """{"type":"tool.execution_start","data":{}}""" + "\n" +
+                """{"type":"tool.execution_complete","data":{}}""" + "\n" +
+                """{"type":"assistant.turn_end","data":{}}""");
+            var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
+            Assert.True(result, "turn_end after tool activity in the same sub-turn should report still processing");
+        }
+        finally { Directory.Delete(tmpDir, true); }
+    }
+
+    [Fact]
+    public void IsSessionStillProcessing_TurnEndNoCurrentToolsAfterEarlierToolRound_ReturnsFalse()
+    {
+        // Older tool rounds must not leak across assistant.turn_start boundaries and keep a
+        // later clean no-tool turn alive.
+        var svc = CreateService();
+        var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
+        var sessionId = Guid.NewGuid().ToString();
+        var sessionDir = Path.Combine(tmpDir, sessionId);
+        Directory.CreateDirectory(sessionDir);
+        var eventsFile = Path.Combine(sessionDir, "events.jsonl");
+
+        try
+        {
+            File.WriteAllText(eventsFile,
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{}}""" + "\n" +
+                """{"type":"tool.execution_start","data":{}}""" + "\n" +
+                """{"type":"tool.execution_complete","data":{}}""" + "\n" +
+                """{"type":"assistant.turn_end","data":{}}""" + "\n" +
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{"content":"final answer"}}""" + "\n" +
+                """{"type":"assistant.turn_end","data":{}}""");
+            var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
+            Assert.False(result, "A clean no-tool turn_end should not be kept active by tools from an earlier round");
+        }
+        finally { Directory.Delete(tmpDir, true); }
+    }
+
+    [Fact]
+    public void IsSessionStillProcessing_MessageWithContentNoTools_ReturnsFalse()
+    {
+        // Final assistant.message with content, no pending tools — session done.
+        var svc = CreateService();
+        var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
+        var sessionId = Guid.NewGuid().ToString();
+        var sessionDir = Path.Combine(tmpDir, sessionId);
+        Directory.CreateDirectory(sessionDir);
+        var eventsFile = Path.Combine(sessionDir, "events.jsonl");
+
+        try
+        {
+            File.WriteAllText(eventsFile,
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{"content":"Here is your answer."}}""");
+            var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
+            Assert.False(result, "assistant.message without pending tools should not report still processing");
+        }
+        finally { Directory.Delete(tmpDir, true); }
+    }
+
+    [Fact]
+    public void IsSessionStillProcessing_MessageWithPendingToolInSameTurn_ReturnsTrue()
+    {
+        // assistant.message as last event, but tool.execution_start earlier in same turn
+        // → smart scan should detect the pending tool and report still processing.
+        var svc = CreateService();
+        var tmpDir = Path.Combine(Path.GetTempPath(), "polypilot-test-" + Guid.NewGuid().ToString("N"));
+        var sessionId = Guid.NewGuid().ToString();
+        var sessionDir = Path.Combine(tmpDir, sessionId);
+        Directory.CreateDirectory(sessionDir);
+        var eventsFile = Path.Combine(sessionDir, "events.jsonl");
+
+        try
+        {
+            File.WriteAllText(eventsFile,
+                """{"type":"assistant.turn_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{}}""" + "\n" +
+                """{"type":"tool.execution_start","data":{}}""" + "\n" +
+                """{"type":"assistant.message","data":{"content":"Running the tool now..."}}""");
+            var result = svc.IsSessionStillProcessing(sessionId, tmpDir);
+            Assert.True(result, "assistant.message with pending tool.execution_start should report still processing");
+        }
+        finally { Directory.Delete(tmpDir, true); }
     }
 
     // --- Resume branch selection: RESUME-ACTIVE vs RESUME-QUIESCE ---

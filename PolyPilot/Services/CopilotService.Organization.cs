@@ -1132,25 +1132,27 @@ public partial class CopilotService
         OnStateChanged?.Invoke();
     }
 
-    public void ToggleGroupCollapsed(string groupId)
+    public void ToggleGroupCollapsed(string groupId, bool notifyStateChange = true)
     {
         var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
         if (group != null)
         {
             group.IsCollapsed = !group.IsCollapsed;
             SaveOrganization();
-            OnStateChanged?.Invoke();
+            if (notifyStateChange)
+                OnStateChanged?.Invoke();
         }
     }
 
-    public void ToggleUnpinnedCollapsed(string groupId)
+    public void ToggleUnpinnedCollapsed(string groupId, bool notifyStateChange = true)
     {
         var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
         if (group != null)
         {
             group.UnpinnedCollapsed = !group.UnpinnedCollapsed;
             SaveOrganization();
-            OnStateChanged?.Invoke();
+            if (notifyStateChange)
+                OnStateChanged?.Invoke();
         }
     }
 
@@ -3981,9 +3983,10 @@ public partial class CopilotService
           while (_sessions.ContainsKey(orchName) || Organization.Sessions.Any(s => s.SessionName == orchName))
               orchName = $"{teamName}-orchestrator-{suffix++}";
         }
+        var resolvedOrchModel = ModelHelper.ResolvePreferredModel(preset.OrchestratorModel, AvailableModels, "claude-opus-4.6");
         try
         {
-            await CreateSessionAsync(orchName, preset.OrchestratorModel, orchWorkDir, ct);
+            await CreateSessionAsync(orchName, resolvedOrchModel, orchWorkDir, ct);
         }
         catch (Exception ex)
         {
@@ -3992,7 +3995,7 @@ public partial class CopilotService
         // Assign role/group/model even if session already existed from a previous run
         MoveSession(orchName, group.Id);
         SetSessionRole(orchName, MultiAgentRole.Orchestrator);
-        SetSessionPreferredModel(orchName, preset.OrchestratorModel);
+        SetSessionPreferredModel(orchName, resolvedOrchModel);
         // Pin orchestrator so it sorts to the top of the group
         var orchMeta = GetSessionMeta(orchName);
         if (orchMeta != null) orchMeta.IsPinned = true;
@@ -4013,7 +4016,7 @@ public partial class CopilotService
               while (_sessions.ContainsKey(workerName) || Organization.Sessions.Any(s => s.SessionName == workerName))
                   workerName = $"{teamName}-{displayName}-{suffix++}";
             }
-            var workerModel = preset.WorkerModels[i];
+            var workerModel = ModelHelper.ResolvePreferredModel(preset.WorkerModels[i], AvailableModels, "claude-opus-4.6");
             var workerWorkDir = workerWorkDirs[i] ?? orchWorkDir ?? workingDirectory;
             Debug($"[WorktreeStrategy] Worker '{workerName}': wtId={workerWtIds[i] ?? "(none)"}, dir={workerWorkDir ?? "(null)"}");
             try
@@ -4089,7 +4092,7 @@ public partial class CopilotService
             currentSlug = Models.ModelHelper.NormalizeToSlug(GetSession(sessionName)?.Model ?? "");
             if (currentSlug == meta.PreferredModel) return;
 
-            await ChangeModelAsync(sessionName, meta.PreferredModel, ct);
+            await ChangeModelAsync(sessionName, meta.PreferredModel, cancellationToken: ct);
             Debug($"Switched '{sessionName}' model to '{meta.PreferredModel}' for multi-agent dispatch");
         }
         catch (Exception ex)

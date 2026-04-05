@@ -32,7 +32,10 @@ public enum UiTheme
     SolarizedDark,   // Solarized dark
     SolarizedLight,  // Solarized light
     SystemSolarized, // Follow OS light/dark preference (Solarized palette)
-    InternationalWomensDay  // Purple/violet theme for March 8
+    InternationalWomensDay,  // Purple/violet theme for March 8
+    AmberDark,       // Warm amber dark theme
+    AmberLight,      // Warm amber light theme
+    SystemAmber      // Follow OS light/dark preference (Amber palette)
 }
 
 public enum CliSourceMode
@@ -162,6 +165,60 @@ public class ConnectionSettings
 
         // Everything else (bare IP, localhost, LAN hostname) → http
         return "http://" + trimmed;
+    }
+
+    internal static Dictionary<string, string> BuildTunnelQrPayload(
+        string url,
+        string? token,
+        string? lanHost,
+        int bridgePort,
+        string? serverPassword,
+        bool allowLan)
+    {
+        var payload = new Dictionary<string, string> { ["url"] = url };
+        if (!string.IsNullOrEmpty(token))
+            payload["token"] = token;
+
+        if (allowLan && !string.IsNullOrEmpty(lanHost) && !string.IsNullOrEmpty(serverPassword))
+        {
+            payload["lanUrl"] = $"http://{lanHost}:{bridgePort}";
+            payload["lanToken"] = serverPassword;
+        }
+
+        return payload;
+    }
+
+    internal static Dictionary<string, string> BuildDirectQrPayload(
+        string host,
+        int bridgePort,
+        string? serverPassword,
+        bool allowLan,
+        string? tunnelUrl = null,
+        string? tunnelToken = null)
+    {
+        var payload = new Dictionary<string, string>();
+
+        if (allowLan)
+        {
+            payload["lanUrl"] = $"http://{host}:{bridgePort}";
+            if (!string.IsNullOrEmpty(serverPassword))
+                payload["lanToken"] = serverPassword;
+        }
+
+        if (!string.IsNullOrEmpty(tunnelUrl))
+        {
+            payload["url"] = tunnelUrl;
+            if (!string.IsNullOrEmpty(tunnelToken))
+                payload["token"] = tunnelToken;
+        }
+        else if (allowLan)
+        {
+            payload["url"] = $"http://{host}:{bridgePort}";
+            if (!string.IsNullOrEmpty(serverPassword))
+                payload["token"] = serverPassword;
+        }
+
+        return payload;
     }
 
     [JsonIgnore]

@@ -134,14 +134,29 @@ public partial class CopilotService
 
             using var doc = JsonDocument.Parse(lastLine);
             var type = doc.RootElement.GetProperty("type").GetString();
-            
-            var activeEvents = new[] { 
-                "assistant.turn_start", "tool.execution_start", 
-                "tool.execution_progress", "assistant.message_delta",
-                "assistant.reasoning", "assistant.reasoning_delta",
-                "assistant.intent"
-            };
-            return activeEvents.Contains(type);
+            if (type == null) return false; // Corrupt/partial event — treat as terminal
+
+            // session.idle is ephemeral (never on disk). session.start can also be the only
+            // on-disk event for a never-used session, so treat it as terminal on restore.
+            var terminalEvents = new[] { "session.idle", "session.error", "session.shutdown", "session.start" };
+            if (terminalEvents.Contains(type)) return false;
+
+            // Smart completion for assistant.message / assistant.turn_end: session.idle is not
+            // written to disk, so a clean no-tool turn can appear to end on one of these events.
+            // Only treat it as idle if the current sub-turn shows no tool activity at all.
+            // If tools were involved, stay conservative and keep waiting for resumed events or
+            // the watchdog timeout — this avoids losing between-round tool output after relaunch.
+            if (type is "assistant.message" or "assistant.turn_end")
+            {
+                var tailTypes = GetTailEventTypes(eventsFile, 30);
+                if (tailTypes != null && tailTypes.Count > 1 && IsCleanNoToolSubturn(tailTypes))
+                {
+                    Debug($"[RESTORE] events.jsonl for '{sessionId}' ends with {type} and the current sub-turn has no tool activity — treating session as idle");
+                    return false;
+                }
+            }
+
+            return true;
         }
         catch { return false; }
     }
@@ -181,6 +196,68 @@ public partial class CopilotService
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Reads the last N event types from events.jsonl in reverse order (most recent first).
+    /// Uses a tail-read (last 8KB) to avoid full-file scan on large sessions.
+    /// Returns null on error.
+    /// </summary>
+    internal static List<string>? GetTailEventTypes(string eventsFilePath, int count)
+    {
+        try
+        {
+            if (!File.Exists(eventsFilePath)) return null;
+
+            const int tailBytes = 8192;
+            using var fs = new FileStream(eventsFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            if (fs.Length == 0) return null;
+
+            var offset = Math.Max(0, fs.Length - tailBytes);
+            fs.Seek(offset, SeekOrigin.Begin);
+            using var reader = new StreamReader(fs);
+            var lines = new List<string>();
+            while (reader.ReadLine() is { } line)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                    lines.Add(line);
+            }
+
+            // Parse types in reverse order (most recent first)
+            var result = new List<string>();
+            for (int i = lines.Count - 1; i >= 0 && result.Count < count; i--)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(lines[i]);
+                    var t = doc.RootElement.GetProperty("type").GetString();
+                    if (t != null) result.Add(t);
+                }
+                catch { }
+            }
+            return result;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Returns true when the current sub-turn contains no tool activity before the latest
+    /// assistant.message / assistant.turn_end. The scan stops at the start of the current
+    /// sub-turn so older tool rounds don't keep a clean completion alive.
+    /// </summary>
+    internal static bool IsCleanNoToolSubturn(List<string> tailTypes)
+    {
+        for (int i = 1; i < tailTypes.Count; i++)
+        {
+            var evt = tailTypes[i];
+            if (evt.StartsWith("tool.execution_", StringComparison.Ordinal))
+                return false;
+
+            if (evt is "assistant.turn_start" or "assistant.turn_end" or "session.resume" or "session.start")
+                break;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -788,28 +865,271 @@ public partial class CopilotService
 
     private async Task FetchAvailableModelsAsync()
     {
+        Task fetchTask;
+        lock (_availableModelsFetchSync)
+        {
+            if (_availableModelsFetchTask.IsCompleted)
+            {
+                _availableModelsFetchQueued = false;
+                _availableModelsFetchTask = RunAvailableModelsFetchLoopAsync();
+            }
+            else
+            {
+                _availableModelsFetchQueued = true;
+            }
+
+            fetchTask = _availableModelsFetchTask;
+        }
+
+        await fetchTask;
+    }
+
+    private async Task<IReadOnlyList<string>> GetSdkAvailableModelsAsync()
+    {
+        if (_client == null)
+            return Array.Empty<string>();
+
+        // ListModelsAsync is backed by the connected Copilot CLI/server, so this
+        // picks up released models without hardcoding them here.
+        var modelList = await _client.ListModelsAsync();
+        if (modelList == null || modelList.Count == 0)
+            return Array.Empty<string>();
+
+        // Capture reasoning effort info from model metadata
+        var efforts = new Dictionary<string, List<string>>();
+        var defaults = new Dictionary<string, string>();
+        foreach (var m in modelList)
+        {
+            if (string.IsNullOrEmpty(m.Id)) continue;
+            if (m.SupportedReasoningEfforts is { Count: > 0 } supported)
+                efforts[m.Id] = supported.ToList();
+            if (!string.IsNullOrEmpty(m.DefaultReasoningEffort))
+                defaults[m.Id] = m.DefaultReasoningEffort;
+        }
+        ModelReasoningEfforts = efforts;
+        ModelDefaultReasoningEffort = defaults;
+
+        return Models.ModelHelper.BuildSelectionList(
+            modelList
+                .Where(m => !string.IsNullOrEmpty(m.Id))
+                .Select(m => m.Id));
+    }
+
+    private async Task<IReadOnlyList<string>> GetDirectCliAvailableModelsAsync()
+    {
+        var cliPath = ResolveCopilotCliPath(_currentSettings?.CliSource ?? CliSourceMode.BuiltIn);
+        if (string.IsNullOrWhiteSpace(cliPath) || !File.Exists(cliPath))
+            return Array.Empty<string>();
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "polypilot-model-probe");
+        Directory.CreateDirectory(tempDir);
+
+        using var process = new System.Diagnostics.Process();
+        process.StartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = cliPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = tempDir
+        };
+        process.StartInfo.ArgumentList.Add("-p");
+        process.StartInfo.ArgumentList.Add("Return exactly the list of model IDs shown in the /model Available tab as a JSON array. Use the current CLI runtime model availability. Do not inspect files or use tools. Return only JSON.");
+        process.StartInfo.ArgumentList.Add("--add-dir");
+        process.StartInfo.ArgumentList.Add(tempDir);
+        process.StartInfo.ArgumentList.Add("--no-custom-instructions");
+        process.StartInfo.ArgumentList.Add("--effort");
+        process.StartInfo.ArgumentList.Add("low");
+        process.StartInfo.ArgumentList.Add("--output-format");
+        process.StartInfo.ArgumentList.Add("text");
+        process.StartInfo.ArgumentList.Add("--silent");
+
+        process.Start();
+        process.StandardInput.Close();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        // Start reading streams without CTS — they'll complete when the process exits
+        // or is killed. Using CTS here causes a race: if the token fires between
+        // WaitForExitAsync returning and the await below, a successful result is lost.
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+
         try
         {
-            if (_client == null) return;
-            var modelList = await _client.ListModelsAsync();
-            if (modelList != null && modelList.Count > 0)
+            await process.WaitForExitAsync(cts.Token);
+        }
+        catch (OperationCanceledException ex)
+        {
+            TryTerminateProcess(process);
+            throw new TimeoutException("Timed out while probing models from the Copilot CLI.", ex);
+        }
+
+        var output = await outputTask;
+        var error = await errorTask;
+
+        if (process.ExitCode != 0)
+        {
+            var detail = FirstNonEmptyLine(error) ?? FirstNonEmptyLine(output) ?? $"exit code {process.ExitCode}";
+            throw new InvalidOperationException($"Copilot CLI model probe failed: {detail}");
+        }
+
+        var models = ParseDirectCliModelProbeOutput(output);
+        if (models.Count == 0)
+        {
+            var snippet = FirstNonEmptyLine(output) ?? "(no output)";
+            throw new InvalidOperationException($"Copilot CLI model probe returned no parseable models: {snippet}");
+        }
+
+        return models;
+    }
+
+    private async Task RunAvailableModelsFetchLoopAsync()
+    {
+        do
+        {
+            IReadOnlyList<string> sdkModels = Array.Empty<string>();
+            IReadOnlyList<string> directCliModels = Array.Empty<string>();
+
+            try
             {
-                var models = modelList
-                    .Where(m => !string.IsNullOrEmpty(m.Id))
-                    .Select(m => m.Id!)
-                    .OrderBy(m => m)
-                    .ToList();
-                if (models.Count > 0)
+                sdkModels = await GetSdkAvailableModelsAsync();
+            }
+            catch (Exception ex)
+            {
+                Debug($"Failed to fetch models from SDK: {ex.Message}");
+            }
+
+            try
+            {
+                directCliModels = await GetDirectCliAvailableModelsAsync();
+            }
+            catch (Exception ex)
+            {
+                Debug($"Failed to fetch models from direct CLI probe: {ex.Message}");
+            }
+
+            var primaryModels = directCliModels.Count > 0 ? directCliModels : sdkModels;
+            var supplementalModels = directCliModels.Count > 0 ? sdkModels : Array.Empty<string>();
+            if (primaryModels.Count > 0)
+            {
+                var models = Models.ModelHelper.BuildSelectionList(primaryModels, supplementalModels.ToArray()).ToList();
+                if (!_localAvailableModels.SequenceEqual(models, StringComparer.OrdinalIgnoreCase))
                 {
                     _localAvailableModels = models;
-                    Debug($"Loaded {models.Count} models from SDK");
-                    OnStateChanged?.Invoke();
+                    Debug($"Loaded {models.Count} models from Copilot CLI (sdk={sdkModels.Count}, direct={directCliModels.Count})");
+                    InvokeOnUI(() => OnStateChanged?.Invoke());
                 }
             }
-        }
-        catch (Exception ex)
+
+            lock (_availableModelsFetchSync)
+            {
+                if (!_availableModelsFetchQueued)
+                    break;
+
+                _availableModelsFetchQueued = false;
+            }
+        } while (true);
+    }
+
+    internal static IReadOnlyList<string> ParseDirectCliModelProbeOutput(string? output, int maxDepth = 5)
+    {
+        if (string.IsNullOrWhiteSpace(output) || maxDepth <= 0)
+            return Array.Empty<string>();
+
+        foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
-            Debug($"Failed to fetch models: {ex.Message}");
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                if (doc.RootElement.TryGetProperty("data", out var data) &&
+                    data.ValueKind == JsonValueKind.Object &&
+                    data.TryGetProperty("content", out var content) &&
+                    content.ValueKind == JsonValueKind.String)
+                {
+                    var nested = ParseDirectCliModelProbeOutput(content.GetString(), maxDepth - 1);
+                    if (nested.Count > 0)
+                        return nested;
+                }
+            }
+            catch (JsonException)
+            {
+                // Fall back to raw array extraction below.
+            }
+        }
+
+        foreach (var candidate in GetJsonArrayCandidates(output))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(candidate);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                return Models.ModelHelper.BuildSelectionList(
+                    doc.RootElement
+                        .EnumerateArray()
+                        .Where(e => e.ValueKind == JsonValueKind.String)
+                        .Select(e => e.GetString())
+                        .Where(s => !string.IsNullOrWhiteSpace(s))
+                        .Where(s => Models.ModelHelper.IsValidModelSlug(Models.ModelHelper.NormalizeToSlug(s))));
+            }
+            catch (JsonException)
+            {
+                // Keep trying more permissive candidate extraction below.
+            }
+        }
+
+        return Array.Empty<string>();
+    }
+
+    private static IEnumerable<string> GetJsonArrayCandidates(string output)
+    {
+        var trimmed = output.Trim();
+        if (trimmed.Length == 0)
+            yield break;
+
+        yield return trimmed;
+
+        if (trimmed.StartsWith("```", StringComparison.Ordinal))
+        {
+            var firstNewline = trimmed.IndexOf('\n');
+            var lastFence = trimmed.LastIndexOf("```", StringComparison.Ordinal);
+            if (firstNewline >= 0 && lastFence > firstNewline)
+                yield return trimmed[(firstNewline + 1)..lastFence].Trim();
+        }
+
+        var start = trimmed.IndexOf('[');
+        var end = trimmed.LastIndexOf(']');
+        if (start >= 0 && end > start)
+            yield return trimmed[start..(end + 1)];
+    }
+
+    private static string? FirstNonEmptyLine(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        return text
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .FirstOrDefault(line => line.Length > 0);
+    }
+
+    private static void TryTerminateProcess(System.Diagnostics.Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best-effort cleanup after a timeout.
         }
     }
 
