@@ -81,10 +81,33 @@ Fast Deployment requires `dotnet build -t:Install` — it pushes assemblies to `
 **Launch activity**: `crc64ef8e1bf56c865459.MainActivity`
 
 ### Windows
-```bash
+```powershell
 dotnet build -f net10.0-windows10.0.19041.0       # Build only
 dotnet run -f net10.0-windows10.0.19041.0          # Build + launch
 ```
+
+#### ⚠️ Relaunch from a Copilot agent session (Windows)
+
+`relaunch.ps1` kills **both** PolyPilot.exe **and** copilot.exe (the persistent CLI server)
+before building. When the auto-update service calls it, PowerShell is a direct child of
+PolyPilot.exe, so killing the copilot server is harmless to the script's process tree.
+
+However, when a **Copilot agent** runs `relaunch.ps1`, the process chain is:
+`PolyPilot → copilot.exe (server) → [agent tool PowerShell] → relaunch.ps1`.
+The script kills `copilot.exe` — the agent's own parent process — breaking stdio pipes
+and terminating the tool call before the build/relaunch can complete.
+
+> **🚨 RULES FOR CALLING RELAUNCH.PS1 FROM AN AGENT SESSION 🚨**
+> 1. **NEVER** run `relaunch.ps1` directly (e.g., `powershell -File relaunch.ps1`).
+>    It will kill your host process and the script will not complete.
+> 2. **ALWAYS** launch it as a fully detached process using `Start-Process`:
+>    ```powershell
+>    Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"C:\Projects\PolyPilot\PolyPilot\relaunch.ps1`"" -WindowStyle Normal
+>    ```
+>    This spawns PowerShell outside the copilot process tree so it survives the kill.
+> 3. After launching, your session will be interrupted when PolyPilot is killed (~2s later).
+>    That's expected — the new instance will start within ~30s and your session resumes.
+> 4. Do NOT attempt to verify the relaunch from the same turn — your session will be dead.
 
 ### iOS (physical device)
 ```bash
