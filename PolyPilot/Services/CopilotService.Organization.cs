@@ -2274,6 +2274,11 @@ public partial class CopilotService
         sb.AppendLine("Each worker retains conversation history from previous turns, so prefer the worker who already worked on the relevant topic.");
         sb.AppendLine("You may include brief analysis before the @worker blocks, but every response MUST contain @worker blocks for all workers you intend to use.");
         sb.AppendLine("NEVER attempt to do the work yourself. ALWAYS delegate via @worker blocks.");
+        sb.AppendLine();
+        sb.AppendLine("## Exception: Meta-Questions About Your Own Behavior");
+        sb.AppendLine("If the user is asking about YOUR orchestration behavior (e.g., 'why did you route that way?', 'why are tasks failing?', 'what went wrong?'),");
+        sb.AppendLine("answer the question DIRECTLY in plain text. Do NOT create @worker blocks for meta-questions about routing, dispatching, or orchestrator behavior.");
+        sb.AppendLine("Only delegate to workers when the user wants ACTUAL WORK done (code, reviews, debugging, etc.).");
         return sb.ToString();
     }
 
@@ -2406,6 +2411,14 @@ public partial class CopilotService
         foreach (Match match in Regex.Matches(orchestratorResponse, pattern, RegexOptions.IgnoreCase))
         {
             var workerName = match.Groups[1].Value.Trim().Trim('`', '\'', '"');
+
+            // Strip trailing inline instructions the model may have appended.
+            // e.g., "reviewer-2 **CODE REVIEW TASK...**" → "reviewer-2"
+            // Worker names only contain alphanumeric, hyphen, space, period, underscore.
+            var cleanEnd = workerName.IndexOfAny(new[] { '*', '[', '(', '{', '<', '!' });
+            if (cleanEnd > 0)
+                workerName = workerName[..cleanEnd].TrimEnd();
+
             var task = match.Groups[2].Value.Trim();
             if (string.IsNullOrEmpty(task)) continue;
 
@@ -2495,7 +2508,13 @@ public partial class CopilotService
         var namePattern = @"@worker:([^\n]+?)(?:\s*\n|$)";
         var mentioned = Regex.Matches(response, namePattern, RegexOptions.IgnoreCase)
             .Cast<Match>()
-            .Select(m => m.Groups[1].Value.Trim().Trim('`', '\'', '"'))
+            .Select(m =>
+            {
+                var raw = m.Groups[1].Value.Trim().Trim('`', '\'', '"');
+                // Strip trailing inline instructions (same as ParseTaskAssignments)
+                var cleanEnd = raw.IndexOfAny(new[] { '*', '[', '(', '{', '<', '!' });
+                return cleanEnd > 0 ? raw[..cleanEnd].TrimEnd() : raw;
+            })
             .Where(n => !string.IsNullOrEmpty(n))
             .ToList();
 
@@ -4222,6 +4241,7 @@ public partial class CopilotService
             // Drain any user prompts queued while the loop was busy (e.g., waiting for workers).
             // These are sent to the orchestrator's SDK session so the model sees them.
             // If the model responds with @worker blocks, merge them into this iteration's assignments.
+            // Meta-questions (about routing, orchestration behavior) are answered directly — no dispatch.
             var queuedAssignments = new List<TaskAssignment>();
             if (_reflectQueuedPrompts.TryGetValue(groupId, out var promptQueue))
             {
@@ -4229,12 +4249,19 @@ public partial class CopilotService
                 {
                     Debug($"[DISPATCH] Draining queued prompt for '{orchestratorName}' (len={queuedPrompt.Length})");
                     var queuedResponse = await SendPromptAndWaitAsync(orchestratorName,
-                        $"[User sent a new message while you were working]\n\n{queuedPrompt}", ct, originalPrompt: queuedPrompt);
+                        $"[User sent a new message while you were working]\n\n{queuedPrompt}\n\n" +
+                        "[If this is a question about YOUR orchestration/routing behavior, answer it directly without @worker blocks. " +
+                        "Only create @worker blocks if the user is requesting actual work to be done.]",
+                        ct, originalPrompt: queuedPrompt);
                     var parsed = ParseTaskAssignments(queuedResponse, workerNames);
                     if (parsed.Count > 0)
                     {
                         Debug($"[DISPATCH] Queued prompt response contained {parsed.Count} @worker assignments");
                         queuedAssignments.AddRange(parsed);
+                    }
+                    else
+                    {
+                        Debug($"[DISPATCH] Queued prompt response had no @worker blocks — orchestrator answered directly (len={queuedResponse.Length})");
                     }
                 }
             }
@@ -4897,6 +4924,8 @@ public partial class CopilotService
         sb.AppendLine();
         sb.AppendLine("Assign refined tasks using `@worker:name` / `@end` blocks to address the gaps identified above.");
         sb.AppendLine("You MUST produce at least one @worker block. NEVER attempt to do the work yourself.");
+        sb.AppendLine();
+        sb.AppendLine("Exception: If the user asked a meta-question about YOUR orchestration behavior (routing, dispatching, failures), answer it directly without @worker blocks.");
         return sb.ToString();
     }
 

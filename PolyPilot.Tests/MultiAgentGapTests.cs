@@ -531,4 +531,78 @@ Do task B.
         // Queue should be empty now
         Assert.False(queue.TryDequeue(out _));
     }
+
+    // --- Inline instruction stripping ---
+
+    [Fact]
+    public void ParseTaskAssignments_InlineInstructions_StrippedFromWorkerName()
+    {
+        // Model writes "@worker:reviewer-2 **CODE REVIEW TASK — you must review a git commit**"
+        // The inline markdown instructions should be stripped, leaving just "reviewer-2"
+        var response = "@worker:reviewer-2 **CODE REVIEW TASK — you must review a git commit, not discuss routing rules.**\nReview PR #42 for correctness.\n@end";
+        var workers = new List<string> { "tuul A Team-reviewer-1", "tuul A Team-reviewer-2" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("tuul A Team-reviewer-2", result[0].WorkerName);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_InlineBrackets_StrippedFromWorkerName()
+    {
+        // Model writes "@worker:srdev-1 (primary developer)"
+        var response = "@worker:srdev-1 (primary developer)\nImplement the feature.\n@end";
+        var workers = new List<string> { "team-srdev-1", "team-srdev-2" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("team-srdev-1", result[0].WorkerName);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_InlineSquareBrackets_StrippedFromWorkerName()
+    {
+        // Model writes "@worker:debugger-1 [high priority]"
+        var response = "@worker:debugger-1 [high priority]\nDebug the crash.\n@end";
+        var workers = new List<string> { "squad-debugger-1" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("squad-debugger-1", result[0].WorkerName);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_InlineAngleBrackets_StrippedFromWorkerName()
+    {
+        // Model writes "@worker:worker-1 <-- assign this one"
+        var response = "@worker:worker-1 <-- assign this one\nDo the work.\n@end";
+        var workers = new List<string> { "worker-1" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("worker-1", result[0].WorkerName);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_CleanWorkerName_NotAffectedByStripping()
+    {
+        // Normal worker name without inline instructions should not be affected
+        var response = "@worker:tuul A Team-srdev-1\nImplement the feature.\n@end";
+        var workers = new List<string> { "tuul A Team-srdev-1" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("tuul A Team-srdev-1", result[0].WorkerName);
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_MultipleWorkersWithInlineInstructions_AllResolved()
+    {
+        var response = @"@worker:srdev-1 **IMPLEMENTATION TASK**
+Implement feature X.
+@end
+@worker:reviewer-1 (code review)
+Review the implementation.
+@end";
+        var workers = new List<string> { "team-srdev-1", "team-reviewer-1" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Equal(2, result.Count);
+        Assert.Contains(result, a => a.WorkerName == "team-srdev-1");
+        Assert.Contains(result, a => a.WorkerName == "team-reviewer-1");
+    }
 }
