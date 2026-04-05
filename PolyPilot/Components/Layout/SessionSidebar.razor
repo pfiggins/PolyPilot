@@ -1324,11 +1324,16 @@ else
                             }
                             if (workerCount > 0)
                             {
+                                var activeWorkerCount = workerSessions.Count(s => s.IsProcessing);
                                 @if (orchSession == null)
                                 {
                                     <div class="unpinned-toggle worker-toggle" @onclick="() => ToggleUnpinnedCollapsedLocal(wToggleGroupId)" @onclick:stopPropagation="true">
                                         <span class="unpinned-chevron @(group.UnpinnedCollapsed ? "collapsed" : "expanded")" aria-hidden="true"></span>
                                         <span class="unpinned-label">@workerCount @(workerCount != 1 ? "workers" : "worker")</span>
+                                        @if (activeWorkerCount > 0)
+                                        {
+                                            <span class="worker-active-badge" title="@activeWorkerCount @(activeWorkerCount != 1 ? "workers" : "worker") currently processing">⚡ @activeWorkerCount active</span>
+                                        }
                                     </div>
                                 }
                                 @if (!group.UnpinnedCollapsed)
@@ -3343,8 +3348,20 @@ else
 
     private void SetGroupMaxIterations(string groupId, ChangeEventArgs e)
     {
-        if (int.TryParse(e.Value?.ToString(), out var val) && val >= 1)
-            _groupMaxIterations[groupId] = val;
+        if (!int.TryParse(e.Value?.ToString(), out var val) || val < 1)
+            return;
+
+        _groupMaxIterations[groupId] = val;
+
+        // Also update the actual group so the top bar and running reflection stay in sync
+        var group = CopilotService.Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+        if (group != null)
+        {
+            group.MaxReflectIterations = val;
+            if (group.ReflectionState is { IsActive: true } rs)
+                rs.MaxIterations = val;
+            CopilotService.NotifyStateChanged();
+        }
     }
 
     private async Task SendToSidebarMultiAgentGroup(string groupId)
