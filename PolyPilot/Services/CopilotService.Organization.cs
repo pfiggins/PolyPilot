@@ -2448,6 +2448,26 @@ public partial class CopilotService
         if (suffixMatches.Count == 1)
             return suffixMatches[0];
 
+        // 3. Progressive prefix extraction: the model sometimes puts the task
+        //    description on the same line as the name (e.g., "reviewer Review Sprint...").
+        //    Try progressively shorter space-delimited prefixes of the captured text.
+        var parts = workerName.Split(' ');
+        if (parts.Length > 1)
+        {
+            for (int len = parts.Length - 1; len >= 1; len--)
+            {
+                var prefix = string.Join(' ', parts.Take(len));
+                if (string.IsNullOrEmpty(prefix)) continue;
+                // Try exact match on prefix
+                var prefixExact = availableWorkers.FirstOrDefault(w =>
+                    w.Equals(prefix, StringComparison.OrdinalIgnoreCase));
+                if (prefixExact != null) return prefixExact;
+                // Try suffix match on prefix
+                var prefixSuffix = availableWorkers.Where(w => IsSuffixMatch(w, prefix)).ToList();
+                if (prefixSuffix.Count == 1) return prefixSuffix[0];
+            }
+        }
+
         return null;
     }
 

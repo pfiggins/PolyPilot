@@ -407,6 +407,72 @@ Do task B.
         Assert.False(CopilotService.IsSuffixMatch("alpha", ""));
     }
 
+    // --- Progressive Prefix Extraction (task on same line as name) ---
+
+    [Fact]
+    public void ResolveWorkerName_TaskOnSameLine_ExtractsName()
+    {
+        // Model writes @worker:reviewer Review Sprint 5-7 batch 2 (commits 6-10)...
+        var workers = new List<string> { "tuul A Team-reviewer", "tuul A Team-reviewer-2" };
+        Assert.Equal("tuul A Team-reviewer",
+            CopilotService.ResolveWorkerName("reviewer Review Sprint 5-7 batch 2", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_PlainTextTaskOnSameLine_ExtractsName()
+    {
+        // Model writes @worker:srdev-2 Status check: You were assigned the 5 reviewer fixes...
+        var workers = new List<string> { "tuul A Team-srdev-1", "tuul A Team-srdev-2" };
+        Assert.Equal("tuul A Team-srdev-2",
+            CopilotService.ResolveWorkerName("srdev-2 Status check: You were assigned the task", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_FullNameWithTaskOnSameLine_ExtractsName()
+    {
+        // Model writes the full name followed by the task
+        var workers = new List<string> { "tuul A Team-reviewer", "tuul A Team-reviewer-2" };
+        Assert.Equal("tuul A Team-reviewer",
+            CopilotService.ResolveWorkerName("tuul A Team-reviewer Review Sprint batch 2", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_ProgressivePrefix_AmbiguousReturnsNull()
+    {
+        // "worker" is a prefix match for both team-worker-1 and team-worker-2
+        var workers = new List<string> { "team-worker-1", "team-worker-2" };
+        Assert.Null(CopilotService.ResolveWorkerName("worker Do the task now", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_NumberedWorkerWithTask_ExtractsCorrectOne()
+    {
+        // "reviewer-3" should match exactly one worker even when task follows
+        var workers = new List<string> { "tuul A Team-reviewer", "tuul A Team-reviewer-2", "tuul A Team-reviewer-3" };
+        Assert.Equal("tuul A Team-reviewer-3",
+            CopilotService.ResolveWorkerName("reviewer-3 Review Sprint 5-7 batch 2 on sprint-2 branch", workers));
+    }
+
+    [Fact]
+    public void ResolveWorkerName_CleanName_NotAffectedByPrefix()
+    {
+        // Clean name without task on same line should still work (exact/suffix match first)
+        var workers = new List<string> { "tuul A Team-srdev-1" };
+        Assert.Equal("tuul A Team-srdev-1",
+            CopilotService.ResolveWorkerName("srdev-1", workers));
+    }
+
+    [Fact]
+    public void ParseTaskAssignments_TaskOnSameLine_ResolvesViaPrefix()
+    {
+        // End-to-end: model puts task on same line as @worker name
+        var response = "@worker:reviewer Review Sprint 5-7 batch 2 (commits 6-10) on the sprint-2 branch.\nDetailed review instructions here.\n@end";
+        var workers = new List<string> { "tuul A Team-reviewer", "tuul A Team-reviewer-2" };
+        var result = CopilotService.ParseTaskAssignments(response, workers);
+        Assert.Single(result);
+        Assert.Equal("tuul A Team-reviewer", result[0].WorkerName);
+    }
+
     [Fact]
     public void ParseTaskAssignments_SuffixMatch_ResolvesAbbreviatedName()
     {
