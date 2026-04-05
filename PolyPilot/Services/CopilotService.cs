@@ -711,6 +711,15 @@ public partial class CopilotService : IAsyncDisposable
         /// session to restart processing on its own ("continued without me sending a message").
         /// Cleared by SendPromptAsync at the start of each new turn.</summary>
         public volatile bool WasUserAborted;
+        /// <summary>
+        /// UTC ticks when IDLE-DEFER was first entered for the current turn (first
+        /// SessionIdleEvent with active background tasks). 0 = not set.
+        /// Uses Interlocked for thread safety: the IDLE-DEFER section (SDK event thread) sets via
+        /// CompareExchange(0 → now); CompleteResponse/SendPromptAsync (UI thread) clear via Exchange(0).
+        /// Matches the pattern of TurnEndReceivedAtTicks. MUST be cleared in every path that
+        /// clears HasDeferredIdle — the two fields are an inseparable companion pair.
+        /// </summary>
+        public long SubagentDeferStartedAtTicks;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)
@@ -3297,6 +3306,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
         state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
+        Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L); // Companion pair — must clear with HasDeferredIdle
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
         state.WasUserAborted = false; // Clear abort flag — new turn starts fresh (re-enables EVT-REARM)
         state.WatchdogKilledThisTurn = false; // Clear watchdog-kill flag — new turn starts fresh
@@ -3603,6 +3613,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     // Mirror primary reconnect: reset tool tracking for new connection
                                                     siblingState.HasUsedToolsThisTurn = false;
                                                     siblingState.HasDeferredIdle = false;
+                                                    Interlocked.Exchange(ref siblingState.SubagentDeferStartedAtTicks, 0L);
                                                     Interlocked.Exchange(ref siblingState.ActiveToolCallCount, 0);
                                                     Interlocked.Exchange(ref siblingState.SuccessfulToolCountThisTurn, 0);
                                                     Interlocked.Exchange(ref siblingState.ToolHealthStaleChecks, 0);
@@ -3816,6 +3827,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // sessions wait 5x longer than necessary to recover.
                     newState.HasUsedToolsThisTurn = false;
                     newState.HasDeferredIdle = false;
+                    newState.SubagentDeferStartedAtTicks = 0L; // redundant (default), but explicit companion pair
                     Interlocked.Exchange(ref newState.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, 0);
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
@@ -3852,6 +3864,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // 120s watchdog tier instead of the inflated 600s from stale tool state.
                     state.HasUsedToolsThisTurn = false;
                     state.HasDeferredIdle = false;
+                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
 
                     // Schedule persistence of the new session ID so it survives app restart.
                     // Without this, the debounced save captures the pre-reconnect snapshot
@@ -3924,6 +3937,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
                     state.HasDeferredIdle = false;
+                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
                     Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     state.Info.IsResumed = false;
                     state.Info.IsProcessing = false;
@@ -3947,6 +3961,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
                 state.HasDeferredIdle = false;
+                Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.Info.IsProcessing = false;
@@ -4167,6 +4182,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
         state.HasDeferredIdle = false;
+        Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L); // INV-1: companion pair with HasDeferredIdle
         state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on abort
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
         // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
@@ -4293,6 +4309,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
                 state.HasDeferredIdle = false;
+                Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.IsReconnectedSend = false; // INV-1 item 8: prevent stale 35s timeout on next watchdog start
@@ -4581,6 +4598,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.Info.IsResumed = false;
                     state.HasUsedToolsThisTurn = false;
                     state.HasDeferredIdle = false;
+                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     state.Info.ProcessingStartedAt = null;
