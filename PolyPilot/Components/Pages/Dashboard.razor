@@ -1358,7 +1358,13 @@
         var shouldCaptureDrafts = !_sessionSwitching 
             && completedSessions.Count == 0
             && (nowTicks - lastCapture) >= 3000;
-        _draftsCapturedThisCycle = shouldCaptureDrafts || _sessionSwitching;
+        // Set the flag AFTER capture completes, not before. The await inside the
+        // capture block yields the Blazor dispatcher — if an intermediate render
+        // fires during the yield (e.g., HandleComplete → StateHasChanged), it would
+        // see the flag as true and restore STALE draftBySession values from the
+        // previous cycle, overwriting whatever the user typed in the meantime.
+        if (_sessionSwitching)
+            _draftsCapturedThisCycle = true;
         if (shouldCaptureDrafts)
         {
             // Capture all card input values before re-render wipes them
@@ -1405,6 +1411,8 @@
                             _cursorEnd = end;
                     }
                 }
+                // Flag set AFTER draftBySession is updated with fresh values
+                _draftsCapturedThisCycle = true;
             }
             catch { }
             Interlocked.Exchange(ref _lastDraftCaptureTickMs, Environment.TickCount64);

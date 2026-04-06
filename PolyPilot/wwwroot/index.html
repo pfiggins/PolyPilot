@@ -763,7 +763,9 @@
             var drafts = JSON.parse(draftsJson || '{}');
             for (var id in drafts) {
                 var el = document.getElementById(id);
-                if (el) el.value = drafts[id];
+                // Skip overwriting the focused input — the user may be actively typing
+                // and the captured value is from before their latest keystrokes.
+                if (el && document.activeElement !== el) el.value = drafts[id];
             }
             if (focusId) {
                 var fel = document.getElementById(focusId);
