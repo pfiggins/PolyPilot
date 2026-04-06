@@ -1869,37 +1869,56 @@
             var orchGroupId = CopilotService.GetOrchestratorGroupId(sessionName);
             if (orchGroupId != null)
             {
-                List<string>? queueImagePaths = null;
-                if (hasImages)
+                if (session.IsResumed)
                 {
-                    queueImagePaths = pendingSendImages!.Select(i => i.TempPath).ToList();
-                    pendingImagesBySession.Remove(sessionName);
-                }
-
-                // Always show the user's message in the chat window
-                session.History.Add(ChatMessage.UserMessage(finalPrompt));
-
-                // Try routing directly into the active reflect loop (bypasses dispatch lock).
-                // Fall back to MessageQueue if no reflect loop is running.
-                if (queueImagePaths is null or { Count: 0 } && CopilotService.TryQueueForActiveReflectLoop(sessionName, finalPrompt))
-                {
-                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
+                    // Orchestrator processing state was restored from a previous app session
+                    // (e.g., CLI was still running when PolyPilot restarted). Auto-abort the
+                    // stale state so the user can interact immediately without manually clicking
+                    // Stop first. The user's message will be dispatched through the normal
+                    // orchestration pipeline below.
+                    CopilotService.LogDispatchRoute(sessionName, true, "RESTORED_ABORT", null, null, null, false);
+                    await CopilotService.AbortSessionAsync(sessionName);
                     session.History.Add(ChatMessage.SystemMessage(
-                        "📋 Orchestrator is busy — your message will be processed at the next iteration."));
+                        "🔄 Cleared stale processing state from previous session — dispatching your message now."));
+                    // Fall through to the normal send path below (IsProcessing is now false)
                 }
                 else
                 {
-                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
-                    CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
-                    session.History.Add(ChatMessage.SystemMessage(
-                        "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+                    List<string>? queueImagePaths = null;
+                    if (hasImages)
+                    {
+                        queueImagePaths = pendingSendImages!.Select(i => i.TempPath).ToList();
+                        pendingImagesBySession.Remove(sessionName);
+                    }
+
+                    // Always show the user's message in the chat window
+                    session.History.Add(ChatMessage.UserMessage(finalPrompt));
+
+                    // Try routing directly into the active reflect loop (bypasses dispatch lock).
+                    // Fall back to MessageQueue if no reflect loop is running.
+                    if (queueImagePaths is null or { Count: 0 } && CopilotService.TryQueueForActiveReflectLoop(sessionName, finalPrompt))
+                    {
+                        CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
+                        session.History.Add(ChatMessage.SystemMessage(
+                            "📋 Orchestrator is busy — your message will be processed at the next iteration."));
+                    }
+                    else
+                    {
+                        CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
+                        CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
+                        session.History.Add(ChatMessage.SystemMessage(
+                            "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+                    }
+                    session.MessageCount = session.History.Count;
+                    _needsScrollToBottom = true;
+                    await InvokeAsync(SafeRefreshAsync);
+                    return;
                 }
-                session.MessageCount = session.History.Count;
-                _needsScrollToBottom = true;
-                await InvokeAsync(SafeRefreshAsync);
-                return;
             }
 
+            // Only steer if still processing (the restored-abort path above cleared it)
+            if (session.IsProcessing)
+            {
             CopilotService.LogDispatchRoute(sessionName, true, "STEER", null, null, null, false);
             List<string>? steerImagePaths = null;
             if (hasImages)
@@ -1913,6 +1932,7 @@
                     InvokeAsync(() => Console.WriteLine($"Error steering {sessionName}: {t.Exception?.InnerException?.Message}"));
             });
             return;
+            }
         }
 
         List<string>? imagePaths = null;
