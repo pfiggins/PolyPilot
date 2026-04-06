@@ -90,6 +90,9 @@ public partial class CopilotService : IAsyncDisposable
     private CodespaceService.DotfilesStatus? _dotfilesStatus;
     private ConnectionSettings? _currentSettings;
     private volatile string? _activeSessionName;
+    // Dock icon badge: count of non-worker session completions since last app foreground.
+    // Only accessed on the UI thread (same as IsProcessing mutations).
+    private int _pendingCompletionCount;
     private SynchronizationContext? _syncContext;
     // Serializes the IsConnectionError reconnect path so concurrent workers
     // don't destroy each other's freshly-created client (thundering herd fix).
@@ -544,6 +547,7 @@ public partial class CopilotService : IAsyncDisposable
     public event Action<string, string>? OnContentReceived; // sessionName, content
     public event Action<string, string>? OnError; // sessionName, error
     public event Action<string, string>? OnSessionComplete; // sessionName, summary
+    public event Action<string>? OnSessionClosed; // sessionName
     public event Action<string, string>? OnActivity; // sessionName, activity description
     public event Action<string>? OnDebug; // debug messages
 
@@ -3265,12 +3269,12 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             throw new InvalidOperationException("This session is waiting for its codespace to connect. Please wait for the green status dot.");
 
         if (state.Info.IsProcessing)
-            throw new InvalidOperationException("Session is already processing a request.");
+            throw new SessionBusyException(sessionName);
 
         // Atomic check-and-set to prevent TOCTOU race: two callers could both see
         // IsProcessing=false and both enter without this guard.
         if (Interlocked.CompareExchange(ref state.SendingFlag, 1, 0) != 0)
-            throw new InvalidOperationException("Session is already processing a request.");
+            throw new SessionBusyException(sessionName);
 
         // Lazy resume INSIDE the SendingFlag guard to prevent double-resume race:
         // without this, two rapid sends could both see Session==null and both call
@@ -3528,10 +3532,17 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                             if (kvp.Key == sessionName) continue;
                                             var otherState = kvp.Value;
                                             if (string.IsNullOrEmpty(otherState.Info.SessionId)) continue;
-                                            // Skip siblings that are actively processing — re-resuming
-                                            // them would orphan mid-turn state and cause TaskCanceledException
-                                            // in orchestrator workers. Let their existing watchdog handle recovery.
-                                            if (otherState.Info.IsProcessing) continue;
+                                            // INV-O14: IsProcessing siblings have dead event streams —
+                                            // their CopilotSession was tied to the old client which was
+                                            // just disposed. Force-abort so the orchestrator retries
+                                            // immediately instead of waiting 2–5 min for the watchdog.
+                                            if (otherState.Info.IsProcessing)
+                                            {
+                                                Debug($"[RECONNECT] Sibling '{kvp.Key}' is IsProcessing with dead event stream — force-completing before re-resume");
+                                                try { await ForceCompleteProcessingAsync(kvp.Key, otherState, "client-recreated-dead-event-stream"); }
+                                                catch (Exception forceEx) { Debug($"[RECONNECT] Failed to force-complete sibling '{kvp.Key}': {forceEx.Message}"); }
+                                                // Fall through to re-resume the session on the new client
+                                            }
                                             var otherMeta = sessionSnapshots.FirstOrDefault(m => m.SessionName == kvp.Key);
                                             if (otherMeta?.GroupId != null &&
                                                 groupSnapshots.Any(g => g.Id == otherMeta.GroupId && g.IsCodespace))
@@ -4692,8 +4703,39 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             _ = _bridgeClient.SwitchSessionAsync(name)
                 .ContinueWith(t => Console.WriteLine($"[CopilotService] SwitchSession bridge error: {t.Exception?.InnerException?.Message}"),
                     TaskContinuationOptions.OnlyOnFaulted);
+        ClearPendingCompletions();
         OnStateChanged?.Invoke();
         return true;
+    }
+
+    /// <summary>
+    /// Increments the dock icon badge count when a non-worker session finishes.
+    /// Must be called on the UI thread (same as IsProcessing mutations).
+    /// </summary>
+    internal void IncrementPendingCompletions(string sessionName)
+    {
+        // Don't badge for the currently active session (user is already looking at it)
+        if (sessionName == _activeSessionName) return;
+        // Don't badge for worker sessions in multi-agent groups
+        if (IsWorkerInMultiAgentGroup(sessionName)) return;
+        _pendingCompletionCount++;
+        UpdateBadge();
+    }
+
+    /// <summary>
+    /// Clears the dock icon badge. Call when the user brings the app to the foreground.
+    /// </summary>
+    public void ClearPendingCompletions()
+    {
+        _pendingCompletionCount = 0;
+        UpdateBadge();
+    }
+
+    private void UpdateBadge()
+    {
+#if MACCATALYST
+        PolyPilot.Platforms.MacCatalyst.BadgeHelper.SetBadge(_pendingCompletionCount);
+#endif
     }
 
     /// <summary>
@@ -4889,6 +4931,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Blazor with "r.parentNode.removeChild" on null (render batch ordering race).
         // Instead, directly remove from Organization.Sessions so the deletion persists across restarts.
         RemoveSessionMetasWhere(m => m.SessionName == name);
+        OnSessionClosed?.Invoke(name);
         if (notifyUi)
             OnStateChanged?.Invoke();
         if (!IsRemoteMode)
@@ -5182,3 +5225,17 @@ public record QuotaInfo(
 
 public record SkillInfo(string Name, string Description, string Source);
 public record AgentInfo(string Name, string Description, string Source);
+
+/// <summary>
+/// Thrown when a session is already processing a request and cannot accept a new one.
+/// Typed exception allows callers to catch busy-session errors without fragile string matching.
+/// </summary>
+public class SessionBusyException : InvalidOperationException
+{
+    public SessionBusyException(string sessionName)
+        : base($"Session '{sessionName}' is already processing a request.")
+    {
+        SessionName = sessionName;
+    }
+    public string SessionName { get; }
+}

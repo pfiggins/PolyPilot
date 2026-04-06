@@ -567,13 +567,6 @@ public partial class CopilotService
         ex is InvalidOperationException && ex.Message.Contains("not initialized", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Returns true if the exception indicates a session is already processing a request.
-    /// This is retryable in the dispatch loop — the session may finish by the time we retry.
-    /// </summary>
-    internal static bool IsSessionBusyError(Exception ex) =>
-        ex is InvalidOperationException && ex.Message.Contains("already processing", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
     /// Returns true if the exception indicates the CLI server process is dead
     /// (e.g., Process.HasExited throws because the Process handle was never started
     /// or has been disposed). This happens when the SDK tries to monitor a stale process.

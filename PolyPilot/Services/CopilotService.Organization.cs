@@ -1825,13 +1825,13 @@ public partial class CopilotService
                 break; // success — exit retry loop
             }
             catch (OperationCanceledException) { throw; }
-            catch (Exception ex) when (dispatchAttempt < maxDispatchRetries && (IsConnectionError(ex) || IsSessionBusyError(ex)))
+            catch (Exception ex) when (dispatchAttempt < maxDispatchRetries && (IsConnectionError(ex) || ex is SessionBusyException))
             {
                 Debug($"[DISPATCH] Retryable error during dispatch (attempt {dispatchAttempt + 1}/{maxDispatchRetries + 1}): {ex.GetType().Name}: {ex.Message}");
                 var orchestratorName = GetOrchestratorSession(groupId);
                 if (orchestratorName != null)
                 {
-                    var reason = IsSessionBusyError(ex) ? "Session busy" : "Connection error";
+                    var reason = ex is SessionBusyException ? "Session busy" : "Connection error";
                     AddOrchestratorSystemMessage(orchestratorName,
                         $"⚡ {reason} during dispatch — retrying in {dispatchRetryDelayMs / 1000}s (attempt {dispatchAttempt + 2}/{maxDispatchRetries + 1})...");
                 }
@@ -3448,7 +3448,8 @@ public partial class CopilotService
         var session = GetSession(sessionName);
         if (session != null)
         {
-            session.History.Add(ChatMessage.SystemMessage(message));
+            lock (session.HistoryLock)
+                session.History.Add(ChatMessage.SystemMessage(message));
             InvokeOnUI(() => OnStateChanged?.Invoke());
         }
     }

@@ -62,6 +62,10 @@ public partial class CopilotService
         ["SubagentFailedEvent"] = EventVisibility.ChatVisible,
         ["CommandsChangedEvent"] = EventVisibility.TimelineOnly,
 
+        // Background task lifecycle — used for real-time agent/shell tracking
+        ["SessionBackgroundTasksChangedEvent"] = EventVisibility.TimelineOnly,
+        ["SystemNotificationEvent"] = EventVisibility.ChatVisible,
+
         // Currently noisy internal events
         ["SessionLifecycleEvent"] = EventVisibility.Ignore,
         ["HookStartEvent"] = EventVisibility.Ignore,
@@ -1061,6 +1065,71 @@ public partial class CopilotService
                 break;
             }
 
+            case SessionBackgroundTasksChangedEvent:
+            {
+                // Real-time background task status update — fires when agents/shells start or stop.
+                // Provides proactive awareness without waiting for session.idle.
+                // Proactively stamp SubagentDeferStartedAtTicks so the zombie expiry timer
+                // starts as early as possible — don't wait for the next session.idle to learn
+                // that background tasks are active. CompareExchange(0 → now) preserves any
+                // existing timestamp from an earlier IDLE-DEFER for the same turn.
+                Interlocked.CompareExchange(
+                    ref state.SubagentDeferStartedAtTicks,
+                    DateTime.UtcNow.Ticks,
+                    0L);
+                Debug($"[BG-TASKS] '{sessionName}' background tasks changed " +
+                      $"(SubagentDeferStartedAtTicks={Interlocked.Read(ref state.SubagentDeferStartedAtTicks)})");
+                Invoke(() =>
+                {
+                    state.Info.LastUpdatedAt = DateTime.Now;
+                    NotifyStateChangedCoalesced();
+                });
+                break;
+            }
+
+            case SystemNotificationEvent sysNotification:
+            {
+                var kind = sysNotification.Data?.Kind;
+                switch (kind)
+                {
+                    case SystemNotificationDataKindAgentCompleted agentDone:
+                        Debug($"[SYS-NOTIFY] '{sessionName}' agent completed: {agentDone.AgentId} ({agentDone.AgentType}) status={agentDone.Status}");
+                        Invoke(() =>
+                        {
+                            state.Info.LastUpdatedAt = DateTime.Now;
+                            NotifyStateChangedCoalesced();
+                        });
+                        break;
+
+                    case SystemNotificationDataKindAgentIdle agentIdle:
+                        Debug($"[SYS-NOTIFY] '{sessionName}' agent idle: {agentIdle.AgentId} ({agentIdle.AgentType})");
+                        break;
+
+                    case SystemNotificationDataKindShellCompleted shellDone:
+                        Debug($"[SYS-NOTIFY] '{sessionName}' shell completed: {shellDone.ShellId} exit={shellDone.ExitCode}");
+                        Invoke(() =>
+                        {
+                            state.Info.LastUpdatedAt = DateTime.Now;
+                            NotifyStateChangedCoalesced();
+                        });
+                        break;
+
+                    case SystemNotificationDataKindShellDetachedCompleted shellDetached:
+                        Debug($"[SYS-NOTIFY] '{sessionName}' detached shell completed: {shellDetached.ShellId}");
+                        Invoke(() =>
+                        {
+                            state.Info.LastUpdatedAt = DateTime.Now;
+                            NotifyStateChangedCoalesced();
+                        });
+                        break;
+
+                    default:
+                        Debug($"[SYS-NOTIFY] '{sessionName}' unknown notification kind: {kind?.Type}");
+                        break;
+                }
+                break;
+            }
+
             default:
                 LogUnhandledSessionEvent(sessionName, evt);
                 break;
@@ -1341,8 +1410,13 @@ public partial class CopilotService
         // This catches routing bypasses where SendToMultiAgentGroupAsync was skipped.
         TryDispatchOrphanedOrchestratorResponse(state.Info.Name, fullResponse);
 
-        // Reflection cycle: evaluate response and enqueue follow-up if goal not yet met
+        // Update dock icon badge: non-worker sessions that finished in the background.
+        // Skip badge during active reflection cycles — only badge on terminal completion.
         var cycle = state.Info.ReflectionCycle;
+        if (cycle == null || !cycle.IsActive)
+            IncrementPendingCompletions(state.Info.Name);
+
+        // Reflection cycle: evaluate response and enqueue follow-up if goal not yet met
         if (cycle != null && cycle.IsActive)
         {
             if (state.SkipReflectionEvaluationOnce)

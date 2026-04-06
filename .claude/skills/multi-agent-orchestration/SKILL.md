@@ -36,9 +36,37 @@ stuck sessions, and coordination failures.
 | File | Purpose |
 |------|---------|
 | `CopilotService.Organization.cs` | Orchestration engine — dispatch, synthesis, reflection |
+| `CopilotService.Codespace.cs` | Multi-server routing via `GetClientForGroup` |
 | `CopilotService.Events.cs` | TCS completion, OnSessionComplete firing |
 | `Models/SessionOrganization.cs` | Group/session metadata, modes, roles |
 | `Models/ReflectionCycle.cs` | Reflection state, stall detection |
+
+### Multi-Server Routing via `GetClientForGroup`
+
+When PolyPilot manages sessions across multiple servers (local + codespace), `GetClientForGroup`
+(`CopilotService.Codespace.cs:38`) selects the correct `CopilotClient` for a given group:
+
+```
+GetClientForGroup(groupId)
+  ├── groupId provided AND group.IsCodespace?
+  │     ├── Yes → return _codespaceClients[groupId]  (throws if disconnected)
+  │     └── No  → fall through
+  └── return _client  (main local SDK connection, throws if uninitialized)
+```
+
+**Thread safety**: Uses `SnapshotGroups()` (not live `Organization.Groups` list) because the
+method may be called from an await continuation on a background thread.
+
+**Callers** (primary session creation/resume paths):
+- `Organization.cs` → worker fresh session revival (dead event stream recovery)
+- `Persistence.cs` → session creation and resume during restore
+- `CopilotService.cs` → main session creation and resume paths
+
+Note: Codespace health-check resumes (`ResumeCodespaceSessionsAsync`) and permission-recovery
+resumes (`TryRecoverPermissionAsync`) use their client references directly, bypassing this method.
+
+**Fail-fast design**: If a codespace group is expected but not connected, throws immediately
+with a diagnostic message rather than silently falling back to the local client.
 
 ---
 
@@ -165,6 +193,25 @@ internal class PendingOrchestration
 | Group deleted | `ClearPendingOrchestration()` |
 | Orchestrator missing | `ClearPendingOrchestration()` |
 | All workers idle | Collect results → synthesize → clear |
+
+### Timestamp Convention: Local Time for Dispatch Filtering
+
+Worker result collection filters messages with `m.Timestamp >= dispatchTime` to avoid picking up
+stale responses from previous dispatches. **Local time (`DateTime.Now`) is used throughout**, not UTC:
+
+- `dispatchTime = DateTime.Now` — set before sending prompts to workers
+- `ChatMessage.Timestamp` uses the parsed event timestamp if present in `LoadHistoryFromDiskAsync`,
+  falling back to `DateTime.Now` when the event has no `timestamp` field
+- `PendingOrchestration.StartedAt` is persisted in UTC, but **converted to local time** on resume:
+  ```csharp
+  var dispatchTimeLocal = pending.StartedAt.Kind == DateTimeKind.Utc
+      ? pending.StartedAt.ToLocalTime()
+      : pending.StartedAt;
+  ```
+
+**Why local time?** All message timestamps in the in-memory `History` and in `events.jsonl` parsing
+use local time. Using UTC for dispatch filtering would cause mismatches and miss valid responses.
+UTC is only used for disk persistence (JSON serialization) — all runtime filtering is local.
 
 ### Resume Flow (`ResumeOrchestrationIfPendingAsync`)
 

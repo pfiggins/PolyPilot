@@ -1507,6 +1507,46 @@ public class MultiAgentRegressionTests
         Assert.Contains("ClearPendingOrchestration", dispatchBlock);
     }
 
+    [Fact]
+    public void SavePendingOrchestration_MustAppearBeforeWorkerDispatch()
+    {
+        // SavePendingOrchestration must be called BEFORE ExecuteWorkerAsync / Task.WhenAll
+        // in both orchestrator paths. If the app crashes after workers are dispatched but
+        // before the save, the orchestration state is lost and ResumeOrchestrationIfPendingAsync
+        // has no record to resume from. See issue #517.
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs"));
+
+        // Non-reflect path (SendViaOrchestratorAsync): SavePendingOrchestration before ExecuteWorkerAsync
+        // Bound the search to the dispatch block to avoid matching the method definition or other call sites.
+        var phase3 = source.IndexOf("Phase 3: Dispatch tasks to workers");
+        Assert.True(phase3 >= 0, "Phase 3 marker not found");
+        var dispatchSection = source.Substring(phase3);
+        var sectionEnd = dispatchSection.IndexOf("private async Task<WorkerResult> ExecuteWorkerAsync");
+        Assert.True(sectionEnd >= 0, "ExecuteWorkerAsync method definition not found after Phase 3");
+        var block = dispatchSection.Substring(0, sectionEnd);
+        var savePos = block.IndexOf("SavePendingOrchestration");
+        var dispatchPos = block.IndexOf("ExecuteWorkerAsync");
+        Assert.True(savePos >= 0, "SavePendingOrchestration not found in non-reflect dispatch block");
+        Assert.True(dispatchPos >= 0, "ExecuteWorkerAsync call not found in non-reflect dispatch block");
+        Assert.True(savePos < dispatchPos,
+            $"SavePendingOrchestration (pos {savePos}) must appear before ExecuteWorkerAsync (pos {dispatchPos}) in non-reflect dispatch path");
+
+        // Reflect path (SendViaOrchestratorReflectAsync): SavePendingOrchestration before dispatch
+        // Anchor to the method definition, not the call site, to avoid testing the wrong path.
+        var reflectMethod = source.IndexOf("private async Task SendViaOrchestratorReflectAsync");
+        Assert.True(reflectMethod >= 0, "SendViaOrchestratorReflectAsync method definition not found");
+        var reflectSave = source.IndexOf("SavePendingOrchestration", reflectMethod);
+        Assert.True(reflectSave >= 0, "SavePendingOrchestration not found in reflect path");
+        var reflectExec = source.IndexOf("ExecuteWorkerAsync", reflectMethod);
+        Assert.True(reflectExec >= 0, "ExecuteWorkerAsync not found in reflect path");
+        var reflectWhenAll = source.IndexOf("Task.WhenAll(workerTasks)", reflectMethod);
+        Assert.True(reflectWhenAll >= 0, "Task.WhenAll(workerTasks) not found in reflect path");
+        Assert.True(reflectSave < reflectExec,
+            $"SavePendingOrchestration (pos {reflectSave}) must appear before ExecuteWorkerAsync (pos {reflectExec}) in reflect dispatch path");
+        Assert.True(reflectSave < reflectWhenAll,
+            $"SavePendingOrchestration (pos {reflectSave}) must appear before Task.WhenAll (pos {reflectWhenAll}) in reflect dispatch path");
+    }
+
     private static string GetRepoRoot()
     {
         var dir = AppContext.BaseDirectory;
@@ -1986,6 +2026,34 @@ public class MultiAgentRegressionTests
         // Worker should be cancelled
         await Assert.ThrowsAsync<TaskCanceledException>(() => workerTask);
         Assert.True(workerCancelled);
+    }
+
+    /// <summary>
+    /// INV-O14: The re-resume loop must NOT skip IsProcessing siblings. Their
+    /// CopilotSession is tied to the old client (which was disposed), so the event
+    /// stream is permanently dead. The loop must force-complete them so the orchestrator
+    /// retries immediately rather than waiting 2–5 min for the watchdog.
+    /// </summary>
+    [Fact]
+    public void ReconnectLoop_IsProcessingSiblings_ForceCompletedNotSkipped()
+    {
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+
+        // Find the Task.Run sibling re-resume block
+        var taskRunIdx = source.IndexOf("Re-resume all OTHER non-codespace sessions");
+        Assert.True(taskRunIdx >= 0, "Re-resume loop must exist in SendPromptAsync");
+
+        // Find the IsProcessing check inside that block
+        var blockEnd = source.IndexOf("catch (Exception reEx)", taskRunIdx);
+        Assert.True(blockEnd > taskRunIdx, "Catch block must follow the re-resume loop");
+        var loopBlock = source.Substring(taskRunIdx, blockEnd - taskRunIdx);
+
+        // INV-O14: must NOT use bare 'continue' on IsProcessing — this was the bug
+        Assert.DoesNotContain("if (otherState.Info.IsProcessing) continue;", loopBlock);
+
+        // INV-O14: must call ForceCompleteProcessingAsync for IsProcessing siblings
+        Assert.Contains("ForceCompleteProcessingAsync", loopBlock);
+        Assert.Contains("client-recreated-dead-event-stream", loopBlock);
     }
 
     #endregion

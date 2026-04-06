@@ -438,6 +438,14 @@ public partial class CopilotService
                 copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
             }
 
+            // Clear IsOrphaned BEFORE registering the event handler — the state may have
+            // been marked orphaned by a sibling reconnect failure (e.g., corrupted session
+            // file caused re-resume to fail, setting IsOrphaned=true on this state).
+            // Without this reset, HandleSessionEvent silently drops all events and the
+            // session appears stuck to mobile clients despite the CLI responding normally.
+            // Order matters: reset first so no early SDK replay events (e.g., session.resume
+            // acknowledgment) are dropped by the IsOrphaned guard in HandleSessionEvent.
+            state.IsOrphaned = false;
             // INV-16: Register event handler BEFORE publishing to state —
             // no window where events arrive with no handler. Matches the pattern
             // in sibling reconnect (CopilotService.cs:2766) and worker revival
@@ -557,6 +565,11 @@ public partial class CopilotService
             // Resume any pending orchestration dispatch interrupted by relaunch
             _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
 
+            // Scan for orphaned workers whose results were never synthesized.
+            // This catches the gap where PendingOrchestration was already cleared
+            // (synthesis completed) but the app crashed before workers finished.
+            _ = ScanForOrphanedWorkersAsync(cancellationToken);
+
             // Replay any bridge prompts that arrived during restore
             var bridgeServer = _serviceProvider?.GetService<WsBridgeServer>();
             if (bridgeServer != null)
@@ -574,6 +587,98 @@ public partial class CopilotService
                     catch (Exception ex) { Console.WriteLine($"[BRIDGE] Error draining pending prompts: {ex.Message}"); }
                 });
             }
+        }
+    }
+
+    /// <summary>
+    /// Read-only diagnostic scan for orphaned workers after restore.
+    /// Detects multi-agent workers that completed with responses but whose orchestrator
+    /// is idle and unaware of their results (e.g., app crashed after PendingOrchestration
+    /// was cleared but before synthesis ran).
+    /// </summary>
+    internal async Task ScanForOrphanedWorkersAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            // Brief delay to let ResumeOrchestrationIfPendingAsync claim any pending groups first
+            await Task.Delay(3000, ct).ConfigureAwait(false);
+
+            var groups = SnapshotGroups();
+            var metas = SnapshotSessionMetas();
+
+            // Read once — single global file, doesn't change between iterations
+            var pending = LoadPendingOrchestration();
+
+            foreach (var group in groups)
+            {
+                if (!group.IsMultiAgent) continue;
+
+                ct.ThrowIfCancellationRequested();
+
+                // Skip if there's still a pending orchestration for this group (being handled)
+                if (pending?.GroupId == group.Id) continue;
+
+                var orchestratorMeta = metas.FirstOrDefault(
+                    m => m.GroupId == group.Id && m.Role == MultiAgentRole.Orchestrator);
+                if (orchestratorMeta == null) continue;
+
+                var orchestratorInfo = GetSession(orchestratorMeta.SessionName);
+                if (orchestratorInfo == null || orchestratorInfo.IsProcessing) continue;
+
+                var workerMetas = metas.Where(
+                    m => m.GroupId == group.Id && m.Role == MultiAgentRole.Worker).ToList();
+                if (workerMetas.Count == 0) continue;
+
+                // Snapshot orchestrator history under lock for thread safety
+                ChatMessage[] orchHistory;
+                lock (orchestratorInfo.HistoryLock)
+                    orchHistory = orchestratorInfo.History.ToArray();
+
+                var orchestratorLastAssistant = orchHistory
+                    .LastOrDefault(m => m.Role == "assistant"
+                        && m.MessageType == ChatMessageType.Assistant
+                        && !string.IsNullOrWhiteSpace(m.Content));
+
+                var orphanedWorkers = new List<string>();
+                foreach (var wm in workerMetas)
+                {
+                    var workerInfo = GetSession(wm.SessionName);
+                    if (workerInfo == null || workerInfo.IsProcessing) continue;
+
+                    // Snapshot worker history under lock for thread safety
+                    ChatMessage[] workerHistory;
+                    lock (workerInfo.HistoryLock)
+                        workerHistory = workerInfo.History.ToArray();
+
+                    // Worker has a completed assistant response
+                    var lastAssistant = workerHistory
+                        .LastOrDefault(m => m.Role == "assistant"
+                            && m.MessageType == ChatMessageType.Assistant
+                            && !string.IsNullOrWhiteSpace(m.Content));
+                    if (lastAssistant == null) continue;
+
+                    // Compare against the orchestrator's last assistant synthesis, not any
+                    // trailing system/user message from reconnect or recovery paths.
+                    if (orchestratorLastAssistant == null || lastAssistant.Timestamp > orchestratorLastAssistant.Timestamp)
+                        orphanedWorkers.Add(wm.SessionName);
+                }
+
+                if (orphanedWorkers.Count > 0)
+                {
+                    Debug($"[ORPHAN-WORKER] Group '{group.Name}': {orphanedWorkers.Count} worker(s) " +
+                          $"have unsynthesized results: {string.Join(", ", orphanedWorkers)}");
+
+                    AddOrchestratorSystemMessage(orchestratorMeta.SessionName,
+                        $"⚠️ {orphanedWorkers.Count} worker(s) completed during restart but results " +
+                        $"were not synthesized ({string.Join(", ", orphanedWorkers)}). " +
+                        $"Send a message to re-trigger collection.");
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Debug($"[ORPHAN-WORKER] Scan failed: {ex.Message}");
         }
     }
 

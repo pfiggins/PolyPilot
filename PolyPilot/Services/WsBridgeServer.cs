@@ -356,22 +356,50 @@ public class WsBridgeServer : IDisposable
     /// </summary>
     private async Task DispatchBridgePromptAsync(string sessionName, string message, string? agentMode, CancellationToken ct = default)
     {
-        await _copilot!.InvokeOnUIAsync(async () =>
+        try
         {
-            var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
-            if (orchGroupId != null)
+            await _copilot!.InvokeOnUIAsync(async () =>
             {
-                var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
-                if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
-                    _copilot.StartGroupReflection(orchGroupId, message, orchGroup.MaxReflectIterations ?? 5);
-                Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
-                await _copilot.SendToMultiAgentGroupAsync(orchGroupId, message, ct);
-            }
-            else
+                var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
+                if (orchGroupId != null)
+                {
+                    var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
+                    if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+                        _copilot.StartGroupReflection(orchGroupId, message, orchGroup.MaxReflectIterations ?? 5);
+                    Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
+                    await _copilot.SendToMultiAgentGroupAsync(orchGroupId, message, ct);
+                }
+                else
+                {
+                    await _copilot.SendPromptAsync(sessionName, message, cancellationToken: ct, agentMode: agentMode);
+                }
+            });
+        }
+        catch (SessionBusyException)
+        {
+            // Session is mid-turn — route the busy-handling on the UI thread because
+            // GetOrchestratorGroupId reads Organization.Sessions/Groups (plain List<T>,
+            // UI-thread-only). EnqueueMessage itself is thread-safe but we keep the
+            // entire decision + action atomic on one thread.
+            await _copilot!.InvokeOnUIAsync(() =>
             {
-                await _copilot.SendPromptAsync(sessionName, message, cancellationToken: ct, agentMode: agentMode);
-            }
-        });
+                var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
+                if (orchGroupId != null)
+                {
+                    // Orchestrated sessions route through SendToMultiAgentGroupAsync which has
+                    // its own busy handling; blindly queuing would bypass the orchestration pipeline.
+                    Console.WriteLine($"[WsBridge] Orchestrator '{sessionName}' busy, dropping mobile message (retry manually)");
+                    Broadcast(BridgeMessage.Create(BridgeMessageTypes.ErrorEvent,
+                        new ErrorPayload { SessionName = sessionName, Error = "Session is busy processing a request. Please retry when the current turn completes." }));
+                }
+                else
+                {
+                    Console.WriteLine($"[WsBridge] '{sessionName}' busy, queuing mobile message for next turn");
+                    _copilot.EnqueueMessage(sessionName, message, agentMode: agentMode);
+                }
+                return Task.CompletedTask;
+            });
+        }
     }
 
     public void Stop()
