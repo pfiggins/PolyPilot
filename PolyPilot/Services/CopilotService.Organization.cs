@@ -29,7 +29,22 @@ internal class PendingOrchestration
 
 public partial class CopilotService
 {
-    public event Action<string, OrchestratorPhase, string?>? OnOrchestratorPhaseChanged; // groupId, phase, detail
+    public event Action<string, OrchestratorPhase, string?>? OnOrchestratorPhaseChanged
+    {
+        add => _onOrchestratorPhaseChanged += value;
+        remove => _onOrchestratorPhaseChanged -= value;
+    }
+    private event Action<string, OrchestratorPhase, string?>? _onOrchestratorPhaseChanged;
+
+    /// <summary>
+    /// Fire the phase changed event and track the phase in <c>_orchestratorPhases</c>
+    /// so the bridge can query it for streaming content filtering.
+    /// </summary>
+    private void FireOrchestratorPhaseChanged(string groupId, OrchestratorPhase phase, string? detail)
+    {
+        _orchestratorPhases[groupId] = phase;
+        _onOrchestratorPhaseChanged?.Invoke(groupId, phase, detail);
+    }
 
     /// <summary>Maximum time a single worker is allowed to run before being cancelled.
     /// Set high (60 min) because the smart watchdog (events.jsonl freshness) handles dead
@@ -88,6 +103,23 @@ public partial class CopilotService
     // When a user sends a message while an orchestrator dispatch is running,
     // the message is queued here and drained after the current dispatch completes.
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orchestratorQueuedPrompts = new();
+
+    // Per-group current orchestrator phase — used by the bridge to suppress streaming
+    // of planning/dispatch content to mobile clients (only synthesis is interesting).
+    private readonly ConcurrentDictionary<string, OrchestratorPhase> _orchestratorPhases = new();
+
+    /// <summary>
+    /// Returns true if the session is an orchestrator currently in a non-synthesis phase
+    /// (Planning, Dispatching, WaitingForWorkers). The bridge uses this to suppress
+    /// streaming of @worker blocks and dispatch boilerplate to mobile clients.
+    /// </summary>
+    public bool IsOrchestratorInDispatchPhase(string sessionName)
+    {
+        var groupId = GetOrchestratorGroupId(sessionName);
+        if (groupId == null) return false;
+        return _orchestratorPhases.TryGetValue(groupId, out var phase)
+            && phase is OrchestratorPhase.Planning or OrchestratorPhase.Dispatching or OrchestratorPhase.WaitingForWorkers;
+    }
 
     #region Session Organization (groups, pinning, sorting)
 
@@ -2018,7 +2050,7 @@ public partial class CopilotService
         var workerNames = members.Where(m => m != orchestratorName).ToList();
 
         // Phase 1: Planning — ask orchestrator to analyze and assign tasks
-        InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Planning, null));
+        InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning, null));
 
         var planningPrompt = BuildOrchestratorPlanningPrompt(prompt, workerNames, group?.OrchestratorPrompt, group?.RoutingContext);
         // Enable early dispatch for the non-reflect orchestrator flow too
@@ -2054,6 +2086,9 @@ public partial class CopilotService
                 planResponse = lastMsg.Content;
             }
         }
+        // Tag orchestrator planning messages so the bridge can filter them from mobile view.
+        // These contain @worker blocks and dispatch boilerplate that's unreadable on mobile.
+        TagLastOrchestratorAssistantMessages(orchestratorName, ChatMessageType.OrchestratorDispatch);
 
         // Phase 2: Parse task assignments from orchestrator response.
         // If the orchestrator assigns fewer workers than available, respect that decision —
@@ -2128,13 +2163,16 @@ public partial class CopilotService
         foreach (var a in iterAssignments)
             dispatchedWorkers.Add(a.WorkerName);
 
+        // Tag any nudge/retry planning responses for bridge filtering
+        TagLastOrchestratorAssistantMessages(orchestratorName, ChatMessageType.OrchestratorDispatch);
+
         Debug($"[DISPATCH] Orchestrator assigned {dispatchedWorkers.Count}/{workerNames.Count} workers. Respecting partial assignment.");
 
         var assignments = allAssignments;
 
         // Phase 3: Dispatch tasks to workers in parallel
         Debug($"[DISPATCH] Dispatching {assignments.Count} tasks: {string.Join(", ", assignments.Select(a => a.WorkerName))}");
-        InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Dispatching,
+        InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Dispatching,
             $"Sending tasks to {assignments.Count} worker(s)"));
 
         // Persist dispatch state BEFORE dispatching — if the app is relaunched while
@@ -2150,7 +2188,7 @@ public partial class CopilotService
 
         try
         {
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.WaitingForWorkers, null));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.WaitingForWorkers, null));
 
             Debug($"[DISPATCH] Staggering {assignments.Count} workers with 1s delay");
             var workerTasks = new List<Task<WorkerResult>>();
@@ -2216,7 +2254,7 @@ public partial class CopilotService
             await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
 
             // Phase 4: Synthesize — send worker results back to orchestrator
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Synthesizing,
                 $"Synthesizing {spSuccessCount} result(s)"));
 
             var synthesisPrompt = BuildSynthesisPrompt(prompt, results.ToList());
@@ -2225,7 +2263,7 @@ public partial class CopilotService
         finally
         {
             ClearPendingOrchestration();
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Complete, null));
             var spGroupName = group?.Name ?? groupId;
             var spOrchSessionId = _sessions.TryGetValue(orchestratorName!, out var spOrchState)
                 ? spOrchState.Info.SessionId : null;
@@ -3455,6 +3493,32 @@ public partial class CopilotService
         }
     }
 
+    /// <summary>
+    /// Retroactively tag the most recent assistant messages from an orchestrator session
+    /// with a specific <see cref="ChatMessageType"/>. Used to mark planning/dispatch
+    /// responses as <see cref="ChatMessageType.OrchestratorDispatch"/> so the bridge
+    /// can filter them from mobile view. Tags all trailing assistant messages (the model
+    /// may produce multiple in a single turn due to tool use).
+    /// </summary>
+    private void TagLastOrchestratorAssistantMessages(string sessionName, ChatMessageType type)
+    {
+        var session = GetSession(sessionName);
+        if (session == null) return;
+        lock (session.HistoryLock)
+        {
+            // Walk backwards from the end, tagging assistant messages until we hit a
+            // non-assistant message (user prompt or system message = turn boundary).
+            for (int i = session.History.Count - 1; i >= 0; i--)
+            {
+                var msg = session.History[i];
+                if (msg.Role == "assistant")
+                    msg.MessageType = type;
+                else
+                    break;
+            }
+        }
+    }
+
     #region Orchestration Persistence (relaunch resilience)
 
     private static string? _pendingOrchestrationFile;
@@ -3626,7 +3690,7 @@ public partial class CopilotService
 
         AddOrchestratorSystemMessage(pending.OrchestratorName,
             $"🔄 App restarted — resuming orchestration. Waiting for {pending.WorkerNames.Count} worker(s) to complete...");
-        InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Resuming,
+        InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Resuming,
             $"Waiting for {pending.WorkerNames.Count} worker(s)"));
 
         // Monitor workers in background — poll until all are idle
@@ -3642,7 +3706,7 @@ public partial class CopilotService
                 AddOrchestratorSystemMessage(pending.OrchestratorName,
                     $"⚠️ Failed to resume orchestration: {ex.Message}");
                 ClearPendingOrchestration();
-                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+                InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
             }
         });
     }
@@ -3677,7 +3741,7 @@ public partial class CopilotService
         if (ct.IsCancellationRequested)
         {
             ClearPendingOrchestration();
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
             return;
         }
 
@@ -3764,7 +3828,7 @@ public partial class CopilotService
             Debug($"[DISPATCH] Re-dispatching {unstartedWorkers.Count} unstarted worker(s): {string.Join(", ", unstartedWorkers)}");
             AddOrchestratorSystemMessage(pending.OrchestratorName,
                 $"🔄 Re-dispatching {unstartedWorkers.Count} worker(s) that never started: {string.Join(", ", unstartedWorkers)}");
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Dispatching,
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Dispatching,
                 $"Re-dispatching {unstartedWorkers.Count} worker(s)"));
 
             // BUG FIX: Clear stuck IsProcessing state on workers before re-dispatch.
@@ -3832,14 +3896,14 @@ public partial class CopilotService
             AddOrchestratorSystemMessage(pending.OrchestratorName,
                 "⚠️ No worker responses available after restart — orchestration aborted.");
             ClearPendingOrchestration();
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
             return;
         }
 
         // Phase: Synthesize
         AddOrchestratorSystemMessage(pending.OrchestratorName,
             $"✅ Collected {successCount}/{results.Count} worker response(s) — sending synthesis to orchestrator...");
-        InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Synthesizing, "Resumed"));
+        InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Synthesizing, "Resumed"));
 
         try
         {
@@ -3871,7 +3935,7 @@ public partial class CopilotService
                 }
                 ClearPendingOrchestration();
                 SaveOrganization();
-                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+                InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
                 return;
             }
 
@@ -3895,7 +3959,7 @@ public partial class CopilotService
                     ClearPendingOrchestration();
 
                     var members = GetMultiAgentGroupMembers(pending.GroupId);
-                    InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Planning, "Resumed"));
+                    InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Planning, "Resumed"));
                     await SendViaOrchestratorReflectAsync(pending.GroupId, members, pending.OriginalPrompt, ct);
                     return; // reflect loop handles completion
                 }
@@ -3911,7 +3975,7 @@ public partial class CopilotService
                 await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
                 await SendPromptAsync(pending.OrchestratorName, followUpSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
                 Debug($"[DISPATCH] Resume follow-up synthesis sent to '{pending.OrchestratorName}'");
-                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+                InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
                 return;
             }
         }
@@ -3923,7 +3987,7 @@ public partial class CopilotService
         }
 
         ClearPendingOrchestration();
-        InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(pending.GroupId, OrchestratorPhase.Complete, null));
+        InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
     }
 
     #endregion
@@ -4467,7 +4531,7 @@ public partial class CopilotService
 
             // Phase 1: Plan (first iteration) or Re-plan (subsequent)
             var iterDetail = $"Iteration {reflectState.CurrentIteration}/{reflectState.MaxIterations}";
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Planning, iterDetail));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning, iterDetail));
 
             string planPrompt;
             if (reflectState.CurrentIteration == 1)
@@ -4522,6 +4586,8 @@ public partial class CopilotService
                     planResponse = lastMsg.Content;
                 }
             }
+            // Tag orchestrator planning messages so the bridge can filter them from mobile view
+            TagLastOrchestratorAssistantMessages(orchestratorName, ChatMessageType.OrchestratorDispatch);
 
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
@@ -4639,7 +4705,7 @@ public partial class CopilotService
                 continue;
 
             // Phase 2-3: Dispatch + Collect
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Dispatching,
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Dispatching,
                 $"Sending tasks to {assignments.Count} worker(s) — {iterDetail}"));
 
             // Persist dispatch state for relaunch resilience
@@ -4654,7 +4720,7 @@ public partial class CopilotService
                 ReflectIteration = reflectState.CurrentIteration
             });
 
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.WaitingForWorkers, iterDetail));
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.WaitingForWorkers, iterDetail));
 
             // Stagger workers with 1s delay (matching non-reflect dispatch path)
             var workerTasks = new List<Task<WorkerResult>>();
@@ -4721,7 +4787,7 @@ public partial class CopilotService
             await WaitForSessionIdleAsync(orchestratorName, ct);
 
             // Phase 4: Synthesize + Evaluate
-            InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Synthesizing,
                 $"Synthesizing {successCount} result(s) — {iterDetail}"));
 
             var synthEvalPrompt = BuildSynthesisWithEvalPrompt(prompt, results.ToList(), reflectState,
@@ -4752,7 +4818,7 @@ public partial class CopilotService
                 }
 
                 // Send to evaluator for independent scoring
-                InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing,
+                InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Synthesizing,
                     $"Evaluating quality — {iterDetail}"));
                 var evalOnlyPrompt = BuildEvaluatorPrompt(prompt, synthesisResponse, reflectState);
                 var evalResponse = await SendPromptAndWaitAsync(evaluatorName, evalOnlyPrompt, ct, originalPrompt: prompt);
@@ -4973,7 +5039,7 @@ public partial class CopilotService
             var completionSummary = reflectState.BuildCompletionSummary();
             InvokeOnUI(() =>
             {
-                OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, completionSummary);
+                FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Complete, completionSummary);
                 OnStateChanged?.Invoke();
             });
 

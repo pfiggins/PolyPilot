@@ -375,6 +375,9 @@ public static class SettingsRegistry
         AddBridgeFilterToggle(list, "bridge.filterReflection", "Hide Reflection",
             "Filter out reflection/evaluation messages.",
             ChatMessageType.Reflection, order: 85);
+        AddBridgeFilterToggle(list, "bridge.filterOrchestratorDispatch", "Hide Orchestrator Dispatch",
+            "Filter out orchestrator planning/dispatch responses (@worker blocks, task assignments).",
+            ChatMessageType.OrchestratorDispatch, order: 86);
 
         // ── Developer ───────────────────────────────────────────────
 

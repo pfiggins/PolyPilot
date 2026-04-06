@@ -11,7 +11,8 @@ public enum ChatMessageType
     ShellOutput,
     Diff,
     Reflection,
-    Image
+    Image,
+    OrchestratorDispatch
 }
 
 public class ChatMessage

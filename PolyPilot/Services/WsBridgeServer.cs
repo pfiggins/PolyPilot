@@ -42,7 +42,8 @@ public class WsBridgeServer : IDisposable
     private volatile HashSet<ChatMessageType> _filteredTypes = new()
     {
         ChatMessageType.System, ChatMessageType.ToolCall, ChatMessageType.Reasoning,
-        ChatMessageType.ShellOutput, ChatMessageType.Diff, ChatMessageType.Reflection
+        ChatMessageType.ShellOutput, ChatMessageType.Diff, ChatMessageType.Reflection,
+        ChatMessageType.OrchestratorDispatch
     };
     private const int OrgStateDebounceMs = 2000;
 
@@ -218,8 +219,14 @@ public class WsBridgeServer : IDisposable
         _orgStateDebounce = new Timer(_ => BroadcastOrganizationState(), null, Timeout.Infinite, Timeout.Infinite);
         _copilot.OnStateChanged += () => DebouncedBroadcastState();
         _copilot.OnContentReceived += (session, content) =>
+        {
+            // Suppress orchestrator planning/dispatch content from mobile clients.
+            // Only synthesis responses are interesting on mobile — @worker blocks are unreadable.
+            if (IsBridgeFiltered(ChatMessageType.OrchestratorDispatch) && _copilot.IsOrchestratorInDispatchPhase(session))
+                return;
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ContentDelta,
                 new ContentDeltaPayload { SessionName = session, Content = content }));
+        };
         _copilot.OnToolStarted += (session, tool, callId, input) =>
         {
             if (IsBridgeFiltered(ChatMessageType.ToolCall)) return;
