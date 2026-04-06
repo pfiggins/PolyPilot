@@ -263,13 +263,15 @@ Do task B.
     }
 
     [Fact]
-    public void ParseTaskAssignments_SameLineTask_SkipsEmptyTask()
+    public void ParseTaskAssignments_SameLineTask_ExtractsCorrectly()
     {
-        // When the task is on the same line as @worker:, the regex captures it as part of the name
-        // and the task body is empty — should be skipped
+        // When the task is on the same line as @worker:, the second pass should
+        // split the name from the task body using available worker list.
         var response = "@worker:team-worker-1 Do this task right now.\n@end";
         var result = CopilotService.ParseTaskAssignments(response, new List<string> { "team-worker-1" });
-        Assert.Empty(result);
+        Assert.Single(result);
+        Assert.Equal("team-worker-1", result[0].WorkerName);
+        Assert.Contains("Do this task right now", result[0].Task);
     }
 
     [Fact]

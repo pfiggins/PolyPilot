@@ -2443,6 +2443,7 @@ public partial class CopilotService
         // Fall back to @worker:name...@end regex parsing
         var assignments = new List<TaskAssignment>();
         var pattern = @"@worker:([^\n]+?)\s*\n([\s\S]*?)(?:@end|(?=@worker:)|$)";
+        var resolvedPositions = new HashSet<int>(); // positions where first pass produced an assignment
 
         foreach (Match match in Regex.Matches(orchestratorResponse, pattern, RegexOptions.IgnoreCase))
         {
@@ -2460,9 +2461,61 @@ public partial class CopilotService
 
             var resolved = ResolveWorkerName(workerName, availableWorkers);
             if (resolved != null)
+            {
                 assignments.Add(new TaskAssignment(resolved, task));
+                resolvedPositions.Add(match.Index);
+            }
         }
+
+        // Second pass: find @worker: lines NOT successfully resolved by the multi-line regex.
+        // This handles single-line blocks like "@worker:name task text@end" or
+        // "@worker:name task text" (no newline between name and task body).
+        var singleLinePattern = @"@worker:([^\n]+?)(?:\s*@end|\s*$)";
+        foreach (Match match in Regex.Matches(orchestratorResponse, singleLinePattern, RegexOptions.IgnoreCase | RegexOptions.Multiline))
+        {
+            // Skip if the first pass already produced a successful assignment at this position
+            if (resolvedPositions.Contains(match.Index))
+                continue;
+
+            var lineText = match.Groups[1].Value.Trim().Trim('`', '\'', '"');
+            if (string.IsNullOrEmpty(lineText)) continue;
+
+            // Try to split "name task-text" using the available worker list
+            var split = TrySplitWorkerNameFromTask(lineText, availableWorkers);
+            if (split != null && !string.IsNullOrEmpty(split.Value.Task))
+                assignments.Add(new TaskAssignment(split.Value.Worker, split.Value.Task));
+        }
+
         return assignments;
+    }
+
+    /// <summary>
+    /// When the orchestrator puts the task description on the @worker: line itself,
+    /// the name capture may contain "reviewer-2 Continue with the cherry-pick task...".
+    /// Try progressively shorter prefixes of the captured text as the worker name,
+    /// returning the remainder as the task body.
+    /// </summary>
+    internal static (string Worker, string Task)? TrySplitWorkerNameFromTask(string nameText, List<string> availableWorkers)
+    {
+        var parts = nameText.Split(' ');
+        if (parts.Length <= 1) return null;
+
+        // Iterate shortest prefix first so we match the actual worker name
+        // before ResolveWorkerName's internal progressive-prefix can match
+        // an overly-long candidate and leave too little as the task body.
+        for (int len = 1; len < parts.Length; len++)
+        {
+            var candidateName = string.Join(' ', parts.Take(len));
+            if (string.IsNullOrEmpty(candidateName)) continue;
+
+            var resolved = ResolveWorkerName(candidateName, availableWorkers);
+            if (resolved != null)
+            {
+                var taskBody = string.Join(' ', parts.Skip(len)).Trim();
+                return (resolved, taskBody);
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -2577,7 +2630,11 @@ public partial class CopilotService
         if (mentioned.Count == 0 || mentioned.Count == resolved.Count) return;
 
         var resolvedNames = new HashSet<string>(resolved.Select(r => r.WorkerName), StringComparer.OrdinalIgnoreCase);
-        var unresolved = mentioned.Where(n => ResolveWorkerName(n, availableWorkers) == null || !resolvedNames.Contains(ResolveWorkerName(n, availableWorkers)!)).ToList();
+        var unresolved = mentioned.Where(n =>
+        {
+            var r = ResolveWorkerName(n, availableWorkers);
+            return r == null || !resolvedNames.Contains(r);
+        }).ToList();
         if (unresolved.Count > 0)
         {
             Debug($"[DISPATCH] '{orchestratorName}' had {unresolved.Count} unresolved @worker name(s): [{string.Join(", ", unresolved)}]. Available: [{string.Join(", ", availableWorkers)}]");
