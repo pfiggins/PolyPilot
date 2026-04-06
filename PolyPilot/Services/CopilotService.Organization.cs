@@ -1775,10 +1775,11 @@ public partial class CopilotService
                 Debug($"[DISPATCH] Reflect orchestrator busy for group '{group.Name}' — queuing prompt");
                 var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
                 queue.Enqueue(prompt);
+                SaveQueuedPrompts();
                 if (orchestratorName != null)
                 {
                     AddOrchestratorSystemMessage(orchestratorName,
-                        $"📨 New message queued (will be sent to orchestrator during next iteration): {prompt}");
+                        $"📨 New message queued (will be processed as a new request after current iteration cycle completes): {prompt}");
                 }
                 return;
             }
@@ -3504,6 +3505,97 @@ public partial class CopilotService
     internal static PendingOrchestration? LoadPendingOrchestrationForTest() => LoadPendingOrchestration();
     internal static void ClearPendingOrchestrationForTest() => ClearPendingOrchestration();
 
+    // --- Queued prompt persistence (survive restarts) ---
+    private static string? _queuedPromptsFile;
+    private static string QueuedPromptsFile { get { lock (_pathLock) return _queuedPromptsFile ??= Path.Combine(PolyPilotBaseDir, "queued-prompts.json"); } }
+
+    /// <summary>
+    /// Persist queued user prompts to disk so they survive app restarts.
+    /// Called when a prompt is queued during an active reflection loop.
+    /// </summary>
+    private void SaveQueuedPrompts()
+    {
+        try
+        {
+            var all = new Dictionary<string, List<string>>();
+            foreach (var kvp in _reflectQueuedPrompts)
+            {
+                var items = kvp.Value.ToArray();
+                if (items.Length > 0) all[kvp.Key] = items.ToList();
+            }
+            if (all.Count == 0)
+            {
+                ClearQueuedPrompts();
+                return;
+            }
+            Directory.CreateDirectory(PolyPilotBaseDir);
+            var json = JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true });
+            var tmp = QueuedPromptsFile + ".tmp";
+            File.WriteAllText(tmp, json);
+            File.Move(tmp, QueuedPromptsFile, overwrite: true);
+            Debug($"[DISPATCH] Saved {all.Values.Sum(v => v.Count)} queued prompt(s) for {all.Count} group(s)");
+        }
+        catch (Exception ex)
+        {
+            Debug($"[DISPATCH] Failed to save queued prompts: {ex.Message}");
+        }
+    }
+
+    private static Dictionary<string, List<string>>? LoadQueuedPrompts()
+    {
+        try
+        {
+            if (!File.Exists(QueuedPromptsFile)) return null;
+            var json = File.ReadAllText(QueuedPromptsFile);
+            return JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json);
+        }
+        catch { return null; }
+    }
+
+    private static void ClearQueuedPrompts()
+    {
+        try { if (File.Exists(QueuedPromptsFile)) File.Delete(QueuedPromptsFile); } catch { }
+    }
+
+    /// <summary>
+    /// After session restore, replay any queued prompts that were persisted before a restart.
+    /// These are user messages that were submitted while an orchestration loop was active.
+    /// </summary>
+    internal async Task ReplayQueuedPromptsIfAnyAsync(CancellationToken ct = default)
+    {
+        var saved = LoadQueuedPrompts();
+        if (saved == null || saved.Count == 0) return;
+        ClearQueuedPrompts();
+
+        foreach (var (groupId, prompts) in saved)
+        {
+            var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId && g.IsMultiAgent);
+            if (group == null)
+            {
+                Debug($"[DISPATCH] Queued prompts for group '{groupId}' — group no longer exists, discarding {prompts.Count} prompt(s)");
+                continue;
+            }
+            var orchestratorName = GetOrchestratorSession(groupId);
+            Debug($"[DISPATCH] Replaying {prompts.Count} queued prompt(s) for group '{group.Name}'");
+            if (orchestratorName != null)
+                AddOrchestratorSystemMessage(orchestratorName,
+                    $"📨 Replaying {prompts.Count} queued message(s) from before restart...");
+
+            foreach (var prompt in prompts)
+            {
+                try
+                {
+                    Debug($"[DISPATCH] Replaying queued prompt through orchestration pipeline (len={prompt.Length})");
+                    await SendToMultiAgentGroupAsync(groupId, prompt, ct);
+                }
+                catch (Exception ex)
+                {
+                    Debug($"[DISPATCH] Failed to replay queued prompt: {ex.Message}");
+                }
+            }
+        }
+    }
+
     /// <summary>
     /// After session restore, check for a pending orchestration dispatch that was interrupted
     /// by an app relaunch. If found, monitor workers and auto-synthesize when all complete.
@@ -4353,31 +4445,24 @@ public partial class CopilotService
                   $"(IsActive={reflectState.IsActive}, IsPaused={reflectState.IsPaused})");
 
             // Drain any user prompts queued while the loop was busy (e.g., waiting for workers).
-            // These are sent to the orchestrator's SDK session so the model sees them.
-            // If the model responds with @worker blocks, merge them into this iteration's assignments.
-            // Meta-questions (about routing, orchestration behavior) are answered directly — no dispatch.
-            var queuedAssignments = new List<TaskAssignment>();
+            // DON'T process them mid-iteration — that would absorb user requests into the current
+            // iteration context and the user would never see a dedicated response. Instead, move
+            // them to leftoverPrompts so they're dispatched as fresh orchestration requests after
+            // the reflection cycle completes. The finally block + leftover delivery (below the loop)
+            // handles this correctly.
             if (_reflectQueuedPrompts.TryGetValue(groupId, out var promptQueue))
             {
                 while (promptQueue.TryDequeue(out var queuedPrompt))
                 {
-                    Debug($"[DISPATCH] Draining queued prompt for '{orchestratorName}' (len={queuedPrompt.Length})");
-                    var queuedResponse = await SendPromptAndWaitAsync(orchestratorName,
-                        $"[User sent a new message while you were working]\n\n{queuedPrompt}\n\n" +
-                        "[If this is a question about YOUR orchestration/routing behavior, answer it directly without @worker blocks. " +
-                        "Only create @worker blocks if the user is requesting actual work to be done.]",
-                        ct, originalPrompt: queuedPrompt);
-                    var parsed = ParseTaskAssignments(queuedResponse, workerNames);
-                    if (parsed.Count > 0)
+                    Debug($"[DISPATCH] Moving queued prompt to leftoverPrompts for post-loop delivery (len={queuedPrompt.Length})");
+                    leftoverPrompts.Add(queuedPrompt);
+                    if (orchestratorName != null)
                     {
-                        Debug($"[DISPATCH] Queued prompt response contained {parsed.Count} @worker assignments");
-                        queuedAssignments.AddRange(parsed);
-                    }
-                    else
-                    {
-                        Debug($"[DISPATCH] Queued prompt response had no @worker blocks — orchestrator answered directly (len={queuedResponse.Length})");
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            $"📨 Queued message received — will be processed as a new request after current iteration cycle completes.");
                     }
                 }
+                SaveQueuedPrompts(); // Clear persisted queue now that prompts are in leftoverPrompts
             }
 
             // Phase 1: Plan (first iteration) or Re-plan (subsequent)
@@ -4524,13 +4609,13 @@ public partial class CopilotService
                     var allAccountedFor = allAttempted || workerNames.All(w =>
                         attemptedWorkers.Contains(w) ||
                         planResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
-                    if (queuedAssignments.Count == 0 && (allDispatched || allAccountedFor))
+                    if (allDispatched || allAccountedFor)
                     {
                         reflectState.GoalMet = true;
                         AddOrchestratorSystemMessage(orchestratorName, $"✅ Orchestrator completed without delegation (iteration {reflectState.CurrentIteration}).");
                         break;
                     }
-                    if (!allDispatched && !allAccountedFor && queuedAssignments.Count == 0)
+                    if (!allDispatched && !allAccountedFor)
                     {
                         // Not all workers dispatched or accounted for — filter remaining
                         // workers to only those relevant to the task (not the full set).
@@ -4547,20 +4632,6 @@ public partial class CopilotService
                         // Fall through to dispatch below
                     }
                     // Fall through to merge and dispatch queued work
-                }
-            }
-
-            // Merge any @worker assignments from queued prompt responses
-            if (queuedAssignments.Count > 0)
-            {
-                var extra = DeduplicateAssignments(queuedAssignments);
-                foreach (var a in extra)
-                {
-                    var existing = assignments.FirstOrDefault(x => string.Equals(x.WorkerName, a.WorkerName, StringComparison.OrdinalIgnoreCase));
-                    if (existing != null)
-                        assignments[assignments.IndexOf(existing)] = new TaskAssignment(existing.WorkerName, existing.Task + "\n\n---\n\n" + a.Task);
-                    else
-                        assignments.Add(a);
                 }
             }
 
@@ -4938,27 +5009,26 @@ public partial class CopilotService
         }
 
         // Fire-and-forget: deliver leftover prompts after semaphore is released.
-        // Route through SendToMultiAgentGroupAsync so full orchestration pipeline runs
-        // (worker dispatch, reflection loop). The semaphore is released so this won't deadlock.
+        // Route each through SendToMultiAgentGroupAsync so it gets a full orchestration cycle
+        // (planning, worker dispatch, synthesis). Each user message is a distinct request and
+        // deserves its own dedicated response — don't combine them.
         if (leftoverPrompts.Count > 0)
         {
             var gId = groupId;
             SafeFireAndForget(Task.Run(async () =>
             {
-                // Combine multiple leftovers into a single prompt to avoid starting
-                // separate orchestration cycles for each queued message.
-                var combined = leftoverPrompts.Count == 1
-                    ? leftoverPrompts[0]
-                    : string.Join("\n\n---\n\n", leftoverPrompts);
-
-                try
+                Debug($"[DISPATCH] Delivering {leftoverPrompts.Count} queued user message(s) as new orchestration request(s)");
+                foreach (var leftover in leftoverPrompts)
                 {
-                    Debug($"[DISPATCH] Sending {leftoverPrompts.Count} leftover prompt(s) through orchestration pipeline (len={combined.Length})");
-                    await SendToMultiAgentGroupAsync(gId, combined);
-                }
-                catch (Exception ex)
-                {
-                    Debug($"[DISPATCH] Failed to send leftover prompts via orchestration: {ex.Message}");
+                    try
+                    {
+                        Debug($"[DISPATCH] Sending queued user message through orchestration pipeline (len={leftover.Length})");
+                        await SendToMultiAgentGroupAsync(gId, leftover);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug($"[DISPATCH] Failed to send queued user message via orchestration: {ex.Message}");
+                    }
                 }
             }), "leftover-prompt-delivery");
         }

@@ -565,6 +565,10 @@ public partial class CopilotService
             // Resume any pending orchestration dispatch interrupted by relaunch
             _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
 
+            // Replay any user prompts that were queued during an active reflection loop
+            // but not yet delivered before the app restarted
+            _ = ReplayQueuedPromptsIfAnyAsync(cancellationToken);
+
             // Scan for orphaned workers whose results were never synthesized.
             // This catches the gap where PendingOrchestration was already cleared
             // (synthesis completed) but the app crashed before workers finished.
