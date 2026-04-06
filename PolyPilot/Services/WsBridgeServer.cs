@@ -1098,7 +1098,20 @@ public class WsBridgeServer : IDisposable
                     var maReq = msg.GetPayload<MultiAgentBroadcastPayload>();
                     if (maReq != null && _copilot != null)
                     {
-                        _ = _copilot.SendToMultiAgentGroupAsync(maReq.GroupId, maReq.Message, ct);
+                        // Queue prompts that arrive during session restore (same as SendMessage handler)
+                        if (_copilot.IsRestoring)
+                        {
+                            // Route through orchestrator session so DrainPendingPromptsAsync dispatches correctly
+                            var orchName = _copilot.GetOrchestratorSession(maReq.GroupId);
+                            _pendingBridgePrompts.Enqueue(new PendingBridgePrompt(orchName ?? maReq.GroupId, maReq.Message, null));
+                            Console.WriteLine($"[BRIDGE] Queued multi-agent prompt for group '{maReq.GroupId}' during restore ({_pendingBridgePrompts.Count} pending)");
+                            break;
+                        }
+                        _ = Task.Run(async () =>
+                        {
+                            try { await _copilot.SendToMultiAgentGroupAsync(maReq.GroupId, maReq.Message, ct); }
+                            catch (Exception ex) { Console.WriteLine($"[WsBridge] MultiAgentBroadcast error for group '{maReq.GroupId}': {ex.Message}"); }
+                        });
                     }
                     break;
 

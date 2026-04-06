@@ -1766,6 +1766,23 @@ public partial class CopilotService
                 return;
             }
         }
+        else if (group.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+        {
+            if (!dispatchLock.Wait(0))
+            {
+                // Reflect orchestrator is busy — queue to the reflect prompt queue
+                var orchestratorName = GetOrchestratorSession(groupId);
+                Debug($"[DISPATCH] Reflect orchestrator busy for group '{group.Name}' — queuing prompt");
+                var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+                queue.Enqueue(prompt);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"📨 New message queued (will be sent to orchestrator during next iteration): {prompt}");
+                }
+                return;
+            }
+        }
         else
         {
             await dispatchLock.WaitAsync(cancellationToken);
@@ -1808,14 +1825,15 @@ public partial class CopilotService
                 break; // success — exit retry loop
             }
             catch (OperationCanceledException) { throw; }
-            catch (Exception ex) when (dispatchAttempt < maxDispatchRetries && IsConnectionError(ex))
+            catch (Exception ex) when (dispatchAttempt < maxDispatchRetries && (IsConnectionError(ex) || IsSessionBusyError(ex)))
             {
-                Debug($"[DISPATCH] Connection error during dispatch (attempt {dispatchAttempt + 1}/{maxDispatchRetries + 1}): {ex.GetType().Name}: {ex.Message}");
+                Debug($"[DISPATCH] Retryable error during dispatch (attempt {dispatchAttempt + 1}/{maxDispatchRetries + 1}): {ex.GetType().Name}: {ex.Message}");
                 var orchestratorName = GetOrchestratorSession(groupId);
                 if (orchestratorName != null)
                 {
+                    var reason = IsSessionBusyError(ex) ? "Session busy" : "Connection error";
                     AddOrchestratorSystemMessage(orchestratorName,
-                        $"⚡ Connection error during dispatch — retrying in {dispatchRetryDelayMs / 1000}s (attempt {dispatchAttempt + 2}/{maxDispatchRetries + 1})...");
+                        $"⚡ {reason} during dispatch — retrying in {dispatchRetryDelayMs / 1000}s (attempt {dispatchAttempt + 2}/{maxDispatchRetries + 1})...");
                 }
 
                 // Wait for the system to stabilize before retrying. The failed send triggers
@@ -1842,6 +1860,19 @@ public partial class CopilotService
             catch (Exception ex)
             {
                 Debug($"[DISPATCH] SendToMultiAgentGroupAsync FAILED: {ex.GetType().Name}: {ex.Message}");
+                // Last resort: queue the message so it's not lost entirely
+                var orchestratorName = GetOrchestratorSession(groupId);
+                if (group.OrchestratorMode is MultiAgentMode.Orchestrator or MultiAgentMode.OrchestratorReflect)
+                {
+                    var targetQueue = group.OrchestratorMode == MultiAgentMode.OrchestratorReflect
+                        ? _reflectQueuedPrompts : _orchestratorQueuedPrompts;
+                    targetQueue.GetOrAdd(groupId, _ => new ConcurrentQueue<string>()).Enqueue(prompt);
+                    if (orchestratorName != null)
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            $"⚠️ Dispatch failed ({ex.GetType().Name}) — message queued for retry on next dispatch.");
+                    Debug($"[DISPATCH] Message queued for retry after failure: {ex.Message}");
+                    return; // don't throw — message is safely queued
+                }
                 throw;
             }
         }
