@@ -1671,6 +1671,24 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Returns the orchestrator group ID if the given session is ANY member (orchestrator or worker)
+    /// of an active orchestrator/orchestratorReflect group. Used by the bridge to redirect
+    /// worker-targeted messages through the orchestrator dispatch pipeline.
+    /// Also returns the orchestrator session name for logging/routing.
+    /// </summary>
+    public (string? GroupId, string? OrchestratorName) GetOrchestratorGroupIdForMember(string sessionName)
+    {
+        var meta = GetSessionMeta(sessionName);
+        if (meta?.GroupId == null) return (null, null);
+        var group = Organization.Groups.FirstOrDefault(g => g.Id == meta.GroupId);
+        if (group is not { IsMultiAgent: true }) return (null, null);
+        if (group.OrchestratorMode != MultiAgentMode.Orchestrator && group.OrchestratorMode != MultiAgentMode.OrchestratorReflect) return (null, null);
+        var orchSession = GetOrchestratorSession(group.Id);
+        if (orchSession == null) return (null, null);
+        return (group.Id, orchSession);
+    }
+
+    /// <summary>
     /// Safety net: detect orchestrator responses with @worker blocks that were sent via SendPromptAsync
     /// (bypassing the multi-agent dispatch pipeline) and dispatch the orphaned worker assignments.
     /// This catches race conditions where the dispatch routing in Dashboard.razor or Events.cs
@@ -5183,25 +5201,40 @@ public partial class CopilotService
         // Route each through SendToMultiAgentGroupAsync so it gets a full orchestration cycle
         // (planning, worker dispatch, synthesis). Each user message is a distinct request and
         // deserves its own dedicated response — don't combine them.
+        // IMPORTANT: Post to UI thread (not Task.Run) because SendToMultiAgentGroupAsync reads
+        // Organization.Sessions/Groups which are plain List<T> — not thread-safe from thread pool.
+        // The post executes after the current call stack returns to the message pump, which is
+        // after dispatchLock.Release() in SendToMultiAgentGroupAsync's finally block.
         if (leftoverPrompts.Count > 0)
         {
             var gId = groupId;
-            SafeFireAndForget(Task.Run(async () =>
+            var orchMode = group?.OrchestratorMode;
+            var maxIter = group?.MaxReflectIterations ?? 5;
+            InvokeOnUI(() =>
             {
-                Debug($"[DISPATCH] Delivering {leftoverPrompts.Count} queued user message(s) as new orchestration request(s)");
-                foreach (var leftover in leftoverPrompts)
+                async Task DeliverLeftoversAsync()
                 {
-                    try
+                    Debug($"[DISPATCH] Delivering {leftoverPrompts.Count} queued user message(s) as new orchestration request(s)");
+                    foreach (var leftover in leftoverPrompts)
                     {
-                        Debug($"[DISPATCH] Sending queued user message through orchestration pipeline (len={leftover.Length})");
-                        await SendToMultiAgentGroupAsync(gId, leftover);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug($"[DISPATCH] Failed to send queued user message via orchestration: {ex.Message}");
+                        try
+                        {
+                            Debug($"[DISPATCH] Sending queued user message through orchestration pipeline (len={leftover.Length})");
+                            // Re-activate reflect state so the leftover goes through the proper
+                            // reflect loop instead of falling back to SendViaOrchestratorAsync
+                            // (which falls to SendBroadcastAsync if GetOrchestratorSession returns null).
+                            if (orchMode == MultiAgentMode.OrchestratorReflect)
+                                StartGroupReflection(gId, leftover, maxIter);
+                            await SendToMultiAgentGroupAsync(gId, leftover);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug($"[DISPATCH] Failed to send queued user message via orchestration: {ex.Message}");
+                        }
                     }
                 }
-            }), "leftover-prompt-delivery");
+                SafeFireAndForget(DeliverLeftoversAsync(), "leftover-prompt-delivery");
+            });
         }
     }
 

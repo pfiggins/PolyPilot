@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using PolyPilot.Models;
 using PolyPilot.Services;
 
@@ -672,5 +673,123 @@ Review the implementation.
         Assert.Equal(2, result.Count);
         Assert.Contains(result, a => a.WorkerName == "team-srdev-1");
         Assert.Contains(result, a => a.WorkerName == "team-reviewer-1");
+    }
+
+    // --- GetOrchestratorGroupIdForMember (bridge worker routing) ---
+
+    private static CopilotService CreateServiceWithOrg(Action<OrganizationState> configure)
+    {
+        var svc = new CopilotService(
+            new StubChatDatabase(),
+            new StubServerManager(),
+            new StubWsBridgeClient(),
+            new RepoManager(),
+            new Microsoft.Extensions.DependencyInjection.ServiceCollection().BuildServiceProvider(),
+            new StubDemoService());
+        configure(svc.Organization);
+        return svc;
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsGroupForOrchestrator()
+    {
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.OrchestratorReflect });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-orch", GroupId = "g1", Role = MultiAgentRole.Orchestrator });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-worker", GroupId = "g1", Role = MultiAgentRole.Worker });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("team-orch");
+        Assert.Equal("g1", groupId);
+        Assert.Equal("team-orch", orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsGroupForWorker()
+    {
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.OrchestratorReflect });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-orch", GroupId = "g1", Role = MultiAgentRole.Orchestrator });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-worker", GroupId = "g1", Role = MultiAgentRole.Worker });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("team-worker");
+        Assert.Equal("g1", groupId);
+        Assert.Equal("team-orch", orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsNullForNonGroupSession()
+    {
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.OrchestratorReflect });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-orch", GroupId = "g1", Role = MultiAgentRole.Orchestrator });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("standalone-session");
+        Assert.Null(groupId);
+        Assert.Null(orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsNullForBroadcastGroup()
+    {
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.Broadcast });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-a", GroupId = "g1" });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-b", GroupId = "g1" });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("team-a");
+        Assert.Null(groupId);
+        Assert.Null(orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsNullForNonMultiAgentGroup()
+    {
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Solo", IsMultiAgent = false });
+            org.Sessions.Add(new SessionMeta { SessionName = "solo-session", GroupId = "g1" });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("solo-session");
+        Assert.Null(groupId);
+        Assert.Null(orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupIdForMember_ReturnsNullWhenNoOrchestrator()
+    {
+        // Group has orchestrator mode but no session with Orchestrator role
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.Orchestrator });
+            org.Sessions.Add(new SessionMeta { SessionName = "worker-1", GroupId = "g1", Role = MultiAgentRole.Worker });
+        });
+
+        var (groupId, orchName) = svc.GetOrchestratorGroupIdForMember("worker-1");
+        Assert.Null(groupId);
+        Assert.Null(orchName);
+    }
+
+    [Fact]
+    public void GetOrchestratorGroupId_StillReturnsNullForWorker()
+    {
+        // Verify backward compat: GetOrchestratorGroupId still only returns for the orchestrator itself
+        var svc = CreateServiceWithOrg(org =>
+        {
+            org.Groups.Add(new SessionGroup { Id = "g1", Name = "Team", IsMultiAgent = true, OrchestratorMode = MultiAgentMode.OrchestratorReflect });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-orch", GroupId = "g1", Role = MultiAgentRole.Orchestrator });
+            org.Sessions.Add(new SessionMeta { SessionName = "team-worker", GroupId = "g1", Role = MultiAgentRole.Worker });
+        });
+
+        Assert.Equal("g1", svc.GetOrchestratorGroupId("team-orch"));
+        Assert.Null(svc.GetOrchestratorGroupId("team-worker"));
     }
 }

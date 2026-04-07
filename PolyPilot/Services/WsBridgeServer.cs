@@ -33,6 +33,11 @@ public class WsBridgeServer : IDisposable
     private readonly SemaphoreSlim _drainLock = new(1, 1);
     private record PendingBridgePrompt(string SessionName, string Message, string? AgentMode);
 
+    // Deduplication for orchestrator group dispatches — prevents blast-dispatch when
+    // the mobile client sends the same message to all group members individually.
+    private readonly ConcurrentDictionary<string, (string Message, long Ticks)> _recentGroupDispatches = new();
+    private const long GroupDispatchDedupeWindowTicks = 5 * TimeSpan.TicksPerSecond;
+
     // Debounce timers to prevent flooding mobile clients during streaming
     private Timer? _sessionsListDebounce;
     private Timer? _orgStateDebounce;
@@ -367,13 +372,32 @@ public class WsBridgeServer : IDisposable
         {
             await _copilot!.InvokeOnUIAsync(async () =>
             {
-                var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
+                // Check if session is ANY member of an orchestrator group (not just the orchestrator).
+                // This prevents blast-dispatch when the mobile client sends the same message to
+                // all group members individually instead of routing through the orchestrator.
+                var (orchGroupId, orchName) = _copilot.GetOrchestratorGroupIdForMember(sessionName);
                 if (orchGroupId != null)
                 {
+                    // Deduplicate: if the same message was dispatched to this group recently, drop it.
+                    // This prevents N identical orchestration cycles when the phone sends to N members.
+                    var now = DateTime.UtcNow.Ticks;
+                    if (_recentGroupDispatches.TryGetValue(orchGroupId, out var recent)
+                        && recent.Message == message
+                        && (now - recent.Ticks) < GroupDispatchDedupeWindowTicks)
+                    {
+                        Console.WriteLine($"[WsBridge] Deduplicating message to group '{orchGroupId}' via '{sessionName}' (same message sent {(now - recent.Ticks) / TimeSpan.TicksPerMillisecond}ms ago)");
+                        return;
+                    }
+                    _recentGroupDispatches[orchGroupId] = (message, now);
+
+                    if (sessionName != orchName)
+                        Console.WriteLine($"[WsBridge] Redirecting worker '{sessionName}' message through orchestrator '{orchName}' (group={orchGroupId})");
+                    else
+                        Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
+
                     var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
                     if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
                         _copilot.StartGroupReflection(orchGroupId, message, orchGroup.MaxReflectIterations ?? 5);
-                    Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
                     await _copilot.SendToMultiAgentGroupAsync(orchGroupId, message, ct);
                 }
                 else
@@ -385,17 +409,17 @@ public class WsBridgeServer : IDisposable
         catch (SessionBusyException)
         {
             // Session is mid-turn — route the busy-handling on the UI thread because
-            // GetOrchestratorGroupId reads Organization.Sessions/Groups (plain List<T>,
+            // GetOrchestratorGroupIdForMember reads Organization.Sessions/Groups (plain List<T>,
             // UI-thread-only). EnqueueMessage itself is thread-safe but we keep the
             // entire decision + action atomic on one thread.
             await _copilot!.InvokeOnUIAsync(() =>
             {
-                var orchGroupId = _copilot.GetOrchestratorGroupId(sessionName);
+                var (orchGroupId, orchName) = _copilot.GetOrchestratorGroupIdForMember(sessionName);
                 if (orchGroupId != null)
                 {
-                    // Orchestrated sessions route through SendToMultiAgentGroupAsync which has
-                    // its own busy handling; blindly queuing would bypass the orchestration pipeline.
-                    Console.WriteLine($"[WsBridge] Orchestrator '{sessionName}' busy, dropping mobile message (retry manually)");
+                    // Any orchestrator group member that's busy means orchestration is in progress.
+                    // Drop silently — the active orchestration handles the routing.
+                    Console.WriteLine($"[WsBridge] Orchestrator group member '{sessionName}' busy, dropping mobile message (group={orchGroupId})");
                     Broadcast(BridgeMessage.Create(BridgeMessageTypes.ErrorEvent,
                         new ErrorPayload { SessionName = sessionName, Error = "Session is busy processing a request. Please retry when the current turn completes." }));
                 }
