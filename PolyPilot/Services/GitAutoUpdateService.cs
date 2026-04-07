@@ -195,10 +195,26 @@ public class GitAutoUpdateService : IDisposable
                         }
                         catch (Exception mergeEx)
                         {
-                            // Merge had conflicts — abort and let the user resolve manually
-                            _logger.LogWarning(mergeEx, "Merge of upstream/main had conflicts — aborting");
+                            _logger.LogWarning(mergeEx, "Merge of {Remote}/main had conflicts — attempting auto-resolution", updateRemote);
+                            _status = $"Resolving merge conflicts with {updateRemote}/main...";
+                            NotifyChanged();
+
+                            if (await TryResolveConflictsAsync(updateRemote))
+                            {
+                                try
+                                {
+                                    await RunGit("push origin main --quiet");
+                                    _logger.LogInformation("Fork merged (with conflict resolution) and pushed to origin");
+                                }
+                                catch (Exception pushEx)
+                                {
+                                    _logger.LogWarning(pushEx, "Merge succeeded but push to origin failed");
+                                }
+                                goto rebuild;
+                            }
+
                             try { await RunGit("merge --abort"); } catch { }
-                            _status = $"Merge conflict with {updateRemote}/main — resolve manually and restart";
+                            _status = $"Merge conflict with {updateRemote}/main — auto-resolve failed, resolve manually and restart";
                             NotifyChanged();
                             return;
                         }
@@ -292,6 +308,153 @@ public class GitAutoUpdateService : IDisposable
             Interlocked.Exchange(ref _checking, 0);
         }
     }
+
+    private async Task<bool> TryResolveConflictsAsync(string updateRemote)
+    {
+        try
+        {
+            var conflictOutput = (await RunGit("diff --name-only --diff-filter=U", throwOnError: false)).Trim();
+            if (string.IsNullOrEmpty(conflictOutput))
+            {
+                _logger.LogWarning("Merge reported conflicts but no unmerged files found");
+                return false;
+            }
+
+            var conflictedFiles = conflictOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            _logger.LogInformation("Auto-resolving {Count} conflicted file(s): {Files}", conflictedFiles.Length, string.Join(", ", conflictedFiles));
+
+            foreach (var file in conflictedFiles)
+            {
+                _logger.LogInformation("Resolving conflict in {File}", file);
+
+                var localCommits = (await RunGit($"log --oneline {updateRemote}/main..HEAD -- \"{file}\"", throwOnError: false)).Trim();
+                if (string.IsNullOrEmpty(localCommits))
+                {
+                    _logger.LogInformation("  No local commits touched {File} — accepting theirs", file);
+                    await RunGit($"checkout --theirs \"{file}\"");
+                    await RunGit($"add \"{file}\"");
+                    continue;
+                }
+
+                _logger.LogInformation("  {File} has local modifications — resolving hunks", file);
+                if (!ResolveConflictedFile(file))
+                {
+                    _logger.LogWarning("  Failed to auto-resolve {File}", file);
+                    return false;
+                }
+
+                await RunGit($"add \"{file}\"");
+            }
+
+            await RunGit("commit --no-edit");
+            _logger.LogInformation("Merge commit created after auto-resolving all conflicts");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Auto-conflict resolution failed");
+            return false;
+        }
+    }
+
+    private bool ResolveConflictedFile(string relativeFilePath)
+    {
+        var fullPath = Path.Combine(_gitRoot!, relativeFilePath);
+        try
+        {
+            var content = File.ReadAllText(fullPath);
+            var resolved = ResolveConflictMarkers(content);
+            if (resolved is null)
+                return false;
+
+            File.WriteAllText(fullPath, resolved);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error reading/writing conflicted file {File}", relativeFilePath);
+            return false;
+        }
+    }
+
+    private string? ResolveConflictMarkers(string content)
+    {
+        var result = new System.Text.StringBuilder(content.Length);
+        var remaining = content.AsSpan();
+
+        while (true)
+        {
+            var markerStart = remaining.IndexOf("<<<<<<< ");
+            if (markerStart < 0)
+            {
+                result.Append(remaining);
+                break;
+            }
+
+            result.Append(remaining[..markerStart]);
+            remaining = remaining[markerStart..];
+
+            var separatorIdx = remaining.IndexOf("\n=======\n");
+            if (separatorIdx < 0)
+            {
+                _logger.LogWarning("Could not find ======= separator in conflict hunk");
+                return null;
+            }
+
+            var endMarkerPrefix = "\n>>>>>>> ";
+            var endIdx = remaining[(separatorIdx + 1)..].IndexOf(endMarkerPrefix);
+            if (endIdx < 0)
+            {
+                _logger.LogWarning("Could not find >>>>>>> end marker in conflict hunk");
+                return null;
+            }
+            endIdx += separatorIdx + 1;
+
+            var endLineBreak = remaining[(endIdx + endMarkerPrefix.Length)..].IndexOf('\n');
+            int hunkEnd;
+            if (endLineBreak < 0)
+                hunkEnd = remaining.Length;
+            else
+                hunkEnd = endIdx + endMarkerPrefix.Length + endLineBreak + 1;
+
+            var firstNewline = remaining.IndexOf('\n');
+            var oursBlock = remaining[(firstNewline + 1)..separatorIdx].ToString();
+            var theirsBlock = remaining[(separatorIdx + "\n=======\n".Length)..endIdx].ToString();
+
+            var oursNorm = NormalizeWhitespace(oursBlock);
+            var theirsNorm = NormalizeWhitespace(theirsBlock);
+
+            string resolved;
+            if (oursNorm == theirsNorm)
+            {
+                _logger.LogDebug("  Hunk: identical (whitespace-normalized) — keeping theirs");
+                resolved = theirsBlock;
+            }
+            else if (theirsNorm.Contains(oursNorm, StringComparison.Ordinal) && oursNorm.Length > 0)
+            {
+                _logger.LogDebug("  Hunk: ours is subset of theirs — keeping theirs");
+                resolved = theirsBlock;
+            }
+            else if (oursNorm.Contains(theirsNorm, StringComparison.Ordinal) && theirsNorm.Length > 0)
+            {
+                _logger.LogDebug("  Hunk: theirs is subset of ours — keeping ours");
+                resolved = oursBlock;
+            }
+            else
+            {
+                _logger.LogDebug("  Hunk: true divergence — combining theirs then ours");
+                resolved = theirsBlock + "\n\n" + oursBlock;
+            }
+
+            result.Append(resolved);
+            remaining = remaining[hunkEnd..];
+        }
+
+        return result.ToString();
+    }
+
+    private static string NormalizeWhitespace(string s) =>
+        System.Text.RegularExpressions.Regex.Replace(s.Trim(), @"\s+", " ");
 
     private async Task<string> RunGit(string args, bool throwOnError = true)
     {

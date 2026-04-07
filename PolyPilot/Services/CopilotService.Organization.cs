@@ -2139,22 +2139,50 @@ public partial class CopilotService
 
             if (iterAssignments.Count == 0)
             {
-                // Still nothing after nudge — force a second nudge reminding it MUST delegate
-                Debug($"[DISPATCH] No assignments after nudge. Sending final delegation reminder.");
-                var finalNudge = "You MUST delegate this task to at least one worker using @worker:name...@end blocks. You cannot do it yourself. Pick the most relevant worker and assign the task now.";
-                var finalResponse = await SendPromptAndWaitAsync(orchestratorName, finalNudge, cancellationToken, originalPrompt: prompt);
-                iterAssignments = DeduplicateAssignments(ParseTaskAssignments(finalResponse, workerNames), dispatchedWorkers);
-                Debug($"[DISPATCH] Final nudge parsed: {iterAssignments.Count} assignments.");
+                if (nudgeResponse.Length == 0 || planResponse.Length == 0)
+                {
+                    // Empty response = communication disrupted (reconnect storm, force-complete).
+                    // Retry the full planning prompt now that the reconnect has settled.
+                    Debug($"[DISPATCH] Nudge returned empty ({nudgeResponse.Length} chars) and plan was {planResponse.Length} chars — likely reconnect disruption. Retrying full planning prompt.");
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        "🔄 Orchestrator responses were disrupted (possible reconnect). Retrying planning...");
+                    if (_sessions.TryGetValue(orchestratorName, out var reconnRetryState))
+                        reconnRetryState.EarlyDispatchOnWorkerBlocks = true;
+                    var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+                    await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
+                    if (_sessions.TryGetValue(orchestratorName, out var reconnRetryPostIdle))
+                    {
+                        var lastRetryMsg = reconnRetryPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
+                        if (lastRetryMsg != null && lastRetryMsg.Content.Length > reconnRetryResponse.Length)
+                            reconnRetryResponse = lastRetryMsg.Content;
+                    }
+                    iterAssignments = DeduplicateAssignments(ParseTaskAssignments(reconnRetryResponse, workerNames), dispatchedWorkers);
+                    Debug($"[DISPATCH] Reconnect-retry parsed: {iterAssignments.Count} assignments. Response length={reconnRetryResponse.Length}");
+                    if (iterAssignments.Count > 0)
+                    {
+                        planResponse = reconnRetryResponse;
+                    }
+                }
 
                 if (iterAssignments.Count == 0)
                 {
-                    // All nudges failed — use charter-based relevance matching instead
-                    // of giving up entirely.
-                    var relevant = SelectRelevantWorkers(prompt, workerNames);
-                    Debug($"[DISPATCH] All nudges failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
-                    AddOrchestratorSystemMessage(orchestratorName,
-                        $"⚡ Orchestrator could not delegate. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
-                    iterAssignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
+                    // Still nothing after nudge/retry — force a second nudge reminding it MUST delegate
+                    Debug($"[DISPATCH] No assignments after nudge. Sending final delegation reminder.");
+                    var finalNudge = "You MUST delegate this task to at least one worker using @worker:name...@end blocks. You cannot do it yourself. Pick the most relevant worker and assign the task now.";
+                    var finalResponse = await SendPromptAndWaitAsync(orchestratorName, finalNudge, cancellationToken, originalPrompt: prompt);
+                    iterAssignments = DeduplicateAssignments(ParseTaskAssignments(finalResponse, workerNames), dispatchedWorkers);
+                    Debug($"[DISPATCH] Final nudge parsed: {iterAssignments.Count} assignments.");
+
+                    if (iterAssignments.Count == 0)
+                    {
+                        // All nudges failed — use charter-based relevance matching instead
+                        // of giving up entirely.
+                        var relevant = SelectRelevantWorkers(prompt, workerNames);
+                        Debug($"[DISPATCH] All nudges failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            $"⚡ Orchestrator could not delegate. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
+                        iterAssignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
+                    }
                 }
             }
         }
@@ -4676,12 +4704,49 @@ public partial class CopilotService
                             assignments = DeduplicateAssignments(nudgeAssignments);
                             // Fall through to dispatch below
                         }
+                        else if (nudgeResponse.Length == 0 || planResponse.Length == 0)
+                        {
+                            // Empty response = communication disrupted (reconnect storm, force-complete).
+                            // Retry the full planning prompt now that the reconnect has settled, rather
+                            // than falling through to SelectRelevantWorkers which blast-dispatches to
+                            // many/all workers with no orchestrator guidance.
+                            Debug($"[DISPATCH] Nudge returned empty ({nudgeResponse.Length} chars) and plan was {planResponse.Length} chars — likely reconnect disruption. Retrying full planning prompt.");
+                            AddOrchestratorSystemMessage(orchestratorName,
+                                "🔄 Orchestrator responses were disrupted (possible reconnect). Retrying planning...");
+                            if (_sessions.TryGetValue(orchestratorName, out var reconnRetryState))
+                                reconnRetryState.EarlyDispatchOnWorkerBlocks = true;
+                            var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                            await WaitForSessionIdleAsync(orchestratorName, ct);
+                            if (_sessions.TryGetValue(orchestratorName, out var reconnRetryPostIdle))
+                            {
+                                var lastRetryMsg = reconnRetryPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
+                                if (lastRetryMsg != null && lastRetryMsg.Content.Length > reconnRetryResponse.Length)
+                                    reconnRetryResponse = lastRetryMsg.Content;
+                            }
+                            var reconnRetryAssignments = ParseTaskAssignments(reconnRetryResponse, workerNames);
+                            Debug($"[DISPATCH] '{orchestratorName}' reconnect-retry parsed: {reconnRetryAssignments.Count} raw assignments. Response length={reconnRetryResponse.Length}");
+                            if (reconnRetryAssignments.Count > 0)
+                            {
+                                assignments = DeduplicateAssignments(reconnRetryAssignments);
+                                planResponse = reconnRetryResponse;
+                            }
+                            else
+                            {
+                                // Retry also failed — fall through to SelectRelevantWorkers as last resort
+                                var relevant = SelectRelevantWorkers(prompt, workerNames);
+                                Debug($"[DISPATCH] Reconnect-retry also failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
+                                AddOrchestratorSystemMessage(orchestratorName,
+                                    $"⚡ Orchestrator could not delegate after retry. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
+                                assignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
+                            }
+                        }
                         else
                         {
-                            // Nudge also failed — use charter-based relevance matching to pick
-                            // only workers suited to this task (not the entire team).
+                            // Nudge returned a real response but with no @worker blocks —
+                            // the orchestrator genuinely refused to delegate. Use charter-based
+                            // relevance matching to pick only workers suited to this task.
                             var relevant = SelectRelevantWorkers(prompt, workerNames);
-                            Debug($"[DISPATCH] Nudge failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
+                            Debug($"[DISPATCH] Nudge failed (non-empty response), targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
                             AddOrchestratorSystemMessage(orchestratorName,
                                 $"⚡ Orchestrator refused to delegate after nudge. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
                             assignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
