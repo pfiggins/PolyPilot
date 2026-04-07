@@ -950,6 +950,30 @@ This matters for IDLE-DEFER because after an app restart, there will be no
 `session.idle` replay — the watchdog and resume logic handle completion detection
 for interrupted sessions, not idle event replay.
 
+### Bug: Blast-dispatch when phone sends to all group members
+
+**Symptom**: When user sends a message from phone to the orchestrator, ALL 19
+sessions get `[SEND]` entries within 14ms. Workers receive direct prompts instead
+of orchestrated tasks. 18 `SessionBusyException` errors follow 2s later from a
+second wave.
+
+**Root cause**: The mobile client sends the user's message to ALL group sessions
+individually (19 separate `send_prompt` messages). The bridge's
+`GetOrchestratorGroupId()` only returns non-null for the orchestrator session
+itself — worker messages bypass orchestration and go through direct
+`SendPromptAsync`, blast-dispatching everyone.
+
+**Fix (3 parts)**:
+1. `GetOrchestratorGroupIdForMember()` — returns group ID for ANY member
+   (orchestrator or worker), not just the orchestrator
+2. Bridge deduplication — same message to same group within 5s is dropped
+3. Leftover prompt delivery uses `InvokeOnUI` instead of `Task.Run` for thread
+   safety, re-activates reflect state via `StartGroupReflection`
+
+**Key invariant**: Worker messages from the bridge MUST be redirected through the
+orchestrator dispatch pipeline, never sent directly to workers in orchestrator
+groups.
+
 ---
 
 ## "Fix with Copilot" — Multi-Agent Awareness
