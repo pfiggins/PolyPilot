@@ -4494,6 +4494,11 @@ public partial class CopilotService
         // Access is sequential (single async flow, no concurrent modification).
         var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // When the orchestrator writes @worker blocks in its synthesis response, we parse
+        // and carry them forward to the next iteration so they're dispatched immediately
+        // instead of being lost (the synthesis prompt encourages this but the system
+        // previously discarded them, causing wasted re-plan iterations).
+        List<TaskAssignment>? carryOverAssignments = null;
 
         try
         {
@@ -4530,7 +4535,25 @@ public partial class CopilotService
             }
 
             // Phase 1: Plan (first iteration) or Re-plan (subsequent)
+            // If the previous synthesis response contained @worker blocks, skip re-planning
+            // and dispatch those assignments directly — the orchestrator already decided what
+            // to dispatch next, so asking it again just causes confusion and wasted iterations.
             var iterDetail = $"Iteration {reflectState.CurrentIteration}/{reflectState.MaxIterations}";
+            List<TaskAssignment> assignments;
+            string planResponse;
+
+            if (carryOverAssignments != null && carryOverAssignments.Count > 0)
+            {
+                assignments = carryOverAssignments;
+                carryOverAssignments = null;
+                planResponse = "(carry-over from synthesis)";
+                Debug($"[DISPATCH] Using {assignments.Count} carry-over assignment(s) from previous synthesis — skipping re-plan");
+                AddOrchestratorSystemMessage(orchestratorName,
+                    $"📋 Dispatching {assignments.Count} task(s) from previous synthesis — {iterDetail}");
+                InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning, iterDetail));
+            }
+            else
+            {
             InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning, iterDetail));
 
             string planPrompt;
@@ -4549,7 +4572,7 @@ public partial class CopilotService
             if (_sessions.TryGetValue(orchestratorName, out var orchState))
                 orchState.EarlyDispatchOnWorkerBlocks = true;
 
-            var planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+            var planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
 
             // Dead connection detection: watchdog killed with 0 SDK events means the
             // server-side session is broken (common after user abort). ResumeSessionAsync
@@ -4569,7 +4592,7 @@ public partial class CopilotService
                     // Re-enable early dispatch on the fresh session
                     if (_sessions.TryGetValue(orchestratorName, out var freshState))
                         freshState.EarlyDispatchOnWorkerBlocks = true;
-                    planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                    planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
                 }
             }
 
@@ -4580,19 +4603,20 @@ public partial class CopilotService
             if (_sessions.TryGetValue(orchestratorName, out var orchPostIdle))
             {
                 var lastMsg = orchPostIdle.Info.History.LastOrDefault(m => m.Role == "assistant");
-                if (lastMsg != null && lastMsg.Content.Length > planResponse.Length)
+                if (lastMsg != null && lastMsg.Content.Length > planResponseRaw.Length)
                 {
-                    Debug($"[DISPATCH] Post-idle response is longer than early dispatch response ({lastMsg.Content.Length} vs {planResponse.Length}) — using full response");
-                    planResponse = lastMsg.Content;
+                    Debug($"[DISPATCH] Post-idle response is longer than early dispatch response ({lastMsg.Content.Length} vs {planResponseRaw.Length}) — using full response");
+                    planResponseRaw = lastMsg.Content;
                 }
             }
             // Tag orchestrator planning messages so the bridge can filter them from mobile view
             TagLastOrchestratorAssistantMessages(orchestratorName, ChatMessageType.OrchestratorDispatch);
 
+            planResponse = planResponseRaw;
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
             LogUnresolvedWorkerNames(planResponse, rawAssignments, workerNames, orchestratorName);
-            var assignments = DeduplicateAssignments(rawAssignments);
+            assignments = DeduplicateAssignments(rawAssignments);
 
             if (assignments.Count == 0)
             {
@@ -4700,6 +4724,7 @@ public partial class CopilotService
                     // Fall through to merge and dispatch queued work
                 }
             }
+            } // end of planning else block
 
             if (assignments.Count == 0)
                 continue;
@@ -4939,6 +4964,21 @@ public partial class CopilotService
                     var selfScore = synthesisResponse.Contains("[[NEEDS_ITERATION]]", StringComparison.OrdinalIgnoreCase) ? 0.4 : 0.7;
                     reflectState.RecordEvaluation(reflectState.CurrentIteration, selfScore,
                         reflectState.LastEvaluation ?? "", GetEffectiveModel(orchestratorName));
+                }
+            }
+
+            // Check if the synthesis response contains @worker blocks for the next iteration.
+            // The synthesis prompt encourages this (e.g., "Revised @worker blocks for the next
+            // iteration"), but previously these blocks were stripped by ExtractIterationEvaluation
+            // and never dispatched — causing the orchestrator to waste iterations re-planning
+            // work it already decided on. Now we carry them forward.
+            if (!reflectState.GoalMet)
+            {
+                var synthAssignments = ParseTaskAssignments(synthesisResponse, workerNames);
+                if (synthAssignments.Count > 0)
+                {
+                    carryOverAssignments = DeduplicateAssignments(synthAssignments);
+                    Debug($"[DISPATCH] Synthesis contained {carryOverAssignments.Count} @worker block(s) — carrying forward to next iteration");
                 }
             }
 
