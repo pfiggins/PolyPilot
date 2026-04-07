@@ -1581,20 +1581,9 @@ public partial class CopilotService
               $"(responseLen={state.CurrentResponse.Length}, flushedLen={state.FlushedResponse.Length}, thread={Environment.CurrentManagedThreadId})");
         
         CancelProcessingWatchdog(state);
-        // Also cancel any pending TurnEnd→Idle fallback — CompleteResponse is now executing
-        CancelTurnEndFallback(state);
-        CancelToolHealthCheck(state);
-        Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-        Interlocked.Exchange(ref state.SendingFlag, 0);
-        state.HasUsedToolsThisTurn = false;
-        ClearDeferredIdleTracking(state);
-        state.IsReconnectedSend = false; // Clear reconnect flag on turn completion (defense-in-depth)
         state.FallbackCanceledByTurnStart = false;
-        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-        Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
-        Interlocked.Exchange(ref state.EventCountThisTurn, 0);
-        Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
-        state.Info.IsResumed = false; // Clear after first successful turn
+        // Per-turn tracking fields (ActiveToolCallCount, HasUsedToolsThisTurn, etc.)
+        // are cleared by ClearProcessingState below. No need to clear them early.
         var response = state.CurrentResponse.ToString();
         var responseAlreadyFlushedThisTurn = WasResponseAlreadyFlushedThisTurn(state, response);
         if (!string.IsNullOrWhiteSpace(response))
@@ -1640,29 +1629,18 @@ public partial class CopilotService
         // Clear IsProcessing BEFORE completing the TCS — if the continuation runs
         // synchronously (e.g., in orchestrator reflection loops), the next SendPromptAsync
         // call must see IsProcessing=false or it throws "already processing".
-        state.CurrentResponse.Clear();
-        state.FlushedResponse.Clear();
-        ClearFlushedReplayDedup(state);
-        state.PendingReasoningMessages.Clear();
-        // Accumulate API time before clearing ProcessingStartedAt
-        if (state.Info.ProcessingStartedAt is { } started)
-        {
-            state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - started).TotalSeconds;
-            state.Info.PremiumRequestsUsed++;
-        }
-        state.AllowTurnStartRearm = true; // session.idle/turn-end completion can be premature; allow one late TurnStart recovery
-        state.Info.IsProcessing = false;
-        state.Info.IsResumed = false;
-        Interlocked.Exchange(ref state.SendingFlag, 0); // Release atomic send lock
-        state.Info.ConsecutiveStuckCount = 0;
-        // A successful completion proves the server is healthy — reset the
+        ClearProcessingState(state);
+        // Success-only: allow EVT-REARM to re-arm IsProcessing if a late TurnStart arrives
+        // (premature session.idle recovery). This must be set AFTER ClearProcessingState to
+        // avoid the race where a background TurnStart thread reads AllowTurnStartRearm=true
+        // before error/abort callers can override it back to false.
+        state.AllowTurnStartRearm = true;
+        // Success-only: a successful completion proves the server is healthy — reset the
         // service-level watchdog timeout counter to prevent false recovery triggers.
         Interlocked.Exchange(ref _consecutiveWatchdogTimeouts, 0);
-        state.Info.ProcessingStartedAt = null;
-        state.Info.ToolCallCount = 0;
-        state.Info.ProcessingPhase = 0;
-        state.Info.ClearPermissionDenials();
-        state.Info.LastUpdatedAt = DateTime.Now;
+        // Success-only: a successful response proves the session is not stuck — reset the
+        // per-session consecutive stuck counter so the >= 3 threshold can re-accumulate.
+        state.Info.ConsecutiveStuckCount = 0;
         state.ResponseCompletion?.TrySetResult(fullResponse);
         
         // Fire completion notification BEFORE OnStateChanged — this ensures
@@ -2337,7 +2315,6 @@ public partial class CopilotService
         if (state.IsOrphaned) return;
         CancelToolHealthCheck(state);
         CancelProcessingWatchdog(state);
-        CancelTurnEndFallback(state);
 
         var activeTools = Volatile.Read(ref state.ActiveToolCallCount);
         var recoveryGeneration = Interlocked.Read(ref state.ProcessingGeneration);
@@ -2352,16 +2329,8 @@ public partial class CopilotService
 
             OnError?.Invoke(sessionName, $"Tool execution stuck ({reason}). Session recovered automatically.");
 
-            // Full cleanup mirroring CompleteResponse — missing fields here caused stuck sessions
-            Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-            state.HasUsedToolsThisTurn = false;
-            ClearDeferredIdleTracking(state);
             state.FallbackCanceledByTurnStart = false;
-            Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
             Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
-            Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
-            Interlocked.Exchange(ref state.EventCountThisTurn, 0);
-            Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
 
             // Build full response: flushed mid-turn text + remaining current text
             var response = state.CurrentResponse.ToString();
@@ -2371,18 +2340,11 @@ public partial class CopilotService
                     : state.FlushedResponse + "\n\n" + response)
                 : response;
 
-            state.CurrentResponse.Clear();
-            state.FlushedResponse.Clear();
-            state.PendingReasoningMessages.Clear();
-
-            state.Info.IsProcessing = false;
+            // Accumulate API time but don't count as premium request (recovery, not success)
+            if (state.Info.ProcessingStartedAt is { } healthStarted)
+                state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - healthStarted).TotalSeconds;
+            ClearProcessingState(state, accumulateApiTime: false);
             state.AllowTurnStartRearm = false; // Explicit tool-health recovery should stay completed
-            state.Info.IsResumed = false;
-            Interlocked.Exchange(ref state.SendingFlag, 0);
-            state.Info.ProcessingStartedAt = null;
-            state.Info.ToolCallCount = 0;
-            state.Info.ProcessingPhase = 0;
-            state.Info.ClearPermissionDenials();
 
             state.ResponseCompletion?.TrySetResult(fullResponse);
 
@@ -2961,33 +2923,19 @@ public partial class CopilotService
                             return;
                         }
                         CancelProcessingWatchdog(state);
-                        CancelToolHealthCheck(state);
-                        Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                        state.HasUsedToolsThisTurn = false;
-                        ClearDeferredIdleTracking(state);
-                        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-                        Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
-                        Interlocked.Exchange(ref state.EventCountThisTurn, 0);
-                        Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
-                        // Cancel any pending TurnEnd→Idle fallback
-                        CancelTurnEndFallback(state);
-                        state.Info.IsResumed = false;
-                        state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on termination
                         // Flush any accumulated partial response before clearing processing state.
                         // Wrapped in try-catch: if flush fails, IsProcessing MUST still be cleared
                         // (otherwise the session is permanently stuck — the watchdog has already exited).
                         try { FlushCurrentResponse(state); }
                         catch (Exception flushEx) { Debug($"[WATCHDOG] '{sessionName}' flush failed during kill: {flushEx.Message}"); }
                         Debug($"[WATCHDOG] '{sessionName}' IsProcessing=false — watchdog timeout after {totalProcessingSeconds:F0}s total, elapsed={elapsed:F0}s, exceededMaxTime={exceededMaxTime}");
-                        state.Info.IsProcessing = false;
-                        state.AllowTurnStartRearm = false; // Watchdog timeout is an explicit forced stop
-                        Interlocked.Exchange(ref state.SendingFlag, 0);
+                        // Capture flushed response BEFORE ClearProcessingState clears it
+                        var watchdogResponse = state.FlushedResponse.ToString();
+                        // Accumulate API time (request was in-flight) but don't count as premium request
                         if (state.Info.ProcessingStartedAt is { } wdStarted)
                             state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - wdStarted).TotalSeconds;
-                        state.Info.ProcessingStartedAt = null;
-                        state.Info.ToolCallCount = 0;
-                        state.Info.ProcessingPhase = 0;
-                        state.Info.ClearPermissionDenials(); // INV-1: clear on all termination paths
+                        ClearProcessingState(state, accumulateApiTime: false);
+                        state.AllowTurnStartRearm = false; // Watchdog timeout is an explicit forced stop
                         state.Info.ConsecutiveStuckCount++;
                         // Track service-level consecutive watchdog timeouts. When the
                         // persistent server's auth token expires, ALL sessions hang silently.
@@ -3024,9 +2972,6 @@ public partial class CopilotService
                             // into a session that's in a repeated-stuck cycle.
                             state.Info.MessageQueue.Clear();
                         }
-                        var watchdogResponse = state.FlushedResponse.ToString();
-                        state.FlushedResponse.Clear();
-                        state.PendingReasoningMessages.Clear();
                         state.ResponseCompletion?.TrySetResult(watchdogResponse);
                         // Fire completion notification so orchestrator loops are unblocked (INV-O4)
                         OnSessionComplete?.Invoke(sessionName, "[Watchdog] timeout");
@@ -3058,28 +3003,15 @@ public partial class CopilotService
                     // Best-effort flush before clearing processing state
                     try { FlushCurrentResponse(state); }
                     catch { /* Flush failure must not prevent IsProcessing cleanup */ }
-                    // INV-1: clear IsProcessing and all 9 companion fields
-                    state.Info.IsProcessing = false;
+                    // Capture response BEFORE ClearProcessingState clears it
+                    var crashResponse = state.FlushedResponse.ToString() + state.CurrentResponse.ToString();
+                    // Accumulate API time but don't count as premium request
+                    if (state.Info.ProcessingStartedAt is { } crashStarted)
+                        state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - crashStarted).TotalSeconds;
+                    ClearProcessingState(state, accumulateApiTime: false);
                     state.AllowTurnStartRearm = false; // Watchdog crash cleanup is terminal for this turn
-                    state.Info.IsResumed = false;
-                    Interlocked.Exchange(ref state.SendingFlag, 0);
-                    Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                    state.HasUsedToolsThisTurn = false;
-                    ClearDeferredIdleTracking(state);
-                    Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-                    Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
-                    Interlocked.Exchange(ref state.EventCountThisTurn, 0);
-                    Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
-                    state.Info.ProcessingStartedAt = null;
-                    state.Info.ToolCallCount = 0;
-                    state.Info.ProcessingPhase = 0;
-                    state.Info.ClearPermissionDenials();
                     state.Info.ConsecutiveStuckCount++;
                     Interlocked.Increment(ref _consecutiveWatchdogTimeouts);
-                    var crashResponse = state.FlushedResponse.ToString() + state.CurrentResponse.ToString();
-                    state.FlushedResponse.Clear();
-                    state.CurrentResponse.Clear();
-                    state.PendingReasoningMessages.Clear();
                     state.ResponseCompletion?.TrySetResult(crashResponse);
                     OnSessionComplete?.Invoke(sessionName, "[Watchdog] crash recovery");
                     OnError?.Invoke(sessionName, "Internal error in session monitoring. Try sending your message again.");

@@ -187,10 +187,16 @@ public class ConsecutiveStuckSessionTests
     public void CompleteResponseSource_ResetsConsecutiveStuckCount()
     {
         // Verify CompleteResponse resets the stuck counter on success.
+        // ConsecutiveStuckCount = 0 must only appear in CompleteResponse (success path),
+        // NOT in ClearProcessingState (which would break accumulation on watchdog timeouts).
         var repoRoot = GetRepoRoot();
         var eventsSource = File.ReadAllText(Path.Combine(repoRoot, "PolyPilot", "Services", "CopilotService.Events.cs"));
 
-        Assert.Contains("ConsecutiveStuckCount = 0", eventsSource);
+        // Must be in CompleteResponse
+        var crIdx = eventsSource.IndexOf("private void CompleteResponse(", StringComparison.Ordinal);
+        Assert.True(crIdx >= 0, "CompleteResponse must exist");
+        var crBody = eventsSource.Substring(crIdx, Math.Min(10000, eventsSource.Length - crIdx));
+        Assert.Contains("ConsecutiveStuckCount = 0", crBody);
     }
 
     // =========================================================================

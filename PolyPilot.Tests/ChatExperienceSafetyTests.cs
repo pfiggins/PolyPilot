@@ -1051,9 +1051,9 @@ public class ChatExperienceSafetyTests
         var crIdx = source.IndexOf("private void CompleteResponse(", StringComparison.Ordinal);
         Assert.True(crIdx > 0);
 
-        // Within CompleteResponse, SendingFlag must be cleared (may be 80+ lines into method)
-        var afterCR = source.Substring(crIdx, Math.Min(6000, source.Length - crIdx));
-        Assert.Contains("SendingFlag", afterCR);
+        // CompleteResponse must call ClearProcessingState (which clears SendingFlag along with all other fields)
+        var afterCR = source.Substring(crIdx, Math.Min(10000, source.Length - crIdx));
+        Assert.Contains("ClearProcessingState", afterCR);
     }
 
     /// <summary>
@@ -1245,5 +1245,114 @@ public class ChatExperienceSafetyTests
         var lastDbMsg = _chatDb.AddedMessages.Last();
         Assert.Equal("test-db-session-id", lastDbMsg.SessionId);
         Assert.Contains("Content for database", lastDbMsg.Message.Content);
+    }
+
+    /// <summary>
+    /// PR #531 review finding: ClearProcessingState must NOT set AllowTurnStartRearm=true.
+    /// Only CompleteResponse (normal-completion path) should allow EVT-REARM.
+    /// Error/abort paths must not have a race window where a background TurnStart event
+    /// reads AllowTurnStartRearm=true before the caller can set it back to false.
+    /// </summary>
+    [Fact]
+    public void ClearProcessingState_DoesNotSetAllowTurnStartRearm()
+    {
+        // Structural: ClearProcessingState method body must NOT contain AllowTurnStartRearm = true
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("private void ClearProcessingState(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ClearProcessingState must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Strip comment lines before checking — comments may document the invariant using
+        // the very string we're guarding against appearing in actual code.
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+
+        Assert.False(codeOnly.Contains("AllowTurnStartRearm = true", StringComparison.Ordinal),
+            "ClearProcessingState must NOT set AllowTurnStartRearm=true — only CompleteResponse should, " +
+            "to avoid a race where error/abort paths get it briefly set before they can override to false.");
+    }
+
+    /// <summary>
+    /// PR #531 review finding: _consecutiveWatchdogTimeouts reset must NOT be in
+    /// ClearProcessingState. It is a success-only signal (healthy server) — resetting it
+    /// on error/abort paths defeats the server-recovery detection threshold.
+    /// </summary>
+    [Fact]
+    public void ClearProcessingState_DoesNotResetConsecutiveWatchdogTimeouts()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("private void ClearProcessingState(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ClearProcessingState must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Strip comment lines — comments may reference the counter by name while documenting why it's excluded.
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+
+        Assert.False(codeOnly.Contains("_consecutiveWatchdogTimeouts", StringComparison.Ordinal),
+            "ClearProcessingState must NOT reset _consecutiveWatchdogTimeouts — only CompleteResponse " +
+            "(success path) should, since resetting on error/abort paths defeats server-recovery detection.");
+
+        Assert.False(codeOnly.Contains("ConsecutiveStuckCount", StringComparison.Ordinal),
+            "ClearProcessingState must NOT reset ConsecutiveStuckCount — only CompleteResponse " +
+            "(success path) should, since resetting on watchdog/error paths breaks the >= 3 " +
+            "threshold that stops system message accumulation in repeatedly-stuck sessions.");
+    }
+
+    /// <summary>
+    /// PR #531 review finding: CompleteResponse must set AllowTurnStartRearm=true,
+    /// reset _consecutiveWatchdogTimeouts, and reset ConsecutiveStuckCount after ClearProcessingState.
+    /// </summary>
+    [Fact]
+    public void CompleteResponse_SetsAllowTurnStartRearmAndResetsWatchdogCounter()
+    {
+        var eventsPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Events.cs");
+        var source = File.ReadAllText(eventsPath);
+
+        var methodIdx = source.IndexOf("private void CompleteResponse(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "CompleteResponse must exist");
+        // Use 10000 chars — the method is ~112 lines before AllowTurnStartRearm, ~6400 chars in.
+        var methodBody = source.Substring(methodIdx, Math.Min(10000, source.Length - methodIdx));
+
+        Assert.True(methodBody.Contains("AllowTurnStartRearm = true", StringComparison.Ordinal),
+            "CompleteResponse must explicitly set AllowTurnStartRearm=true after ClearProcessingState");
+        Assert.True(methodBody.Contains("_consecutiveWatchdogTimeouts", StringComparison.Ordinal),
+            "CompleteResponse must reset _consecutiveWatchdogTimeouts on successful completion");
+        Assert.True(methodBody.Contains("ConsecutiveStuckCount = 0", StringComparison.Ordinal),
+            "CompleteResponse must reset ConsecutiveStuckCount on successful completion");
+    }
+
+    /// <summary>
+    /// PR #531 re-review finding: AbortSessionAsync must NOT increment PremiumRequestsUsed.
+    /// User-initiated aborts consumed server resources (API time) but shouldn't count against
+    /// the premium request budget. The call must use accumulateApiTime: false and manually
+    /// accumulate TotalApiTimeSeconds before ClearProcessingState.
+    /// </summary>
+    [Fact]
+    public void AbortSessionAsync_DoesNotIncrementPremiumRequestsViaAccumulateApiTime()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("public async Task AbortSessionAsync(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "AbortSessionAsync must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // The abort path must call ClearProcessingState with accumulateApiTime: false
+        Assert.True(methodBody.Contains("accumulateApiTime: false", StringComparison.Ordinal),
+            "AbortSessionAsync must call ClearProcessingState with accumulateApiTime: false — " +
+            "user aborts should not increment PremiumRequestsUsed");
+
+        // It must also manually accumulate TotalApiTimeSeconds (request was consumed)
+        Assert.True(methodBody.Contains("TotalApiTimeSeconds", StringComparison.Ordinal),
+            "AbortSessionAsync must manually accumulate TotalApiTimeSeconds before ClearProcessingState — " +
+            "the request consumed server resources even though the user aborted");
     }
 }
