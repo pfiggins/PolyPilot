@@ -72,6 +72,31 @@ public class ChatExperienceSafetyTests
         method.Invoke(svc, new object?[] { sessionState });
     }
 
+    /// <summary>Invokes the private FinalizeResumedSessionUiStateAsync helper via reflection.</summary>
+    private static async Task InvokeFinalizeResumedSessionUiStateAsync(
+        CopilotService svc,
+        object sessionState,
+        string sessionId,
+        string? workingDirectory,
+        string? gitBranch,
+        bool isStillProcessing,
+        int processingPhase,
+        string reconnectMsg)
+    {
+        var method = typeof(CopilotService).GetMethod("FinalizeResumedSessionUiStateAsync", NonPublic)!;
+        var task = (Task)method.Invoke(svc, new object?[]
+        {
+            sessionState,
+            sessionId,
+            workingDirectory,
+            gitBranch,
+            isStillProcessing,
+            processingPhase,
+            reconnectMsg
+        })!;
+        await task;
+    }
+
     /// <summary>Invokes the private ClearFlushedReplayDedup helper to simulate a tool/sub-turn boundary.</summary>
     private static void InvokeClearFlushedReplayDedup(object sessionState)
     {
@@ -1092,14 +1117,16 @@ public class ChatExperienceSafetyTests
     }
 
     /// <summary>
-    /// The "Session not found" reconnect path must include McpServers and SkillDirectories
-    /// in the fresh session config (PR #330 regression guard).
+    /// Fresh create + lazy/explicit resume paths must all preserve MCP servers and skill
+    /// directories so restarted sessions do not silently lose tool availability.
     /// </summary>
     [Fact]
-    public void ReconnectPath_IncludesMcpServersAndSkills()
+    public void ResumeAndReconnectPaths_IncludeMcpServersAndSkills()
     {
         var source = File.ReadAllText(
             Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+        var persistence = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
 
         // After extraction to BuildFreshSessionConfig, verify the reconnect path calls the helper
         var sessionNotFoundIdx = source.IndexOf("resumeEx.Message.Contains(\"Session not found\"", StringComparison.Ordinal);
@@ -1113,50 +1140,79 @@ public class ChatExperienceSafetyTests
         var helperBlock = source.Substring(helperIdx, Math.Min(2000, source.Length - helperIdx));
         Assert.Contains("McpServers", helperBlock);
         Assert.Contains("SkillDirectories", helperBlock);
+
+        var resumeHelperIdx = source.IndexOf("private ResumeSessionConfig BuildResumeSessionConfig", StringComparison.Ordinal);
+        Assert.True(resumeHelperIdx > 0);
+        var resumeHelperBlock = source.Substring(resumeHelperIdx, Math.Min(2000, source.Length - resumeHelperIdx));
+        Assert.Contains("McpServers", resumeHelperBlock);
+        Assert.Contains("SkillDirectories", resumeHelperBlock);
+        Assert.Contains("BuildResumeSessionConfig(state, resumeWorkingDirectory", source);
+        Assert.Contains("BuildResumeSessionConfig(state, resumeWorkDir", persistence);
     }
 
     /// <summary>
-    /// Lazy-resume and its fresh-session fallback must include McpServers and SkillDirectories.
-    /// Without these, resumed sessions start without MCP tools (e.g., WorkIQ) until manual /mcp reload.
+    /// Finalizing resumed session state should complete stale entries and append the reconnect
+    /// message through the dedicated UI-thread helper instead of mutating History inline.
     /// </summary>
     [Fact]
-    public void LazyResumePath_IncludesMcpServersAndSkills()
+    public async Task FinalizeResumedSessionUiState_CompletesStaleEntriesAndAppendsReconnectMessage()
     {
-        var source = File.ReadAllText(
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("resume-ui-finalize");
+        var state = GetSessionState(svc, "resume-ui-finalize");
+
+        var staleTool = ChatMessage.ToolCallMessage("bash", "call-1", "echo hi");
+        staleTool.IsComplete = false;
+        var staleReasoning = ChatMessage.ReasoningMessage("reason-1");
+        staleReasoning.Content = "thinking...";
+        staleReasoning.IsComplete = false;
+        session.History.Add(ChatMessage.UserMessage("resume me"));
+        session.History.Add(staleTool);
+        session.History.Add(staleReasoning);
+
+        await InvokeFinalizeResumedSessionUiStateAsync(
+            svc,
+            state,
+            Guid.NewGuid().ToString(),
+            "/tmp/worktree",
+            "main",
+            isStillProcessing: true,
+            processingPhase: 3,
+            reconnectMsg: "🔄 Session reconnected at 12:34 — running bash");
+
+        Assert.True(staleTool.IsComplete);
+        Assert.True(staleReasoning.IsComplete);
+        Assert.True(session.IsProcessing);
+        Assert.Equal(3, session.ProcessingPhase);
+        Assert.Equal("/tmp/worktree", session.WorkingDirectory);
+        Assert.Equal("main", session.GitBranch);
+        Assert.Contains(session.History, m => m.Content?.Contains("Session reconnected", StringComparison.Ordinal) == true);
+    }
+
+    /// <summary>
+    /// The lazy-resume fallback path (session not found / corrupt / process error)
+    /// must attach an event handler on the fresh session so it is not deaf.
+    /// When the old post-resume .On() was removed in favor of ResumeSessionConfig.OnEvent,
+    /// the fallback branch that creates a fresh SessionConfig must still call .On() explicitly.
+    /// </summary>
+    [Fact]
+    public void LazyResumeFallback_AttachesEventHandler()
+    {
+        var persistence = File.ReadAllText(
             Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
 
-        // Find the EnsureSessionConnectedAsync method containing the lazy-resume logic
-        var methodIdx = source.IndexOf("EnsureSessionConnectedAsync", StringComparison.Ordinal);
-        Assert.True(methodIdx > 0, "EnsureSessionConnectedAsync not found");
-        var block = source.Substring(methodIdx, Math.Min(3000, source.Length - methodIdx));
+        // Find the fallback create path ("Lazy-resume failed" → CreateSessionAsync)
+        var fallbackIdx = persistence.IndexOf("Lazy-resume failed for", StringComparison.Ordinal);
+        Assert.True(fallbackIdx > 0, "Could not find the lazy-resume fallback path");
 
-        // MCP servers must be loaded before creating the resume config
-        Assert.Contains("LoadMcpServers", block);
-        Assert.Contains("LoadSkillDirectories", block);
+        // Grab the block from the fallback through the next FlushSaveActiveSessionsToDisk
+        var afterFallback = persistence.Substring(fallbackIdx, Math.Min(800, persistence.Length - fallbackIdx));
+        Assert.Contains("CreateSessionAsync", afterFallback);
 
-        // Both the ResumeSessionConfig and the fallback SessionConfig must include MCP
-        Assert.Contains("McpServers = mcpServers", block);
-        Assert.Contains("SkillDirectories = skillDirs", block);
-    }
-
-    /// <summary>
-    /// The public ResumeSessionAsync (sidebar resume, bridge resume) must also include
-    /// McpServers and SkillDirectories so MCP tools work after explicit resume.
-    /// </summary>
-    [Fact]
-    public void SidebarResumePath_IncludesMcpServersAndSkills()
-    {
-        var source = File.ReadAllText(
-            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
-
-        var methodIdx = source.IndexOf("public async Task<AgentSessionInfo> ResumeSessionAsync(", StringComparison.Ordinal);
-        Assert.True(methodIdx > 0, "ResumeSessionAsync not found");
-        var block = source.Substring(methodIdx, Math.Min(6000, source.Length - methodIdx));
-
-        Assert.Contains("LoadMcpServers", block);
-        Assert.Contains("LoadSkillDirectories", block);
-        Assert.Contains("McpServers = resumeMcpServers", block);
-        Assert.Contains("SkillDirectories = resumeSkillDirs", block);
+        // The critical invariant: .On(evt => HandleSessionEvent(...)) must appear
+        // between CreateSessionAsync and the end of this catch block
+        Assert.Contains("copilotSession.On(evt => HandleSessionEvent(state, evt))", afterFallback);
     }
 
     // =========================================================================
@@ -1398,5 +1454,37 @@ public class ChatExperienceSafetyTests
         Assert.True(methodBody.Contains("TotalApiTimeSeconds", StringComparison.Ordinal),
             "AbortSessionAsync must manually accumulate TotalApiTimeSeconds before ClearProcessingState — " +
             "the request consumed server resources even though the user aborted");
+    }
+
+    /// <summary>
+    /// The ResumeSessionAsync method must pass the event handler via ResumeSessionConfig.OnEvent
+    /// instead of calling .On() after the resume returns. The SDK registers OnEvent before
+    /// sending the session.resume RPC, closing the race window where events arrive between
+    /// resume-return and .On() call — which causes silently dropped content events (empty responses).
+    /// </summary>
+    [Fact]
+    public void ResumeSessionAsync_UsesOnEventInConfig_NotPostResumeOn()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        // Find the ResumeSessionAsync method (the one that resumes sessions on startup)
+        var methodIdx = source.IndexOf("public async Task<AgentSessionInfo> ResumeSessionAsync(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ResumeSessionAsync must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Must use OnEvent in the config — this registers BEFORE the RPC call
+        Assert.True(methodBody.Contains("OnEvent", StringComparison.Ordinal),
+            "ResumeSessionAsync must pass event handler via ResumeSessionConfig.OnEvent " +
+            "to avoid the race where events are dropped between resume-return and .On() call");
+
+        // Must NOT have a post-resume .On() call (which would be the race-prone pattern)
+        // Strip comment lines first
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+        Assert.False(codeOnly.Contains("copilotSession.On(evt", StringComparison.Ordinal),
+            "ResumeSessionAsync must NOT call copilotSession.On() after resume — " +
+            "use OnEvent in config instead to prevent the event delivery race");
     }
 }

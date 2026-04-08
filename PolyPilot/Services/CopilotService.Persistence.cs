@@ -414,22 +414,11 @@ public partial class CopilotService
             var resumeModel = state.Info.Model ?? DefaultModel;
             var resumeWorkDir = state.Info.WorkingDirectory;
 
-            // Load MCP servers and skill directories so resumed sessions have full tool access.
-            // Without this, lazily-resumed sessions start without MCP tools until manual /mcp reload.
-            var settings = ConnectionSettings.Load();
-            var mcpServers = LoadMcpServers(settings.DisabledMcpServers, settings.DisabledPlugins);
-            var skillDirs = LoadSkillDirectories(settings.DisabledPlugins);
+            // Clear IsOrphaned before resuming so early replay events from ResumeSessionConfig.OnEvent
+            // are not dropped by the orphan guard in HandleSessionEvent.
+            state.IsOrphaned = false;
 
-            var resumeConfig = new ResumeSessionConfig
-            {
-                Model = resumeModel,
-                WorkingDirectory = resumeWorkDir,
-                McpServers = mcpServers,
-                SkillDirectories = skillDirs,
-                Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                OnPermissionRequest = AutoApprovePermissions,
-                InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
-            };
+            var resumeConfig = BuildResumeSessionConfig(state, resumeWorkDir, evt => HandleSessionEvent(state, evt));
 
             CopilotSession copilotSession;
             bool wasResumed = false;
@@ -445,16 +434,14 @@ public partial class CopilotService
                 IsProcessError(ex))
             {
                 Debug($"Lazy-resume failed for '{sessionName}': {ex.Message} — creating fresh session");
-                copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(new SessionConfig
-                {
-                    Model = resumeModel,
-                    WorkingDirectory = resumeWorkDir,
-                    McpServers = mcpServers,
-                    SkillDirectories = skillDirs,
-                    Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                    OnPermissionRequest = AutoApprovePermissions,
-                    InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
-                }, cancellationToken);
+                state.Info.Model = resumeModel;
+                state.Info.WorkingDirectory = resumeWorkDir;
+                var freshConfig = BuildFreshSessionConfig(state);
+                copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(freshConfig, cancellationToken);
+                // Attach event handler on the fresh session so it isn't deaf.
+                // BuildFreshSessionConfig doesn't set OnEvent on the SessionConfig, and
+                // the old post-resume .On() was removed, so we must register explicitly here.
+                copilotSession.On(evt => HandleSessionEvent(state, evt));
                 state.Info.SessionId = copilotSession.SessionId;
                 FlushSaveActiveSessionsToDisk();
             }
@@ -485,19 +472,9 @@ public partial class CopilotService
                 copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
             }
 
-            // Clear IsOrphaned BEFORE registering the event handler — the state may have
-            // been marked orphaned by a sibling reconnect failure (e.g., corrupted session
-            // file caused re-resume to fail, setting IsOrphaned=true on this state).
-            // Without this reset, HandleSessionEvent silently drops all events and the
-            // session appears stuck to mobile clients despite the CLI responding normally.
-            // Order matters: reset first so no early SDK replay events (e.g., session.resume
-            // acknowledgment) are dropped by the IsOrphaned guard in HandleSessionEvent.
-            state.IsOrphaned = false;
-            // INV-16: Register event handler BEFORE publishing to state —
-            // no window where events arrive with no handler. Matches the pattern
-            // in sibling reconnect (CopilotService.cs:2766) and worker revival
-            // (Organization.cs:1547).
-            copilotSession.On(evt => HandleSessionEvent(state, evt));
+            // INV-16: For the happy-path resume, the event handler is registered via
+            // ResumeSessionConfig.OnEvent before the RPC. For the fallback fresh-create
+            // path, .On() is called explicitly right after CreateSessionAsync.
             state.Session = copilotSession;
             state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
 
