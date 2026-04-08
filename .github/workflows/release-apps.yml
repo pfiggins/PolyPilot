@@ -231,6 +231,24 @@ jobs:
             -p:ApplicationDisplayVersion='${{ env.APP_VERSION }}' \
             -p:ApplicationVersion='${{ steps.build.outputs.number }}'
 
+      - name: Fix Mac Catalyst app icon
+        run: |
+          APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
+          PLIST="$APP_PATH/Contents/Info.plist"
+
+          # MAUI's resizetizer generates an incomplete icns (4 sizes, up to 128@2x).
+          # Mac App Store requires 512x512@2x. Replace with the complete pre-built icns.
+          cp PolyPilot/Resources/AppIcon/appicon.icns "$APP_PATH/Contents/Resources/appicon.icns"
+          echo "Replaced icns with complete pre-built version"
+
+          # Ensure CFBundleIconName is set
+          if ! /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" 2>/dev/null; then
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string appicon" "$PLIST"
+            echo "Added CFBundleIconName to Info.plist"
+          else
+            echo "CFBundleIconName already set: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$PLIST")"
+          fi
+
       - name: Patch bundle identifier for App Store
         run: |
           APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
