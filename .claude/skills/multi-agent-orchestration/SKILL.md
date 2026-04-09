@@ -1010,6 +1010,38 @@ itself — worker messages bypass orchestration and go through direct
 orchestrator dispatch pipeline, never sent directly to workers in orchestrator
 groups.
 
+### Bug: Persistent blast-dispatch despite bridge dedup (remote-mode local orchestration)
+
+**Symptom**: Phone sends one message to orchestrator, but 28+ calls to
+`SendToMultiAgentGroupAsync` occur within 4 seconds. Workers receive duplicate
+dispatches, creating a massive mess. The earlier bridge dedup (above) was in
+place but didn't prevent it.
+
+**Root cause**: The phone's `CopilotService` in remote mode ran
+`SendToMultiAgentGroupAsync` locally, executing the FULL orchestration loop:
+plan → parse @worker blocks → dispatch each worker via `SendPromptAsync` →
+bridge `send_message`. Each worker dispatch arrived at the server bridge with
+DIFFERENT message content (unique task per worker), so exact-message dedup
+failed. The server then ran its OWN orchestration loop for each. Two concurrent
+orchestration loops + N extra STMAGSA calls.
+
+**Why previous dedup failed**: Bridge `_recentGroupDispatches` compared
+`recent.Message == message`. Worker dispatches have different messages, so all
+but the first passed dedup.
+
+**Fix (3 parts)**:
+1. **Remote-mode delegation** — `SendToMultiAgentGroupAsync` returns early when
+   `IsRemoteMode`, delegating to `_bridgeClient.SendMultiAgentBroadcastAsync()`
+   instead of running the orchestration loop locally
+2. **Time-only bridge dedup** — changed from exact-message match to time-window-
+   only (any dispatch to same group within 5s is dropped regardless of message)
+3. **MultiAgentBroadcast handler** — added dedup, `StartGroupReflection`, and
+   `InvokeOnUIAsync` to the handler (previously had none of these)
+
+**Key invariant (INV-O17)**: Phone clients in remote mode MUST NOT run
+orchestration locally. `SendToMultiAgentGroupAsync` checks `IsRemoteMode` and
+delegates to the bridge. Only the server (non-remote) runs orchestration.
+
 ---
 
 ## "Fix with Copilot" — Multi-Agent Awareness
