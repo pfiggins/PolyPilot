@@ -88,6 +88,66 @@ public class WsBridgeServer : IDisposable
     internal bool IsBridgeFiltered(ChatMessageType type) => _filteredTypes.Contains(type);
 
     /// <summary>
+    /// Markers indicating orchestrator boilerplate (planning prompts, synthesis scaffolding).
+    /// Mirrors ChatMessageList.OrchestratorMarkers for consistent filtering.
+    /// </summary>
+    private static readonly string[] OrchestratorContentMarkers = new[]
+    {
+        "You are the orchestrator of a multi-agent group",
+        "## Work Routing",
+        "## Worker Results",
+        "## Your Task",
+        "## Original Request",
+        "## User Request",
+        "## Evaluation Check",
+        "## Previous Iteration",
+        "## Additional Orchestration Instructions",
+        "@worker:",
+        "[[GROUP_REFLECT_COMPLETE]]",
+    };
+
+    /// <summary>
+    /// Returns true if the message content matches orchestrator boilerplate patterns.
+    /// Used to filter user-role planning prompts and assistant dispatch responses that
+    /// aren't tagged with <see cref="ChatMessageType.OrchestratorDispatch"/> (e.g. the
+    /// planning prompt sent TO the orchestrator is a User message, not tagged).
+    /// </summary>
+    internal static bool IsOrchestratorBoilerplate(string? content)
+    {
+        if (string.IsNullOrEmpty(content)) return false;
+        foreach (var marker in OrchestratorContentMarkers)
+            if (content.Contains(marker))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Filters messages for mobile display. Removes type-filtered messages AND
+    /// orchestrator boilerplate detected by content markers (planning prompts,
+    /// dispatch scaffolding, synthesis headers).
+    /// </summary>
+    private List<ChatMessage> FilterMessagesForBridge(List<ChatMessage> messages)
+    {
+        var filtered = _filteredTypes;
+        var filterOrchestratorContent = filtered.Contains(ChatMessageType.OrchestratorDispatch);
+
+        return messages.Where(m =>
+        {
+            // Type-based filter (System, ToolCall, OrchestratorDispatch, etc.)
+            if (filtered.Count > 0 && filtered.Contains(m.MessageType))
+                return false;
+
+            // Content-based filter: strip orchestrator planning prompts and dispatch
+            // boilerplate that are typed as User/Assistant (not OrchestratorDispatch).
+            // The desktop UI collapses these in ChatMessageList.razor — mobile needs
+            // them stripped entirely since there's no collapsible UI.
+            if (filterOrchestratorContent && IsOrchestratorBoilerplate(m.Content))
+                return false;
+
+            return true;
+        }).ToList();
+    }
+
     /// Start the bridge server. Now only needs the port — connects to CopilotService directly.
     /// The targetPort parameter is kept for API compat but ignored.
     /// </summary>
@@ -1642,10 +1702,8 @@ public class WsBridgeServer : IDisposable
             hasMore = false;
         }
 
-        // Filter out message types configured in BridgeFilteredMessageTypes setting
-        var filtered = _filteredTypes;
-        if (filtered.Count > 0)
-            messagesToSend = messagesToSend.Where(m => !filtered.Contains(m.MessageType)).ToList();
+        // Filter out message types and orchestrator boilerplate for mobile display
+        messagesToSend = FilterMessagesForBridge(messagesToSend);
 
         // Populate ImageDataUri for Image messages so mobile can render them
         foreach (var m in messagesToSend)
@@ -1812,10 +1870,8 @@ public class WsBridgeServer : IDisposable
             hasMore = false;
         }
 
-        // Filter out message types configured in BridgeFilteredMessageTypes setting
-        var filtered = _filteredTypes;
-        if (filtered.Count > 0)
-            messagesToSend = messagesToSend.Where(m => !filtered.Contains(m.MessageType)).ToList();
+        // Filter out message types and orchestrator boilerplate for mobile display
+        messagesToSend = FilterMessagesForBridge(messagesToSend);
 
         // Populate ImageDataUri for Image messages — clone to avoid mutating shared History objects
         for (int i = 0; i < messagesToSend.Count; i++)

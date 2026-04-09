@@ -54,9 +54,10 @@ public partial class CopilotService
     private static readonly Regex WorkerNamePattern = new(@"-[Ww]orker-\d+(-\d+)?$", RegexOptions.Compiled);
 
     /// <summary>Maximum time the orchestrator waits for all workers to complete.
-    /// Shorter than WorkerExecutionTimeout — if a worker is stuck, the orchestrator
-    /// proceeds with partial results rather than blocking the group forever.</summary>
-    private static readonly TimeSpan OrchestratorCollectionTimeout = TimeSpan.FromMinutes(15);
+    /// Must be generous enough for complex tasks (firmware builds, large refactors)
+    /// while still catching genuinely stuck workers. The smart watchdog handles dead
+    /// sessions in ~90s, so this is for workers that are alive but slow.</summary>
+    private static readonly TimeSpan OrchestratorCollectionTimeout = TimeSpan.FromMinutes(30);
 
     /// <summary>When ALL workers return responses shorter than this threshold (chars) AND complete
     /// faster than <see cref="MassFailureMaxDurationSeconds"/>, the reflect loop treats this as a
