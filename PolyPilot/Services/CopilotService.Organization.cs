@@ -57,6 +57,19 @@ public partial class CopilotService
     /// Shorter than WorkerExecutionTimeout — if a worker is stuck, the orchestrator
     /// proceeds with partial results rather than blocking the group forever.</summary>
     private static readonly TimeSpan OrchestratorCollectionTimeout = TimeSpan.FromMinutes(15);
+
+    /// <summary>When ALL workers return responses shorter than this threshold (chars) AND complete
+    /// faster than <see cref="MassFailureMaxDurationSeconds"/>, the reflect loop treats this as a
+    /// mass failure (e.g., directive sent as task, API error, session corruption) and breaks early
+    /// instead of endlessly re-dispatching. Prevents the "acknowledge directive" loop where the
+    /// orchestrator dispatches all workers for a non-task message and they all reply with
+    /// "Confirmed. Standing by." in 3 seconds.</summary>
+    internal const int MassFailureResponseThreshold = 200;
+
+    /// <summary>Maximum per-worker duration (seconds) to count as "suspiciously fast."
+    /// Workers completing in under this time AND returning less than <see cref="MassFailureResponseThreshold"/>
+    /// chars are considered mass failures.</summary>
+    internal const int MassFailureMaxDurationSeconds = 30;
     /// Checks both WasPrematurelyIdled flag (set by EVT-REARM) and events.jsonl freshness
     /// (CLI still writing events). The events.jsonl check catches cases where EVT-REARM
     /// takes 30-60s to fire.</summary>
@@ -103,6 +116,22 @@ public partial class CopilotService
     // When a user sends a message while an orchestrator dispatch is running,
     // the message is queued here and drained after the current dispatch completes.
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orchestratorQueuedPrompts = new();
+
+    /// <summary>
+    /// Enqueue a prompt into a queue, but skip if an identical prompt is already queued.
+    /// Prevents the blast-dispatch pattern where a bridge message is sent to all group members,
+    /// causing the same prompt to be queued N times for the orchestrator.
+    /// </summary>
+    internal static bool EnqueueIfNotDuplicate(ConcurrentQueue<string> queue, string prompt)
+    {
+        // Snapshot the queue and check for duplicates. ConcurrentQueue.ToArray() is O(n)
+        // but queue sizes are tiny (< 20 even in pathological cases).
+        var existing = queue.ToArray();
+        if (existing.Any(p => string.Equals(p, prompt, StringComparison.Ordinal)))
+            return false;
+        queue.Enqueue(prompt);
+        return true;
+    }
 
     // Per-group current orchestrator phase — used by the bridge to suppress streaming
     // of planning/dispatch content to mobile clients (only synthesis is interesting).
@@ -1772,7 +1801,11 @@ public partial class CopilotService
 
         // Loop IS running — queue directly to _reflectQueuedPrompts
         var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
-        queue.Enqueue(prompt);
+        if (!EnqueueIfNotDuplicate(queue, prompt))
+        {
+            Debug($"[DISPATCH] TryQueueForActiveReflectLoop: duplicate prompt for '{sessionName}' — skipping");
+            return true; // Still "handled" — don't fall through to other dispatch paths
+        }
         Debug($"[DISPATCH] TryQueueForActiveReflectLoop: queued prompt for '{sessionName}' (len={prompt.Length})");
         return true;
     }
@@ -1807,7 +1840,11 @@ public partial class CopilotService
                 var orchestratorName = GetOrchestratorSession(groupId);
                 Debug($"[DISPATCH] Orchestrator busy for group '{group.Name}' — queuing prompt for after current dispatch");
                 var queue = _orchestratorQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
-                queue.Enqueue(prompt);
+                if (!EnqueueIfNotDuplicate(queue, prompt))
+                {
+                    Debug($"[DISPATCH] Duplicate prompt already queued for group '{group.Name}' — skipping");
+                    return;
+                }
                 if (orchestratorName != null)
                 {
                     AddOrchestratorSystemMessage(orchestratorName,
@@ -1824,7 +1861,11 @@ public partial class CopilotService
                 var orchestratorName = GetOrchestratorSession(groupId);
                 Debug($"[DISPATCH] Reflect orchestrator busy for group '{group.Name}' — queuing prompt");
                 var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
-                queue.Enqueue(prompt);
+                if (!EnqueueIfNotDuplicate(queue, prompt))
+                {
+                    Debug($"[DISPATCH] Duplicate prompt already queued for reflect group '{group.Name}' — skipping");
+                    return;
+                }
                 SaveQueuedPrompts();
                 if (orchestratorName != null)
                 {
@@ -4525,7 +4566,11 @@ public partial class CopilotService
             // SDK session at the start of the next iteration (not just local UI history).
             Debug($"[DISPATCH] Reflect loop already running for group '{group.Name}' — queuing prompt for next iteration");
             var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
-            queue.Enqueue(prompt);
+            if (!EnqueueIfNotDuplicate(queue, prompt))
+            {
+                Debug($"[DISPATCH] Duplicate prompt already queued for reflect loop '{group.Name}' — skipping");
+                return;
+            }
             AddOrchestratorSystemMessage(orchestratorName,
                 $"📨 New user message queued (will be sent to orchestrator at next iteration): {prompt}");
             return;
@@ -4887,6 +4932,44 @@ public partial class CopilotService
 
             var successCount = results.Count(r => r.Success);
             var totalCount = results.Length;
+
+            // Mass-failure detection: if ALL workers returned tiny responses very quickly,
+            // this is likely a non-task message (directive, correction) or a systemic API error.
+            // Break the reflect loop early instead of endlessly re-dispatching. The orchestrator
+            // model sometimes dispatches workers to "acknowledge" behavioral directives, which
+            // creates a pointless loop of tiny responses → replan → dispatch → tiny responses.
+            if (totalCount >= 2)
+            {
+                var allTiny = results.All(r =>
+                    (r.Response?.Length ?? 0) < MassFailureResponseThreshold
+                    && r.Duration.TotalSeconds < MassFailureMaxDurationSeconds);
+                if (allTiny)
+                {
+                    var avgLen = results.Average(r => r.Response?.Length ?? 0);
+                    var avgDur = results.Average(r => r.Duration.TotalSeconds);
+                    Debug($"[DISPATCH] Mass failure detected: all {totalCount} workers returned tiny responses " +
+                          $"(avg {avgLen:F0} chars in {avgDur:F1}s). Breaking reflect loop.");
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"⚠️ All {totalCount} workers returned very brief responses (avg {avgLen:F0} chars in {avgDur:F1}s). " +
+                        "This typically means the request was a directive or correction, not an actionable task. " +
+                        "Completing orchestration cycle.");
+
+                    // Send a minimal synthesis so the orchestrator can produce a final response
+                    await WaitForSessionIdleAsync(orchestratorName, ct);
+                    var massFailSynth = $"All {totalCount} workers completed with brief acknowledgments (avg {avgLen:F0} chars). " +
+                        "This was not an actionable task — it was a behavioral directive or correction. " +
+                        "Summarize what was acknowledged and confirm receipt. Do NOT re-dispatch workers.\n\n" +
+                        "[[GROUP_REFLECT_COMPLETE]]";
+                    await SendPromptAndWaitAsync(orchestratorName, massFailSynth, ct, originalPrompt: prompt);
+
+                    reflectState.GoalMet = true;
+                    reflectState.IsActive = false;
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"✅ {reflectState.BuildCompletionSummary()} (mass-failure early exit)");
+                    break;
+                }
+            }
+
             AddOrchestratorSystemMessage(orchestratorName,
                 $"📋 Collected {successCount}/{totalCount} worker result(s) — synthesizing...");
 
@@ -5207,6 +5290,16 @@ public partial class CopilotService
         // after dispatchLock.Release() in SendToMultiAgentGroupAsync's finally block.
         if (leftoverPrompts.Count > 0)
         {
+            // Deduplicate leftover prompts — bridge blast-dispatch can cause the same message
+            // to be queued multiple times through different paths (dispatch lock, loop lock,
+            // TryQueue, MessageQueue drain). Without dedup, each copy triggers a full
+            // orchestration cycle, creating an N-cycle loop for a single user message.
+            var uniqueLeftovers = leftoverPrompts.Distinct(StringComparer.Ordinal).ToList();
+            if (uniqueLeftovers.Count < leftoverPrompts.Count)
+            {
+                Debug($"[DISPATCH] Deduplicated leftover prompts: {leftoverPrompts.Count} → {uniqueLeftovers.Count}");
+            }
+
             var gId = groupId;
             var orchMode = group?.OrchestratorMode;
             var maxIter = group?.MaxReflectIterations ?? 5;
@@ -5214,8 +5307,8 @@ public partial class CopilotService
             {
                 async Task DeliverLeftoversAsync()
                 {
-                    Debug($"[DISPATCH] Delivering {leftoverPrompts.Count} queued user message(s) as new orchestration request(s)");
-                    foreach (var leftover in leftoverPrompts)
+                    Debug($"[DISPATCH] Delivering {uniqueLeftovers.Count} queued user message(s) as new orchestration request(s)");
+                    foreach (var leftover in uniqueLeftovers)
                     {
                         try
                         {

@@ -792,4 +792,57 @@ Review the implementation.
         Assert.Equal("g1", svc.GetOrchestratorGroupId("team-orch"));
         Assert.Null(svc.GetOrchestratorGroupId("team-worker"));
     }
+
+    // --- EnqueueIfNotDuplicate ---
+
+    [Fact]
+    public void EnqueueIfNotDuplicate_FirstPrompt_Enqueues()
+    {
+        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "hello world"));
+        Assert.Single(queue);
+    }
+
+    [Fact]
+    public void EnqueueIfNotDuplicate_DuplicatePrompt_Skips()
+    {
+        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "hello world"));
+        Assert.False(CopilotService.EnqueueIfNotDuplicate(queue, "hello world"));
+        Assert.Single(queue);
+    }
+
+    [Fact]
+    public void EnqueueIfNotDuplicate_DifferentPrompts_BothEnqueued()
+    {
+        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "task A"));
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "task B"));
+        Assert.Equal(2, queue.Count);
+    }
+
+    [Fact]
+    public void EnqueueIfNotDuplicate_CaseSensitive()
+    {
+        var queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "Hello"));
+        Assert.True(CopilotService.EnqueueIfNotDuplicate(queue, "hello"));
+        Assert.Equal(2, queue.Count);
+    }
+
+    // --- Mass-failure constants ---
+
+    [Fact]
+    public void MassFailureConstants_HaveReasonableDefaults()
+    {
+        // Response threshold should catch typical "acknowledged" messages (50-150 chars)
+        // but not real worker output (typically 500+ chars)
+        Assert.True(CopilotService.MassFailureResponseThreshold >= 100);
+        Assert.True(CopilotService.MassFailureResponseThreshold <= 500);
+
+        // Duration threshold should catch instant responses (3-10s) but not
+        // real work (typically 30s-30min)
+        Assert.True(CopilotService.MassFailureMaxDurationSeconds >= 10);
+        Assert.True(CopilotService.MassFailureMaxDurationSeconds <= 60);
+    }
 }
