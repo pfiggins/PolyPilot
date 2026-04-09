@@ -148,6 +148,16 @@ internal class StubWsBridgeClient : IWsBridgeClient
     public Task PushOrganizationAsync(OrganizationState organization, CancellationToken ct = default) => Task.CompletedTask;
     public Task CreateSessionWithWorktreeAsync(CreateSessionWithWorktreePayload payload, CancellationToken ct = default) => Task.CompletedTask;
     public Task CreateGroupFromPresetAsync(CreateGroupFromPresetPayload payload, CancellationToken ct = default) => Task.CompletedTask;
+    public Task SendMultiAgentBroadcastAsync(string groupId, string message, CancellationToken ct = default)
+    {
+        MultiAgentBroadcastCount++;
+        LastBroadcastGroupId = groupId;
+        LastBroadcastMessage = message;
+        return Task.CompletedTask;
+    }
+    public int MultiAgentBroadcastCount { get; private set; }
+    public string? LastBroadcastGroupId { get; private set; }
+    public string? LastBroadcastMessage { get; private set; }
     public string? LastRenamedOldName { get; private set; }
     public string? LastRenamedNewName { get; private set; }
     public int RenameSessionCallCount { get; private set; }

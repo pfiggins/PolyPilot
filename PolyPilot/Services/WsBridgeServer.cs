@@ -378,14 +378,17 @@ public class WsBridgeServer : IDisposable
                 var (orchGroupId, orchName) = _copilot.GetOrchestratorGroupIdForMember(sessionName);
                 if (orchGroupId != null)
                 {
-                    // Deduplicate: if the same message was dispatched to this group recently, drop it.
-                    // This prevents N identical orchestration cycles when the phone sends to N members.
+                    // Deduplicate: if ANY message was dispatched to this group recently, drop it.
+                    // The phone's remote-mode orchestration loop sends different messages per worker
+                    // (task assignments), so exact-message matching is insufficient. Use time-only
+                    // dedup: after the first dispatch to a group, block ALL further dispatches for
+                    // the dedup window. This is safe because the server's orchestration engine
+                    // handles all worker dispatch — the phone should never send to workers directly.
                     var now = DateTime.UtcNow.Ticks;
                     if (_recentGroupDispatches.TryGetValue(orchGroupId, out var recent)
-                        && recent.Message == message
                         && (now - recent.Ticks) < GroupDispatchDedupeWindowTicks)
                     {
-                        Console.WriteLine($"[WsBridge] Deduplicating message to group '{orchGroupId}' via '{sessionName}' (same message sent {(now - recent.Ticks) / TimeSpan.TicksPerMillisecond}ms ago)");
+                        Console.WriteLine($"[WsBridge] Deduplicating message to group '{orchGroupId}' via '{sessionName}' (last dispatch {(now - recent.Ticks) / TimeSpan.TicksPerMillisecond}ms ago)");
                         return;
                     }
                     _recentGroupDispatches[orchGroupId] = (message, now);
@@ -1166,9 +1169,30 @@ public class WsBridgeServer : IDisposable
                             Console.WriteLine($"[BRIDGE] Queued multi-agent prompt for group '{maReq.GroupId}' during restore ({_pendingBridgePrompts.Count} pending)");
                             break;
                         }
+
+                        // Deduplicate: if we recently dispatched to this group, drop (same as send_message path)
+                        var maNow = DateTime.UtcNow.Ticks;
+                        if (_recentGroupDispatches.TryGetValue(maReq.GroupId, out var maRecent)
+                            && (maNow - maRecent.Ticks) < GroupDispatchDedupeWindowTicks)
+                        {
+                            Console.WriteLine($"[WsBridge] Deduplicating multi_agent_broadcast for group '{maReq.GroupId}' ({(maNow - maRecent.Ticks) / TimeSpan.TicksPerMillisecond}ms since last dispatch)");
+                            break;
+                        }
+                        _recentGroupDispatches[maReq.GroupId] = (maReq.Message, maNow);
+
                         _ = Task.Run(async () =>
                         {
-                            try { await _copilot.SendToMultiAgentGroupAsync(maReq.GroupId, maReq.Message, ct); }
+                            try
+                            {
+                                await _copilot!.InvokeOnUIAsync(async () =>
+                                {
+                                    // Start reflection if needed (mirrors send_message path)
+                                    var maGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == maReq.GroupId);
+                                    if (maGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+                                        _copilot.StartGroupReflection(maReq.GroupId, maReq.Message, maGroup.MaxReflectIterations ?? 5);
+                                    await _copilot.SendToMultiAgentGroupAsync(maReq.GroupId, maReq.Message, ct);
+                                });
+                            }
                             catch (Exception ex) { Console.WriteLine($"[WsBridge] MultiAgentBroadcast error for group '{maReq.GroupId}': {ex.Message}"); }
                         });
                     }

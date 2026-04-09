@@ -845,4 +845,71 @@ Review the implementation.
         Assert.True(CopilotService.MassFailureMaxDurationSeconds >= 10);
         Assert.True(CopilotService.MassFailureMaxDurationSeconds <= 60);
     }
+
+    // --- Remote-mode blast-dispatch prevention ---
+
+    private static (CopilotService Service, StubWsBridgeClient Bridge) CreateServiceWithOrgAndBridge()
+    {
+        var bridge = new StubWsBridgeClient();
+        var svc = new CopilotService(
+            new StubChatDatabase(),
+            new StubServerManager(),
+            bridge,
+            new RepoManager(),
+            new Microsoft.Extensions.DependencyInjection.ServiceCollection().BuildServiceProvider(),
+            new StubDemoService());
+        return (svc, bridge);
+    }
+
+    [Fact]
+    public async Task SendToMultiAgentGroupAsync_RemoteMode_DelegatesToBridge()
+    {
+        // In remote mode, SendToMultiAgentGroupAsync must NOT run the orchestration loop
+        // locally. It should delegate to the bridge client's SendMultiAgentBroadcastAsync
+        // to prevent the phone from sending individual worker dispatches as bridge messages.
+        var (service, bridge) = CreateServiceWithOrgAndBridge();
+
+        // Force remote mode via reflection (same approach as BridgeDisconnectTests)
+        bridge.IsConnected = true;
+        typeof(CopilotService).GetProperty(nameof(CopilotService.IsRemoteMode))!.SetValue(service, true);
+
+        // Add a multi-agent group
+        service.Organization.Groups.Add(new SessionGroup
+        {
+            Id = "test-group",
+            Name = "Test Group",
+            IsMultiAgent = true,
+            OrchestratorMode = MultiAgentMode.OrchestratorReflect,
+        });
+        service.Organization.Sessions.Add(new SessionMeta { SessionName = "Test Group-orchestrator", GroupId = "test-group" });
+        service.Organization.Sessions.Add(new SessionMeta { SessionName = "Test Group-worker-1", GroupId = "test-group" });
+
+        await service.SendToMultiAgentGroupAsync("test-group", "Do the task");
+
+        // Should have delegated to bridge, not run locally
+        Assert.Equal(1, bridge.MultiAgentBroadcastCount);
+        Assert.Equal("test-group", bridge.LastBroadcastGroupId);
+        Assert.Equal("Do the task", bridge.LastBroadcastMessage);
+    }
+
+    [Fact]
+    public async Task SendToMultiAgentGroupAsync_RemoteMode_NotConnected_Throws()
+    {
+        var (service, bridge) = CreateServiceWithOrgAndBridge();
+
+        bridge.IsConnected = false;
+        typeof(CopilotService).GetProperty(nameof(CopilotService.IsRemoteMode))!.SetValue(service, true);
+
+        service.Organization.Groups.Add(new SessionGroup
+        {
+            Id = "test-group",
+            Name = "Test Group",
+            IsMultiAgent = true,
+            OrchestratorMode = MultiAgentMode.Orchestrator,
+        });
+        service.Organization.Sessions.Add(new SessionMeta { SessionName = "Test Group-orchestrator", GroupId = "test-group" });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.SendToMultiAgentGroupAsync("test-group", "Do something"));
+    }
 }

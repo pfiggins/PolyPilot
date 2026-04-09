@@ -57,6 +57,7 @@ public interface IWsBridgeClient
     Task PushOrganizationAsync(OrganizationState organization, CancellationToken ct = default);
     Task CreateSessionWithWorktreeAsync(CreateSessionWithWorktreePayload payload, CancellationToken ct = default);
     Task CreateGroupFromPresetAsync(CreateGroupFromPresetPayload payload, CancellationToken ct = default);
+    Task SendMultiAgentBroadcastAsync(string groupId, string message, CancellationToken ct = default);
     Task<DirectoriesListPayload> ListDirectoriesAsync(string? path = null, CancellationToken ct = default);
 
     // Repo operations

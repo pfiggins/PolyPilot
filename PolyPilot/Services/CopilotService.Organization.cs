@@ -1818,6 +1818,19 @@ public partial class CopilotService
         var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId && g.IsMultiAgent);
         if (group == null) { Debug($"[DISPATCH] SendToMultiAgentGroupAsync: group '{groupId}' not found or not multi-agent"); return; }
 
+        // In remote mode, delegate to the server via bridge. The phone must NOT run
+        // orchestration locally — it would send individual worker dispatches as bridge
+        // messages, each re-routed to SendToMultiAgentGroupAsync on the server, causing
+        // N duplicate orchestration cycles (blast-dispatch).
+        if (IsRemoteMode)
+        {
+            if (!_bridgeClient.IsConnected)
+                throw new InvalidOperationException("Not connected to server. Reconnecting…");
+            Debug($"[DISPATCH] Remote mode: delegating to bridge multi_agent_broadcast for group '{group.Name}'");
+            await _bridgeClient.SendMultiAgentBroadcastAsync(groupId, prompt, cancellationToken);
+            return;
+        }
+
         var members = GetMultiAgentGroupMembers(groupId);
         if (members.Count == 0) { Debug($"[DISPATCH] SendToMultiAgentGroupAsync: no members for group '{group.Name}'"); return; }
 
