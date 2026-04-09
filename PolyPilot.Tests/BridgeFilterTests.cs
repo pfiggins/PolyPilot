@@ -324,4 +324,30 @@ public class BridgeFilterTests : IDisposable
     {
         Assert.True(WsBridgeServer.IsOrchestratorBoilerplate("All tasks completed. [[GROUP_REFLECT_COMPLETE]]"));
     }
+
+    [Fact]
+    public void FilterMessagesForBridge_AssistantWithMarkers_NotStripped()
+    {
+        // Assistant messages containing orchestrator markers (e.g. synthesis that
+        // references "## Worker Results") must NOT be stripped — only user-role
+        // planning prompts should be filtered by content.
+        var messages = new List<ChatMessage>
+        {
+            new("user", "What happened?", DateTime.UtcNow, ChatMessageType.User),
+            new("assistant", "## Worker Results\nHere is the screenshot you requested.", DateTime.UtcNow, ChatMessageType.Assistant),
+            new("user", "You are the orchestrator of a multi-agent group. You have 5 workers.\n## User Request\nReview PR", DateTime.UtcNow, ChatMessageType.User),
+        };
+
+        // Use reflection to call FilterMessagesForBridge on the server
+        var method = typeof(WsBridgeServer).GetMethod("FilterMessagesForBridge",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+        var result = (List<ChatMessage>)method!.Invoke(_server, new object[] { messages })!;
+
+        // User message should remain, assistant with markers should remain,
+        // orchestrator planning prompt (user role) should be stripped
+        Assert.Equal(2, result.Count);
+        Assert.Equal("What happened?", result[0].Content);
+        Assert.Contains("## Worker Results", result[1].Content);
+    }
 }

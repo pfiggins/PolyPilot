@@ -137,11 +137,16 @@ public class WsBridgeServer : IDisposable
             if (filtered.Count > 0 && filtered.Contains(m.MessageType))
                 return false;
 
-            // Content-based filter: strip orchestrator planning prompts and dispatch
-            // boilerplate that are typed as User/Assistant (not OrchestratorDispatch).
-            // The desktop UI collapses these in ChatMessageList.razor — mobile needs
-            // them stripped entirely since there's no collapsible UI.
-            if (filterOrchestratorContent && IsOrchestratorBoilerplate(m.Content))
+            // Content-based filter: strip orchestrator planning prompts that are
+            // typed as User (the planning prompt sent TO the orchestrator contains
+            // "You are the orchestrator...", @worker blocks, ## Worker Results, etc.).
+            // ONLY filter user-role messages — assistant responses may legitimately
+            // reference these markers in synthesis or answers to the user.
+            // Assistant dispatch responses are already tagged OrchestratorDispatch
+            // and caught by the type-based filter above.
+            if (filterOrchestratorContent
+                && m.Role == "user"
+                && IsOrchestratorBoilerplate(m.Content))
                 return false;
 
             return true;
