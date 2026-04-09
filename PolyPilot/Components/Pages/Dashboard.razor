@@ -1900,7 +1900,7 @@
                     {
                         CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
                         session.History.Add(ChatMessage.SystemMessage(
-                            "📋 Orchestrator is busy — your message will be processed at the next iteration."));
+                            "📋 Orchestrator is busy — your message will be included in the current iteration's synthesis."));
                     }
                     else
                     {

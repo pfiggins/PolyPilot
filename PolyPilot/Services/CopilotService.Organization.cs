@@ -4987,6 +4987,24 @@ public partial class CopilotService
             AddOrchestratorSystemMessage(orchestratorName,
                 $"📋 Collected {successCount}/{totalCount} worker result(s) — synthesizing...");
 
+            // Check for user steering messages that arrived while workers were running.
+            // Inject them into the synthesis prompt so the orchestrator sees them immediately
+            // and can adjust the next iteration's dispatch. These messages are NOT deferred
+            // to leftoverPrompts because the user intended them as real-time course corrections.
+            var steeringMessages = new List<string>();
+            if (_reflectQueuedPrompts.TryGetValue(groupId, out var synthQueue))
+            {
+                while (synthQueue.TryDequeue(out var steeringPrompt))
+                {
+                    Debug($"[DISPATCH] Injecting steering message into synthesis (len={steeringPrompt.Length})");
+                    steeringMessages.Add(steeringPrompt);
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"📨 User steering message received — including in synthesis.");
+                }
+                if (steeringMessages.Count > 0)
+                    SaveQueuedPrompts();
+            }
+
             // After early dispatch, the orchestrator may still be doing tool work.
             // Wait for it to go idle before sending the synthesis prompt.
             await WaitForSessionIdleAsync(orchestratorName, ct);
@@ -4997,6 +5015,22 @@ public partial class CopilotService
 
             var synthEvalPrompt = BuildSynthesisWithEvalPrompt(prompt, results.ToList(), reflectState,
                 group.RoutingContext, dispatchedWorkers, workerNames);
+
+            // Append user steering messages so the orchestrator can adjust its next dispatch
+            if (steeringMessages.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder(synthEvalPrompt);
+                sb.AppendLine();
+                sb.AppendLine("## ⚡ User Steering (received while workers were running)");
+                sb.AppendLine("The user sent the following message(s) during this iteration. Incorporate their direction into your evaluation and next-iteration planning:");
+                foreach (var msg in steeringMessages)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"> {msg}");
+                }
+                sb.AppendLine();
+                synthEvalPrompt = sb.ToString();
+            }
 
             // Check worker participation once for both evaluator and self-eval paths
             var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
