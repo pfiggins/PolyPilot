@@ -1824,6 +1824,33 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Unconditionally queue a prompt into the reflect queue for the given orchestrator,
+    /// regardless of whether the reflect loop is currently running. Used when the orchestrator
+    /// is busy but the reflect loop semaphore isn't held (e.g., during initial planning or
+    /// between iterations). The message will be drained by the synthesis phase, the iteration-
+    /// top drain, or the post-loop leftover drain — whichever runs next.
+    /// Returns true if the prompt was queued, false if the session isn't a reflect orchestrator.
+    /// </summary>
+    public bool ForceQueueForReflectLoop(string sessionName, string prompt)
+    {
+        var groupId = GetOrchestratorGroupId(sessionName);
+        if (groupId == null) return false;
+
+        var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+        if (group?.OrchestratorMode != MultiAgentMode.OrchestratorReflect) return false;
+
+        var queue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+        if (!EnqueueIfNotDuplicate(queue, prompt))
+        {
+            Debug($"[DISPATCH] ForceQueueForReflectLoop: duplicate prompt for '{sessionName}' — skipping");
+            return true;
+        }
+        SaveQueuedPrompts();
+        Debug($"[DISPATCH] ForceQueueForReflectLoop: queued prompt for '{sessionName}' (len={prompt.Length})");
+        return true;
+    }
+
+    /// <summary>
     /// Send a prompt to all sessions in a multi-agent group based on its orchestration mode.
     /// </summary>
     public async Task SendToMultiAgentGroupAsync(string groupId, string prompt, CancellationToken cancellationToken = default)

@@ -1895,12 +1895,20 @@
                     session.History.Add(ChatMessage.UserMessage(finalPrompt));
 
                     // Try routing directly into the active reflect loop (bypasses dispatch lock).
-                    // Fall back to MessageQueue if no reflect loop is running.
+                    // Fall back to reflect queue (if OrchestratorReflect) or MessageQueue.
                     if (queueImagePaths is null or { Count: 0 } && CopilotService.TryQueueForActiveReflectLoop(sessionName, finalPrompt))
                     {
                         CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
                         session.History.Add(ChatMessage.SystemMessage(
                             "📋 Orchestrator is busy — your message will be included in the current iteration's synthesis."));
+                    }
+                    else if (queueImagePaths is null or { Count: 0 } && CopilotService.ForceQueueForReflectLoop(sessionName, finalPrompt))
+                    {
+                        // Reflect loop semaphore not held (e.g., initial planning phase) but
+                        // this IS a reflect orchestrator — queue for the next drain opportunity.
+                        CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_FORCE", null, null, null, true);
+                        session.History.Add(ChatMessage.SystemMessage(
+                            "📋 Orchestrator is busy — your message has been queued and will be included when the next synthesis phase begins."));
                     }
                     else
                     {
