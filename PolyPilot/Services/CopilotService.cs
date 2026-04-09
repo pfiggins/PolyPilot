@@ -3541,6 +3541,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                 Debug($"[RECONNECT] Sibling '{kvp.Key}' is IsProcessing with dead event stream — force-completing before re-resume");
                                                 try { await ForceCompleteProcessingAsync(kvp.Key, otherState, "client-recreated-dead-event-stream"); }
                                                 catch (Exception forceEx) { Debug($"[RECONNECT] Failed to force-complete sibling '{kvp.Key}': {forceEx.Message}"); }
+                                                // Notify the user that their in-flight message was lost
+                                                AddOrchestratorSystemMessage(kvp.Key,
+                                                    "⚠️ Connection lost while processing — your last message may not have been completed. Please re-send if needed.");
                                                 // Fall through to re-resume the session on the new client
                                             }
                                             var otherMeta = sessionSnapshots.FirstOrDefault(m => m.SessionName == kvp.Key);
