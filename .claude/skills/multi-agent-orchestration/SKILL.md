@@ -819,6 +819,42 @@ safe because worker suffixes within a group are unique (e.g., `srdev-1`, `review
 
 ---
 
+### Bug: Orchestrator mass-dispatch loop on non-task messages (discovered 2026-04-09)
+
+**Symptom**: User sends a behavioral directive from mobile. Orchestrator dispatches
+workers to "acknowledge" the directive. All workers return tiny responses (50-150 chars)
+in 3-5 seconds. Orchestrator re-plans and re-dispatches. Cycle repeats 24+ times over
+37 minutes. Periodically dispatches ALL 17 workers at once.
+
+**Root cause (two factors)**:
+1. **Bridge blast-dispatch** (fixed separately in `GetOrchestratorGroupIdForMember`)
+   sent the message to all group sessions. Each copy was queued as a separate prompt
+   for the orchestrator. 18+ copies queued → 18+ full orchestration cycles.
+2. **No mass-failure detection**: When ALL workers return tiny responses very quickly,
+   the reflect loop didn't recognize this as "no real work needed" and kept
+   re-dispatching.
+
+**Fix (three guards)**:
+1. **Queue deduplication** (`EnqueueIfNotDuplicate`): All four `_reflectQueuedPrompts`
+   enqueue sites now skip identical prompts already in the queue. Prevents N copies
+   of the same message from creating N orchestration cycles.
+2. **Mass-failure detection**: After collecting worker results, if ALL workers returned
+   < `MassFailureResponseThreshold` (200) chars in < `MassFailureMaxDurationSeconds`
+   (30s), the reflect loop sends a summary synthesis and breaks early instead of
+   re-dispatching.
+3. **Leftover prompt deduplication**: Before delivering leftover prompts as new
+   orchestration cycles, duplicates are removed via `Distinct()`.
+
+**Constants**:
+- `MassFailureResponseThreshold = 200` (chars) — below this, a response is "tiny"
+- `MassFailureMaxDurationSeconds = 30` (seconds) — below this, completion is "suspiciously fast"
+- Both thresholds must be met for ALL workers in a dispatch round to trigger mass-failure
+
+**Tests**: `MultiAgentGapTests.cs` — 5 new tests for `EnqueueIfNotDuplicate` and
+mass-failure constants.
+
+---
+
 ## IDLE-DEFER & BackgroundTasks (PR #399)
 
 > **This is the primary fix for premature idle in multi-agent workers.**
@@ -1185,7 +1221,7 @@ Reflect mode runs multiple iterations. Expect this pattern:
 | `MultiAgentRegressionTests.cs` | ~70 | Organization, reconciliation, presets, reflection bugs |
 | `ReflectionCycleTests.cs` | ~95 | Sentinels, iteration, stall detection, evaluation |
 | `ProcessingWatchdogTests.cs` | ~35 | Session state, abort, reconnect, watchdog constants |
-| `MultiAgentGapTests.cs` | ~30 | @worker parsing, task assignments, delegation |
+| `MultiAgentGapTests.cs` | ~70 | @worker parsing, task assignments, delegation, queue dedup, routing |
 
 ### ✅ Well-Covered
 
