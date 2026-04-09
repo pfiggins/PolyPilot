@@ -151,6 +151,18 @@ public partial class CopilotService
             && phase is OrchestratorPhase.Planning or OrchestratorPhase.Dispatching or OrchestratorPhase.WaitingForWorkers;
     }
 
+    /// <summary>
+    /// Returns true if orchestration is currently active for the given group (Planning,
+    /// Dispatching, or WaitingForWorkers). Used by the bridge to drop duplicate dispatches
+    /// from the phone's local orchestration loop that arrive after the server has already
+    /// started orchestrating.
+    /// </summary>
+    public bool IsGroupOrchestrationActive(string groupId)
+    {
+        return _orchestratorPhases.TryGetValue(groupId, out var phase)
+            && phase is OrchestratorPhase.Planning or OrchestratorPhase.Dispatching or OrchestratorPhase.WaitingForWorkers;
+    }
+
     #region Session Organization (groups, pinning, sorting)
 
     public async Task<string> CreateMultiAgentGroupAsync(string groupName, string orchestratorModel, string workerModel, int workerCount, MultiAgentMode mode, string? systemPrompt = null)

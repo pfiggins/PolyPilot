@@ -36,7 +36,7 @@ public class WsBridgeServer : IDisposable
     // Deduplication for orchestrator group dispatches — prevents blast-dispatch when
     // the mobile client sends the same message to all group members individually.
     private readonly ConcurrentDictionary<string, (string Message, long Ticks)> _recentGroupDispatches = new();
-    private const long GroupDispatchDedupeWindowTicks = 5 * TimeSpan.TicksPerSecond;
+    private const long GroupDispatchDedupeWindowTicks = 30 * TimeSpan.TicksPerSecond;
 
     // Debounce timers to prevent flooding mobile clients during streaming
     private Timer? _sessionsListDebounce;
@@ -451,6 +451,19 @@ public class WsBridgeServer : IDisposable
                         Console.WriteLine($"[WsBridge] Deduplicating message to group '{orchGroupId}' via '{sessionName}' (last dispatch {(now - recent.Ticks) / TimeSpan.TicksPerMillisecond}ms ago)");
                         return;
                     }
+
+                    // State-aware dedup: if orchestration is already active for this group
+                    // (Planning, Dispatching, or WaitingForWorkers), drop the bridge message.
+                    // This catches delayed duplicates from the phone's local orchestration loop
+                    // that arrive outside the time-based dedup window. The server already started
+                    // orchestrating from the first bridge message — a second dispatch would queue
+                    // and cause a duplicate orchestration cycle after the first completes.
+                    if (_copilot.IsGroupOrchestrationActive(orchGroupId))
+                    {
+                        Console.WriteLine($"[WsBridge] Dropping duplicate bridge message for group '{orchGroupId}' via '{sessionName}' — orchestration already active");
+                        return;
+                    }
+
                     _recentGroupDispatches[orchGroupId] = (message, now);
 
                     if (sessionName != orchName)
@@ -1238,6 +1251,14 @@ public class WsBridgeServer : IDisposable
                             Console.WriteLine($"[WsBridge] Deduplicating multi_agent_broadcast for group '{maReq.GroupId}' ({(maNow - maRecent.Ticks) / TimeSpan.TicksPerMillisecond}ms since last dispatch)");
                             break;
                         }
+
+                        // State-aware dedup: drop if orchestration is already active (same as send_message path)
+                        if (_copilot.IsGroupOrchestrationActive(maReq.GroupId))
+                        {
+                            Console.WriteLine($"[WsBridge] Dropping duplicate multi_agent_broadcast for group '{maReq.GroupId}' — orchestration already active");
+                            break;
+                        }
+
                         _recentGroupDispatches[maReq.GroupId] = (maReq.Message, maNow);
 
                         _ = Task.Run(async () =>

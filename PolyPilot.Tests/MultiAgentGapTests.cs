@@ -848,6 +848,32 @@ Review the implementation.
 
     // --- Remote-mode blast-dispatch prevention ---
 
+    [Fact]
+    public void GroupDispatchDedupeWindow_IsAtLeast30Seconds()
+    {
+        // The dedup window must be long enough to cover the phone's local orchestration
+        // round-trip (planning prompt → orchestrator response → worker dispatches).
+        // 5 seconds was too short — phone sends worker dispatches ~10-30s after planning.
+        var field = typeof(WsBridgeServer).GetField("GroupDispatchDedupeWindowTicks",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(field);
+        var ticks = (long)field!.GetValue(null)!;
+        Assert.True(ticks >= 30 * TimeSpan.TicksPerSecond,
+            $"GroupDispatchDedupeWindowTicks should be >= 30s, was {ticks / TimeSpan.TicksPerSecond}s");
+    }
+
+    [Fact]
+    public void IsGroupOrchestrationActive_WhenNoPhase_ReturnsFalse()
+    {
+        var (service, _) = CreateServiceWithOrgAndBridge();
+        service.Organization.Groups.Add(new SessionGroup
+        {
+            Id = "g1", Name = "Team", IsMultiAgent = true,
+            OrchestratorMode = MultiAgentMode.OrchestratorReflect,
+        });
+        Assert.False(service.IsGroupOrchestrationActive("g1"));
+    }
+
     private static (CopilotService Service, StubWsBridgeClient Bridge) CreateServiceWithOrgAndBridge()
     {
         var bridge = new StubWsBridgeClient();
