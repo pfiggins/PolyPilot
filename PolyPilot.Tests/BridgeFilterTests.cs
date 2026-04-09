@@ -278,4 +278,50 @@ public class BridgeFilterTests : IDisposable
         Assert.Contains("ToolCall", loaded.BridgeFilteredMessageTypes);
         Assert.Contains("Reasoning", loaded.BridgeFilteredMessageTypes);
     }
+
+    // ========== Orchestrator Content Filtering Tests ==========
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_PlanningPrompt_ReturnsTrue()
+    {
+        var content = "You are the orchestrator of a multi-agent group. You have 5 worker agent(s) available:\n  - 'team-worker-1' (model: claude-sonnet-4.6)";
+        Assert.True(WsBridgeServer.IsOrchestratorBoilerplate(content));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_WorkerBlock_ReturnsTrue()
+    {
+        Assert.True(WsBridgeServer.IsOrchestratorBoilerplate("Here are the assignments:\n@worker:team-worker-1\nReview the PR\n@end"));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_UserRequest_ReturnsTrue()
+    {
+        Assert.True(WsBridgeServer.IsOrchestratorBoilerplate("## User Request\nPlease fix the bug in auth.cs"));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_WorkerResults_ReturnsTrue()
+    {
+        Assert.True(WsBridgeServer.IsOrchestratorBoilerplate("## Worker Results\nWorker 1 completed successfully."));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_NormalMessage_ReturnsFalse()
+    {
+        Assert.False(WsBridgeServer.IsOrchestratorBoilerplate("Please review the PR and fix the auth bug"));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_NullOrEmpty_ReturnsFalse()
+    {
+        Assert.False(WsBridgeServer.IsOrchestratorBoilerplate(null));
+        Assert.False(WsBridgeServer.IsOrchestratorBoilerplate(""));
+    }
+
+    [Fact]
+    public void IsOrchestratorBoilerplate_ReflectComplete_ReturnsTrue()
+    {
+        Assert.True(WsBridgeServer.IsOrchestratorBoilerplate("All tasks completed. [[GROUP_REFLECT_COMPLETE]]"));
+    }
 }
