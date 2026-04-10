@@ -506,4 +506,45 @@ public class ChatDatabaseResilienceTests : IDisposable
         Assert.Equal("data:image/png;base64,abc", messages[0].ImageDataUri);
         Assert.Equal("A screenshot", messages[0].Caption);
     }
+
+    [Fact]
+    public async Task UpdateToolImageAsync_ConvertsToolCallToImage()
+    {
+        var dbPath = Path.Combine(_tempDir, "tool-image-update.db");
+        ChatDatabase.SetDbPathForTesting(dbPath);
+        var db = new ChatDatabase();
+
+        // Insert a tool call message (as would happen during ToolExecutionStartEvent)
+        var toolMsg = ChatMessage.ToolCallMessage("show_image", "tc-img-1", null);
+        await db.AddMessageAsync("s1", toolMsg);
+
+        // Verify it's stored as a ToolCall
+        var before = await db.GetAllMessagesAsync("s1");
+        Assert.Single(before);
+        Assert.Equal(ChatMessageType.ToolCall, before[0].MessageType);
+        Assert.Null(before[0].ImagePath);
+
+        // Update to image (as would happen during ToolExecutionCompleteEvent)
+        await db.UpdateToolImageAsync("s1", "tc-img-1", "/tmp/screenshot.png", "A caption");
+
+        // Verify it's now an Image message with correct fields
+        var after = await db.GetAllMessagesAsync("s1");
+        Assert.Single(after);
+        Assert.Equal(ChatMessageType.Image, after[0].MessageType);
+        Assert.Equal("/tmp/screenshot.png", after[0].ImagePath);
+        Assert.Equal("A caption", after[0].Caption);
+        Assert.True(after[0].IsComplete);
+        Assert.True(after[0].IsSuccess);
+    }
+
+    [Fact]
+    public async Task UpdateToolImageAsync_WithInvalidPath_DoesNotThrow()
+    {
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
+        var db = new ChatDatabase();
+        db.ResetConnection();
+
+        // Should not throw even with invalid DB path
+        await db.UpdateToolImageAsync("session-1", "tool-1", "/img.png", "cap");
+    }
 }

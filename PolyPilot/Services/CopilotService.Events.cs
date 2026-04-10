@@ -387,6 +387,9 @@ public partial class CopilotService
                         {
                             FlushCurrentResponse(state);
                             state.Info.History.Add(imgPlaceholder);
+                            // Persist tool call to DB so show_image → Image mutation survives restart
+                            if (!string.IsNullOrEmpty(state.Info.SessionId))
+                                SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, imgPlaceholder), "AddMessageAsync");
                             OnToolStarted?.Invoke(sessionName, startToolName, startCallId, toolInput);
                         });
                     }
@@ -397,6 +400,9 @@ public partial class CopilotService
                         {
                             FlushCurrentResponse(state);
                             state.Info.History.Add(toolMsg);
+                            // Persist tool call to DB for completion tracking
+                            if (!string.IsNullOrEmpty(state.Info.SessionId))
+                                SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, toolMsg), "AddMessageAsync");
                             OnToolStarted?.Invoke(sessionName, startToolName, startCallId, toolInput);
                             OnActivity?.Invoke(sessionName, $"🔧 Running {startToolName}...");
                         });
@@ -524,6 +530,9 @@ public partial class CopilotService
                         histToolMsg.IsComplete = true;
                         histToolMsg.IsSuccess = true;
                         histToolMsg.Content = resultStr;
+                        // Persist image mutation to DB so it survives app restart
+                        if (!string.IsNullOrEmpty(state.Info.SessionId) && !string.IsNullOrEmpty(imgPath))
+                            SafeFireAndForget(_chatDb.UpdateToolImageAsync(state.Info.SessionId, completeCallId, imgPath, imgCaption), "UpdateToolImageAsync");
                     }
                     else
                     {
@@ -531,6 +540,9 @@ public partial class CopilotService
                         histToolMsg.IsSuccess = !hasError;
                         // If resultStr is empty but there's an error message, show the error
                         histToolMsg.Content = string.IsNullOrEmpty(resultStr) && hasError ? errorStr ?? "" : resultStr;
+                        // Persist tool completion to DB
+                        if (!string.IsNullOrEmpty(state.Info.SessionId))
+                            SafeFireAndForget(_chatDb.UpdateToolCompleteAsync(state.Info.SessionId, completeCallId, histToolMsg.Content, !hasError), "UpdateToolCompleteAsync");
                     }
                 }
 

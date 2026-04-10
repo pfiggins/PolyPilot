@@ -2315,6 +2315,11 @@ public partial class CopilotService
         InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Dispatching,
             $"Sending tasks to {assignments.Count} worker(s)"));
 
+        // Show user-visible dispatch summary in the orchestrator chat
+        var shortNames = assignments.Select(a => StripGroupPrefix(a.WorkerName, group.Name)).ToList();
+        AddOrchestratorSystemMessage(orchestratorName,
+            $"📡 Dispatched to {assignments.Count} worker(s): {string.Join(", ", shortNames)}");
+
         // Persist dispatch state BEFORE dispatching — if the app is relaunched while
         // workers are processing, we can resume and collect their results.
         SavePendingOrchestration(new PendingOrchestration
@@ -3634,6 +3639,18 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Strip the group name prefix from a worker session name for display.
+    /// E.g. "tuul A Team-srdev-1" → "srdev-1".
+    /// </summary>
+    private static string StripGroupPrefix(string workerName, string groupName)
+    {
+        var prefix = groupName + "-";
+        return workerName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? workerName[prefix.Length..]
+            : workerName;
+    }
+
+    /// <summary>
     /// Retroactively tag the most recent assistant messages from an orchestrator session
     /// with a specific <see cref="ChatMessageType"/>. Used to mark planning/dispatch
     /// responses as <see cref="ChatMessageType.OrchestratorDispatch"/> so the bridge
@@ -4913,6 +4930,11 @@ public partial class CopilotService
             // Phase 2-3: Dispatch + Collect
             InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Dispatching,
                 $"Sending tasks to {assignments.Count} worker(s) — {iterDetail}"));
+
+            // Show user-visible dispatch summary in the orchestrator chat
+            var shortNames = assignments.Select(a => StripGroupPrefix(a.WorkerName, group.Name)).ToList();
+            AddOrchestratorSystemMessage(orchestratorName,
+                $"📡 Dispatched to {assignments.Count} worker(s): {string.Join(", ", shortNames)}");
 
             // Persist dispatch state for relaunch resilience
             SavePendingOrchestration(new PendingOrchestration

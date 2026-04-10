@@ -310,6 +310,25 @@ public class ChatDatabase : IChatDatabase
     }
 
     /// <summary>
+    /// Update a tool call message to an Image message when show_image completes.
+    /// </summary>
+    public async Task UpdateToolImageAsync(string sessionId, string toolCallId, string imagePath, string? caption)
+    {
+        SQLiteAsyncConnection? db = null;
+        try
+        {
+            db = await GetConnectionAsync();
+            await db.ExecuteAsync(
+                "UPDATE ChatMessageEntity SET MessageType = ?, ImagePath = ?, Caption = ?, Content = ?, IsComplete = 1, IsSuccess = 1 WHERE SessionId = ? AND ToolCallId = ?",
+                nameof(ChatMessageType.Image), imagePath, caption, imagePath, sessionId, toolCallId);
+        }
+        catch (Exception ex)
+        {
+            LogError("UpdateToolImageAsync", ex, db);
+        }
+    }
+
+    /// <summary>
     /// Update reasoning message content (appending delta text).
     /// </summary>
     public async Task UpdateReasoningContentAsync(string sessionId, string reasoningId, string content, bool isComplete)

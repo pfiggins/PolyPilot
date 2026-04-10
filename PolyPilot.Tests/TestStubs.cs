@@ -26,6 +26,9 @@ internal class StubChatDatabase : IChatDatabase
     public Task UpdateToolCompleteAsync(string sessionId, string toolCallId, string result, bool success)
         => Task.CompletedTask;
 
+    public Task UpdateToolImageAsync(string sessionId, string toolCallId, string imagePath, string? caption)
+        => Task.CompletedTask;
+
     public Task UpdateReasoningContentAsync(string sessionId, string reasoningId, string content, bool isComplete)
         => Task.CompletedTask;
 
