@@ -1,0 +1,285 @@
+#
+# There is insufficient memory for the Java Runtime Environment to continue.
+# Native memory allocation (mmap) failed to map 2147483648 bytes. Error detail: G1 virtual space
+# Possible reasons:
+#   The system is out of physical RAM or swap space
+#   This process is running with CompressedOops enabled, and the Java Heap may be blocking the growth of the native heap
+# Possible solutions:
+#   Reduce memory load on the system
+#   Increase physical memory or swap space
+#   Check if swap backing store is full
+#   Decrease Java heap size (-Xmx/-Xms)
+#   Decrease number of Java threads
+#   Decrease Java thread stack sizes (-Xss)
+#   Set larger code cache with -XX:ReservedCodeCacheSize=
+#   JVM is running with Zero Based Compressed Oops mode in which the Java heap is
+#     placed in the first 32GB address space. The Java Heap base address is the
+#     maximum limit for the native heap growth. Please use -XX:HeapBaseMinAddress
+#     to set the Java Heap base and to place the Java Heap above 32GB virtual address.
+# This output file may be truncated or incomplete.
+#
+#  Out of Memory Error (os_windows.cpp:3736), pid=178892, tid=87004
+#
+# JRE version:  (21.0.8+9) (build )
+# Java VM: OpenJDK 64-Bit Server VM (21.0.8+9-LTS, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, g1 gc, windows-amd64)
+# No core dump will be written. Minidumps are not enabled by default on client versions of Windows
+#
+
+---------------  S U M M A R Y ------------
+
+Command Line: com.xamarin.manifestmerger.Main obj\Debug\net10.0-android\android\manifestmerger.rsp
+
+Host: Intel(R) Core(TM) Ultra 9 285K, 24 cores, 127G,  Windows 11 , 64 bit Build 26100 (10.0.26100.7920)
+Time: Fri Apr 10 11:38:05 2026 Eastern Daylight Time elapsed time: 2.018973 seconds (0d 0h 0m 2s)
+
+---------------  T H R E A D  ---------------
+
+Current thread (0x00000238980bf850):  JavaThread "Unknown thread" [_thread_in_vm, id=87004, stack(0x000000cd91800000,0x000000cd91900000) (1024K)]
+
+Stack: [0x000000cd91800000,0x000000cd91900000]
+Native frames: (J=compiled Java code, j=interpreted, Vv=VM code, C=native code)
+V  [jvm.dll+0x6e1729]
+V  [jvm.dll+0x8bf47b]
+V  [jvm.dll+0x8c19aa]
+V  [jvm.dll+0x8c2083]
+V  [jvm.dll+0x289fd6]
+V  [jvm.dll+0x6de085]
+V  [jvm.dll+0x6d218a]
+V  [jvm.dll+0x366f6e]
+V  [jvm.dll+0x36ee1b]
+V  [jvm.dll+0x3c06b9]
+V  [jvm.dll+0x3c095b]
+V  [jvm.dll+0x33a8b7]
+V  [jvm.dll+0x33b3fb]
+V  [jvm.dll+0x888e5e]
+V  [jvm.dll+0x3cd611]
+V  [jvm.dll+0x871e5c]
+V  [jvm.dll+0x461261]
+V  [jvm.dll+0x462ea1]
+C  [jli.dll+0x52f0]
+C  [ucrtbase.dll+0x37b0]
+C  [KERNEL32.DLL+0x2e8d7]
+C  [ntdll.dll+0x8c48c]
+
+
+---------------  P R O C E S S  ---------------
+
+Threads class SMR info:
+_java_thread_list=0x00007fffeb256288, length=0, elements={
+}
+
+Java Threads: ( => current thread )
+Total: 0
+
+Other Threads:
+  0x00000238b057d7f0 WorkerThread "GC Thread#0"                     [id=47832, stack(0x000000cd91900000,0x000000cd91a00000) (1024K)]
+  0x000002389816d360 ConcurrentGCThread "G1 Main Marker"            [id=357364, stack(0x000000cd91a00000,0x000000cd91b00000) (1024K)]
+  0x000002389816dc70 WorkerThread "G1 Conc#0"                       [id=400840, stack(0x000000cd91b00000,0x000000cd91c00000) (1024K)]
+
+[error occurred during error reporting (printing all threads), id 0xc0000005, EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007fffea94d307]
+VM state: not at safepoint (not fully initialized)
+
+VM Mutex/Monitor currently owned by a thread:  ([mutex/lock_event])
+[0x00007fffeb2ca8c8] Heap_lock - owner thread: 0x00000238980bf850
+
+Heap address: 0x00000000a0000000, size: 30208 MB, Compressed Oops mode: Zero based, Oop shift amount: 3
+
+CDS archive(s) mapped at: [0x0000000000000000-0x0000000000000000-0x0000000000000000), size 0, SharedBaseAddress: 0x0000000800000000, ArchiveRelocationMode: 1.
+Narrow klass base: 0x0000000000000000, Narrow klass shift: 0, Narrow klass range: 0x0
+
+GC Precious Log:
+ CardTable entry size: 512
+ Card Set container configuration: InlinePtr #cards 3 size 8 Array Of Cards #cards 128 size 272 Howl #buckets 8 coarsen threshold 29491 Howl Bitmap #cards 4096 size 528 coarsen threshold 3686 Card regions per heap region 1 cards per card region 32768
+
+Heap:
+ garbage-first heap   total 0K, used 0K [0x00000000a0000000, 0x0000000800000000)
+  region size 16384K, 0 young (0K), 0 survivors (0K)
+
+[error occurred during error reporting (printing heap information), id 0xc0000005, EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007fffead3ba99]
+GC Heap History (0 events):
+No events
+
+Dll operation events (1 events):
+Event: 0.005 Loaded shared library C:\Program Files\Android\openjdk\jdk-21.0.8\bin\java.dll
+
+Deoptimization events (0 events):
+No events
+
+Classes loaded (0 events):
+No events
+
+Classes unloaded (0 events):
+No events
+
+Classes redefined (0 events):
+No events
+
+Internal exceptions (0 events):
+No events
+
+ZGC Phase Switch (0 events):
+No events
+
+VM Operations (0 events):
+No events
+
+Memory protections (0 events):
+No events
+
+Nmethod flushes (0 events):
+No events
+
+Events (0 events):
+No events
+
+
+Dynamic libraries:
+0x00007ff668040000 - 0x00007ff66804e000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\java.exe
+0x00007ff981840000 - 0x00007ff981aa7000 	C:\WINDOWS\SYSTEM32\ntdll.dll
+0x00007ff980840000 - 0x00007ff980909000 	C:\WINDOWS\System32\KERNEL32.DLL
+0x00007ff97f150000 - 0x00007ff97f541000 	C:\WINDOWS\System32\KERNELBASE.dll
+0x00007ff97e2a0000 - 0x00007ff97e3eb000 	C:\WINDOWS\System32\ucrtbase.dll
+0x00007ff950ee0000 - 0x00007ff950ef8000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\jli.dll
+0x00007ff950de0000 - 0x00007ff950dfe000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\VCRUNTIME140.dll
+0x00007ff97fad0000 - 0x00007ff97fc95000 	C:\WINDOWS\System32\USER32.dll
+0x00007ff9626b0000 - 0x00007ff962943000 	C:\WINDOWS\WinSxS\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.26100.8037_none_3e092faae333b53b\COMCTL32.dll
+0x00007ff97e740000 - 0x00007ff97e767000 	C:\WINDOWS\System32\win32u.dll
+0x00007ff97f960000 - 0x00007ff97fa09000 	C:\WINDOWS\System32\msvcrt.dll
+0x00007ff980da0000 - 0x00007ff980dcb000 	C:\WINDOWS\System32\GDI32.dll
+0x00007ff97e4a0000 - 0x00007ff97e5cb000 	C:\WINDOWS\System32\gdi32full.dll
+0x00007ff97e770000 - 0x00007ff97e813000 	C:\WINDOWS\System32\msvcp_win.dll
+0x00007ff97f5e0000 - 0x00007ff97f611000 	C:\WINDOWS\System32\IMM32.DLL
+0x00007ff979430000 - 0x00007ff97943c000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\vcruntime140_1.dll
+0x00007ff8ae350000 - 0x00007ff8ae3d9000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\msvcp140.dll
+0x00007fffea600000 - 0x00007fffeb3ac000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\server\jvm.dll
+0x00007ff97fa10000 - 0x00007ff97facb000 	C:\WINDOWS\System32\ADVAPI32.dll
+0x00007ff97fdf0000 - 0x00007ff97fe97000 	C:\WINDOWS\System32\sechost.dll
+0x00007ff980f60000 - 0x00007ff981078000 	C:\WINDOWS\System32\RPCRT4.dll
+0x00007ff980ee0000 - 0x00007ff980f54000 	C:\WINDOWS\System32\WS2_32.dll
+0x00007ff97d980000 - 0x00007ff97d9de000 	C:\WINDOWS\SYSTEM32\POWRPROF.dll
+0x00007ff977f10000 - 0x00007ff977f45000 	C:\WINDOWS\SYSTEM32\WINMM.dll
+0x00007ff9768b0000 - 0x00007ff9768bb000 	C:\WINDOWS\SYSTEM32\VERSION.dll
+0x00007ff97d960000 - 0x00007ff97d974000 	C:\WINDOWS\SYSTEM32\UMPDC.dll
+0x00007ff97ce70000 - 0x00007ff97ce8b000 	C:\WINDOWS\SYSTEM32\kernel.appcore.dll
+0x00007ff950ed0000 - 0x00007ff950eda000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\jimage.dll
+0x00007ff97b890000 - 0x00007ff97bad2000 	C:\WINDOWS\SYSTEM32\DBGHELP.DLL
+0x00007ff97ff60000 - 0x00007ff9802e2000 	C:\WINDOWS\System32\combase.dll
+0x00007ff97fd10000 - 0x00007ff97fde7000 	C:\WINDOWS\System32\OLEAUT32.dll
+0x00007ff9508b0000 - 0x00007ff9508eb000 	C:\WINDOWS\SYSTEM32\dbgcore.DLL
+0x00007ff97e3f0000 - 0x00007ff97e495000 	C:\WINDOWS\System32\bcryptPrimitives.dll
+0x00007ff909c30000 - 0x00007ff909c51000 	C:\Program Files\Android\openjdk\jdk-21.0.8\bin\java.dll
+
+JVMTI agents: none
+
+dbghelp: loaded successfully - version: 4.0.5 - missing functions: none
+symbol engine: initialized successfully - sym options: 0x614 - pdb path: .;C:\Program Files\Android\openjdk\jdk-21.0.8\bin;C:\WINDOWS\SYSTEM32;C:\WINDOWS\WinSxS\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.26100.8037_none_3e092faae333b53b;C:\Program Files\Android\openjdk\jdk-21.0.8\bin\server
+
+VM Arguments:
+java_command: com.xamarin.manifestmerger.Main obj\Debug\net10.0-android\android\manifestmerger.rsp
+java_class_path (initial): C:\Program Files\dotnet\packs\Microsoft.Android.Sdk.Windows\36.1.2\tools\manifestmerger.jar
+Launcher Type: SUN_STANDARD
+
+[Global flags]
+     intx CICompilerCount                          = 12                                        {product} {ergonomic}
+     uint ConcGCThreads                            = 5                                         {product} {ergonomic}
+     uint G1ConcRefinementThreads                  = 18                                        {product} {ergonomic}
+   size_t G1HeapRegionSize                         = 16777216                                  {product} {ergonomic}
+    uintx GCDrainStackTargetSize                   = 64                                        {product} {ergonomic}
+   size_t InitialHeapSize                          = 2147483648                                {product} {ergonomic}
+   size_t MarkStackSize                            = 4194304                                   {product} {ergonomic}
+   size_t MaxHeapSize                              = 31675383808                               {product} {ergonomic}
+   size_t MinHeapDeltaBytes                        = 16777216                                  {product} {ergonomic}
+   size_t MinHeapSize                              = 16777216                                  {product} {ergonomic}
+    uintx NonNMethodCodeHeapSize                   = 7602480                                {pd product} {ergonomic}
+    uintx NonProfiledCodeHeapSize                  = 122027880                              {pd product} {ergonomic}
+    uintx ProfiledCodeHeapSize                     = 122027880                              {pd product} {ergonomic}
+    uintx ReservedCodeCacheSize                    = 251658240                              {pd product} {ergonomic}
+     bool SegmentedCodeCache                       = true                                      {product} {ergonomic}
+   size_t SoftMaxHeapSize                          = 31675383808                            {manageable} {ergonomic}
+     bool UseCompressedOops                        = true                           {product lp64_product} {ergonomic}
+     bool UseG1GC                                  = true                                      {product} {ergonomic}
+     bool UseLargePagesIndividualAllocation        = false                                  {pd product} {ergonomic}
+
+Logging:
+Log output configuration:
+ #0: stdout all=warning uptime,level,tags foldmultilines=false
+ #1: stderr all=off uptime,level,tags foldmultilines=false
+
+Environment Variables:
+PATH=C:\Program Files\Android\openjdk\jdk-21.0.8\bin;C:\Program Files\PowerShell\7;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;C:\Program Files\dotnet\;C:\ProgramData\chocolatey\bin;C:\Users\phil\AppData\Local\Microsoft\WindowsApps;C:\Program Files\Notepad++;C:\Program Files\PuTTY\;C:\Program Files\Docker\Docker\resources\bin;C:\Program Files\Microsoft SQL Server\170\Tools\Binn\;C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\;C:\Program Files\Nodejs;C:\Users\phil\AppData\Roaming\npm;C:\Users\phil\AppData\Local\Programs\Fiddler;C:\Users\phil\AppData\Local\gitkraken\bin;C:\Users\phil\AppData\Local\PowerToys\DSCModules\;C:\Users\phil\.dotnet\tools;C:\tools;C:\Program Files\SEGGER\JLink_V874a;C:\Program Files\Git\cmd;C:\Program Files\Microsoft SQL Server\170\DTS\Binn\;C:\Program Files\PowerShell\7\;C:\Users\phil\AppData\Local\Microsoft\WindowsApps;C:\Users\phil\AppData\Roaming\npm;C:\Users\phil\AppData\Local\Programs\Fiddler;C:\Users\phil\AppData\Local\gitkraken\bin;C:\Users\phil\.dotnet\tools;C:\Users\phil\AppData\Local\PowerToys\DSCModules\;C:\Users\phil\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\phil\.local\bin;C:\Users\phil\AppData\Local\Microsoft\WinGet\Packages\Microsoft.devtunnel_Microsoft.Winget.Source_8wekyb3d8bbwe;C:\Users\phil\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin;
+USERNAME=phil
+OS=Windows_NT
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 198 Stepping 2, GenuineIntel
+TMP=C:\Users\phil\AppData\Local\Temp
+TEMP=C:\Users\phil\AppData\Local\Temp
+
+
+
+
+Periodic native trim disabled
+
+---------------  S Y S T E M  ---------------
+
+OS:
+ Windows 11 , 64 bit Build 26100 (10.0.26100.7920)
+OS uptime: 9 days 12:08 hours
+Hyper-V role detected
+
+CPU: total 24 (initial active 24) (24 cores per cpu, 1 threads per core) family 6 model 198 stepping 2 microcode 0x11b, cx8, cmov, fxsr, mmx, 3dnowpref, sse, sse2, sse3, ssse3, sse4.1, sse4.2, popcnt, lzcnt, tsc, tscinvbit, avx, avx2, aes, erms, clmul, bmi1, bmi2, adx, sha, fma, vzeroupper, clflush, clflushopt, clwb, hv, serialize, rdtscp, rdpid, fsrm, f16c, cet_ibt, cet_ss
+Processor Information for processor 0
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 1
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 2
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 3
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 4
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 5
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 6
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 7
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 8
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 9
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 10
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 11
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 12
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 13
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 14
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 15
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 16
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 17
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 18
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 19
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 20
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 21
+  Max Mhz: 3200, Current Mhz: 3200, Mhz Limit: 3200
+Processor Information for processor 22
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+Processor Information for processor 23
+  Max Mhz: 3700, Current Mhz: 3700, Mhz Limit: 3700
+
+Memory: 4k page, system-wide physical 130514M (66873M free)
+TotalPageFile size 249641M (AvailPageFile size 1809M)
+current process WorkingSet (physical memory assigned to process): 13M, peak: 13M
+current process commit charge ("private bytes"): 82M, peak: 2130M
+
+vm_info: OpenJDK 64-Bit Server VM (21.0.8+9-LTS) for windows-amd64 JRE (21.0.8+9-LTS), built on 2025-07-10T20:22:44Z by "MicrosoftCorporation" with unknown MS VC++:1944
+
+END.

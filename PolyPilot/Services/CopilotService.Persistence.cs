@@ -30,6 +30,7 @@ public partial class CopilotService
                     ReasoningEffort = s.Info.ReasoningEffort,
                     WorkingDirectory = s.Info.WorkingDirectory,
                     GroupId = sessionMetas.FirstOrDefault(m => m.SessionName == s.Info.Name)?.GroupId,
+                    RecoveredFromSessionId = s.Info.RecoveredFromSessionId,
                     LastPrompt = s.Info.IsProcessing
                         ? s.Info.History.LastOrDefault(m => m.IsUser)?.Content
                         : null,
@@ -77,6 +78,7 @@ public partial class CopilotService
                     WorkingDirectory = s.Info.WorkingDirectory,
                     ReasoningEffort = s.Info.ReasoningEffort,
                     GroupId = sessionMetas.FirstOrDefault(m => m.SessionName == s.Info.Name)?.GroupId,
+                    RecoveredFromSessionId = s.Info.RecoveredFromSessionId,
                     LastPrompt = s.Info.IsProcessing
                         ? s.Info.History.LastOrDefault(m => m.IsUser)?.Content
                         : null,
@@ -190,6 +192,18 @@ public partial class CopilotService
             var entryToAdd = existing;
             if (activeNames.Contains(existing.DisplayName))
             {
+                // If the active session moved to a different group (e.g., scattered team
+                // reconstruction created a new multi-agent group and the session was recreated
+                // there), the persisted entry may be an obsolete predecessor. Drop it only
+                // when the replacement explicitly records that it recovered history from this
+                // exact session ID; otherwise keep a "(previous)" entry so recoverability wins.
+                var activeCounterpart = active.FirstOrDefault(a =>
+                    string.Equals(a.DisplayName, existing.DisplayName, StringComparison.OrdinalIgnoreCase));
+                if (activeCounterpart != null && CanSafelyDropSupersededGroupMoveEntry(existing, activeCounterpart))
+                {
+                    continue; // Explicitly recovered into the active group-moved replacement
+                }
+
                 entryToAdd = new ActiveSessionEntry
                 {
                     SessionId = existing.SessionId,
@@ -199,6 +213,7 @@ public partial class CopilotService
                     WorkingDirectory = existing.WorkingDirectory,
                     LastPrompt = existing.LastPrompt,
                     GroupId = existing.GroupId,
+                    RecoveredFromSessionId = existing.RecoveredFromSessionId,
                     TotalInputTokens = existing.TotalInputTokens,
                     TotalOutputTokens = existing.TotalOutputTokens,
                     ContextCurrentTokens = existing.ContextCurrentTokens,
@@ -221,6 +236,27 @@ public partial class CopilotService
         }
 
         return merged;
+    }
+
+    private static bool CanSafelyDropSupersededGroupMoveEntry(
+        ActiveSessionEntry existing,
+        ActiveSessionEntry activeCounterpart)
+    {
+        // Require an explicit recovery marker — without it we don't know if the new session
+        // is really a replacement for the old one (it might just be a same-named unrelated session).
+        if (string.IsNullOrEmpty(activeCounterpart.RecoveredFromSessionId) ||
+            !string.Equals(activeCounterpart.RecoveredFromSessionId, existing.SessionId, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // If RecoveredFromSessionId explicitly matches, allow drop regardless of group.
+        // Covers two cases:
+        //   1. Cross-group: scattered team reconstruction moved the session to a new group
+        //   2. Same-group: worker revival (empty response → fresh session within the same group)
+        // Both are safe to drop because the active entry explicitly records that it recovered
+        // history from the old one — there is no user-visible history loss.
+        return true;
     }
 
     /// <summary>
@@ -248,6 +284,7 @@ public partial class CopilotService
         // Restore real LastUpdatedAt so focus detection uses actual activity time, not restore time
         if (entry.LastUpdatedAt.HasValue)
             state.Info.LastUpdatedAt = entry.LastUpdatedAt.Value;
+        state.Info.RecoveredFromSessionId ??= entry.RecoveredFromSessionId;
 
         // Backfill from events.jsonl only when ALL tracked fields are zero (indicating "never tracked")
         if (entry.PremiumRequestsUsed == 0 && entry.TotalApiTimeSeconds == 0 && !entry.CreatedAt.HasValue)
@@ -377,14 +414,11 @@ public partial class CopilotService
             var resumeModel = state.Info.Model ?? DefaultModel;
             var resumeWorkDir = state.Info.WorkingDirectory;
 
-            var resumeConfig = new ResumeSessionConfig
-            {
-                Model = resumeModel,
-                WorkingDirectory = resumeWorkDir,
-                Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                OnPermissionRequest = AutoApprovePermissions,
-                InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
-            };
+            // Clear IsOrphaned before resuming so early replay events from ResumeSessionConfig.OnEvent
+            // are not dropped by the orphan guard in HandleSessionEvent.
+            state.IsOrphaned = false;
+
+            var resumeConfig = BuildResumeSessionConfig(state, resumeWorkDir, evt => HandleSessionEvent(state, evt));
 
             CopilotSession copilotSession;
             bool wasResumed = false;
@@ -400,14 +434,14 @@ public partial class CopilotService
                 IsProcessError(ex))
             {
                 Debug($"Lazy-resume failed for '{sessionName}': {ex.Message} — creating fresh session");
-                copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(new SessionConfig
-                {
-                    Model = resumeModel,
-                    WorkingDirectory = resumeWorkDir,
-                    Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
-                    OnPermissionRequest = AutoApprovePermissions,
-                    InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
-                }, cancellationToken);
+                state.Info.Model = resumeModel;
+                state.Info.WorkingDirectory = resumeWorkDir;
+                var freshConfig = BuildFreshSessionConfig(state);
+                copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(freshConfig, cancellationToken);
+                // Attach event handler on the fresh session so it isn't deaf.
+                // BuildFreshSessionConfig doesn't set OnEvent on the SessionConfig, and
+                // the old post-resume .On() was removed, so we must register explicitly here.
+                copilotSession.On(evt => HandleSessionEvent(state, evt));
                 state.Info.SessionId = copilotSession.SessionId;
                 FlushSaveActiveSessionsToDisk();
             }
@@ -438,19 +472,9 @@ public partial class CopilotService
                 copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
             }
 
-            // Clear IsOrphaned BEFORE registering the event handler — the state may have
-            // been marked orphaned by a sibling reconnect failure (e.g., corrupted session
-            // file caused re-resume to fail, setting IsOrphaned=true on this state).
-            // Without this reset, HandleSessionEvent silently drops all events and the
-            // session appears stuck to mobile clients despite the CLI responding normally.
-            // Order matters: reset first so no early SDK replay events (e.g., session.resume
-            // acknowledgment) are dropped by the IsOrphaned guard in HandleSessionEvent.
-            state.IsOrphaned = false;
-            // INV-16: Register event handler BEFORE publishing to state —
-            // no window where events arrive with no handler. Matches the pattern
-            // in sibling reconnect (CopilotService.cs:2766) and worker revival
-            // (Organization.cs:1547).
-            copilotSession.On(evt => HandleSessionEvent(state, evt));
+            // INV-16: For the happy-path resume, the event handler is registered via
+            // ResumeSessionConfig.OnEvent before the RPC. For the fallback fresh-create
+            // path, .On() is called explicitly right after CreateSessionAsync.
             state.Session = copilotSession;
             state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
 
@@ -933,6 +957,7 @@ public partial class CopilotService
                                         recreatedState.Info.History.Add(ChatMessage.SystemMessage("🔄 Session recreated — conversation history recovered from previous session."));
                                         recreatedState.Info.MessageCount = recreatedState.Info.History.Count;
                                         recreatedState.Info.LastReadMessageCount = recreatedState.Info.History.Count;
+                                        recreatedState.Info.RecoveredFromSessionId = bestSourceId;
                                     }
 
                                     // Restore usage stats (token counts, CreatedAt, etc.)
@@ -1145,7 +1170,7 @@ public partial class CopilotService
         }
     }
 
-    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null, int? sidebarWidth = null, bool? sidebarRailMode = null)
+    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null, int? sidebarWidth = null, bool? sidebarRailMode = null, bool? hasSeenTutorialPrompt = null)
     {
         try
         {
@@ -1171,6 +1196,7 @@ public partial class CopilotService
                     : existing?.Drafts ?? new Dictionary<string, string>(),
                 SidebarWidth = Math.Clamp(sidebarWidth ?? existing?.SidebarWidth ?? 320, 200, 600),
                 SidebarRailMode = sidebarRailMode ?? existing?.SidebarRailMode ?? false,
+                HasSeenTutorialPrompt = hasSeenTutorialPrompt ?? existing?.HasSeenTutorialPrompt ?? false,
             };
 
             lock (_uiStateLock)

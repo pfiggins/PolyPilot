@@ -80,11 +80,14 @@ public partial class CopilotService
     /// the worker is likely still active despite the premature session.idle.</summary>
     internal const int PrematureIdleEventsFileFreshnessSeconds = 15;
 
-    /// <summary>Grace period after TCS completion before declaring premature idle based on
-    /// events.jsonl mtime. During this window we observe whether the file's mtime changes
-    /// (indicating the CLI is still writing), vs. remaining frozen (normal completion where
-    /// the idle event itself wrote the file). This prevents false-positive premature idle
-    /// detection when events.jsonl was just written by the completing idle event.</summary>
+    /// <summary>Settle period (first phase of two-phase grace check): waits for the OS to
+    /// flush the completing event's mtime update before taking the stable baseline snapshot.
+    /// Must be less than PrematureIdleEventsGracePeriodMs. Observation window = Grace - Settle.</summary>
+    internal const int PrematureIdleEventsSettleMs = 500;
+
+    /// <summary>Total observation window: settle (500ms) + observe (1500ms) = 2000ms.
+    /// After settle, we snapshot stableMtime. After the full window, endMtime > stableMtime
+    /// means the CLI wrote NEW events (genuine premature idle), not just the completing flush.</summary>
     internal const int PrematureIdleEventsGracePeriodMs = 2000;
 
     /// <summary>Maximum time to wait for the worker's real completion after detecting a
@@ -648,9 +651,21 @@ public partial class CopilotService
                             var repo = _repoManager.Repositories.FirstOrDefault(r => r.Id == worktree.RepoId);
                             if (repo != null)
                             {
-                                var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
-                                if (repoGroup != null)
-                                    meta.GroupId = repoGroup.Id;
+                                // Prefer an existing local folder group for this repo over creating
+                                // a new URL-based repo group. This prevents duplicate sidebar entries
+                                // when the user added the repo via "Existing folder".
+                                var localFolderGroup = Organization.Groups.FirstOrDefault(g =>
+                                    g.RepoId == repo.Id && g.IsLocalFolder && !g.IsMultiAgent);
+                                if (localFolderGroup != null)
+                                {
+                                    meta.GroupId = localFolderGroup.Id;
+                                }
+                                else
+                                {
+                                    var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
+                                    if (repoGroup != null)
+                                        meta.GroupId = repoGroup.Id;
+                                }
                             }
                         }
                         changed = true;
@@ -670,11 +685,23 @@ public partial class CopilotService
                     var repo = _repoManager.Repositories.FirstOrDefault(r => r.Id == worktree.RepoId);
                     if (repo != null)
                     {
-                        var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
-                        if (repoGroup != null)
+                        // Prefer an existing local folder group (same fix as the
+                        // workingDir-based block above) to avoid duplicate sidebar entries.
+                        var localFolderGroup = Organization.Groups.FirstOrDefault(g =>
+                            g.RepoId == repo.Id && g.IsLocalFolder && !g.IsMultiAgent);
+                        if (localFolderGroup != null)
                         {
-                            meta.GroupId = repoGroup.Id;
+                            meta.GroupId = localFolderGroup.Id;
                             changed = true;
+                        }
+                        else
+                        {
+                            var repoGroup = GetOrCreateRepoGroup(repo.Id, repo.Name);
+                            if (repoGroup != null)
+                            {
+                                meta.GroupId = repoGroup.Id;
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -2379,10 +2406,11 @@ public partial class CopilotService
                 // Collect results — all tasks should now be completed (force-completed or already done).
                 // Use try/catch since force-completed tasks may fault.
                 var partialResults = new List<WorkerResult>();
-                foreach (var t in workerTasks)
+                for (var i = 0; i < workerTasks.Count; i++)
                 {
-                    try { partialResults.Add(await t); }
-                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                    var workerName = i < assignments.Count ? assignments[i].WorkerName : "unknown";
+                    try { partialResults.Add(await workerTasks[i]); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult(workerName, null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
                 }
                 results = partialResults.ToArray();
             }
@@ -2828,6 +2856,12 @@ public partial class CopilotService
     private record WorkerResult(string WorkerName, string? Response, bool Success, string? Error, TimeSpan Duration);
 
     /// <summary>
+    /// Upper bound for AbortAsync during force-complete cleanup. The cleanup path exists to
+    /// recover from stuck workers; it must stay bounded even if the SDK RPC is half-open.
+    /// </summary>
+    internal const int ForceCompleteAbortTimeoutSeconds = 15;
+
+    /// <summary>
     /// Full INV-1-compliant force-completion of a session's processing state.
     /// Clears all 9+ companion fields, resolves the ResponseCompletion TCS,
     /// fires OnSessionComplete, and cancels background timers.
@@ -2841,6 +2875,14 @@ public partial class CopilotService
         CancelToolHealthCheck(state);
         CancelIdleDeferFallback(state);
 
+        // Capture whether a tool call is in-flight BEFORE we reset ActiveToolCallCount below.
+        // If true we must abort the SDK session after the UI-thread cleanup so the CLI clears
+        // its pending tool expectations. Without this, the next SendAsync is silently dropped —
+        // the SDK queues the message but the CLI is blocked waiting for a tool result that will
+        // never arrive (e.g., a bash tool whose process was killed externally).
+        // This mirrors the RESUME-QUIESCE abort in CopilotService.Persistence.cs.
+        var hadActiveTool = Volatile.Read(ref state.ActiveToolCallCount) > 0;
+
         var tcs = new TaskCompletionSource<bool>();
         InvokeOnUI(() =>
         {
@@ -2848,24 +2890,13 @@ public partial class CopilotService
             {
                 if (!state.Info.IsProcessing) { tcs.TrySetResult(true); return; }
 
-                // Full cleanup mirroring CompleteResponse / unstartedWorkers recovery
+                // Full cleanup via ClearProcessingState
                 FlushCurrentResponse(state);
-                Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                Interlocked.Exchange(ref state.SendingFlag, 0);
-                Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
                 Interlocked.Exchange(ref state.WatchdogCaseBResets, 0);
                 Interlocked.Exchange(ref state.WatchdogCaseBLastFileSize, 0);
                 Interlocked.Exchange(ref state.WatchdogCaseBStaleCount, 0);
-                state.HasUsedToolsThisTurn = false;
-                state.HasDeferredIdle = false;
-                Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
                 state.FallbackCanceledByTurnStart = false;
-                state.Info.IsResumed = false;
-                state.Info.ProcessingStartedAt = null;
-                state.Info.ToolCallCount = 0;
-                state.Info.ProcessingPhase = 0;
-                state.Info.ClearPermissionDenials();
 
                 var response = state.CurrentResponse.ToString();
                 var fullResponse = state.FlushedResponse.Length > 0
@@ -2874,10 +2905,11 @@ public partial class CopilotService
                         : state.FlushedResponse + "\n\n" + response)
                     : response;
 
-                state.CurrentResponse.Clear();
-                state.FlushedResponse.Clear();
-                state.PendingReasoningMessages.Clear();
-                state.Info.IsProcessing = false;
+                // Accumulate API time but don't count as premium request (forced recovery)
+                if (state.Info.ProcessingStartedAt is { } forceStarted)
+                    state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - forceStarted).TotalSeconds;
+                ClearProcessingState(state, accumulateApiTime: false);
+                state.AllowTurnStartRearm = false; // Force-complete is explicit recovery, not a speculative idle completion
 
                 state.ResponseCompletion?.TrySetResult(fullResponse);
                 var summary = fullResponse.Length > 0 ? (fullResponse.Length > 100 ? fullResponse[..100] + "..." : fullResponse) : "";
@@ -2889,6 +2921,33 @@ public partial class CopilotService
             catch (Exception ex) { tcs.TrySetException(ex); }
         });
         try { await tcs.Task; } catch { }
+
+        // If a tool call was in-flight when we force-completed, abort the SDK session to clear
+        // the CLI's pending tool expectations. Without this, the next SendAsync succeeds at the
+        // transport level but the CLI never processes it — it's stuck waiting for tool results
+        // that will never arrive. Non-fatal: if AbortAsync fails the session will still accept
+        // new messages on the next reconnect (lazy-resume clears SDK state independently).
+        if (hadActiveTool)
+        {
+            var session = state.Session;
+            if (session != null)
+            {
+                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(ForceCompleteAbortTimeoutSeconds));
+                try
+                {
+                    await session.AbortAsync(abortCts.Token);
+                    Debug($"[DISPATCH] ForceCompleteProcessing '{sessionName}': abort sent to clear pending tool state");
+                }
+                catch (OperationCanceledException) when (abortCts.IsCancellationRequested)
+                {
+                    Debug($"[DISPATCH] ForceCompleteProcessing '{sessionName}': abort timed out after {ForceCompleteAbortTimeoutSeconds}s — proceeding anyway");
+                }
+                catch (Exception abortEx)
+                {
+                    Debug($"[DISPATCH] ForceCompleteProcessing '{sessionName}': abort failed (non-fatal): {abortEx.Message}");
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -3029,6 +3088,10 @@ public partial class CopilotService
                     Debug($"[DISPATCH] Worker '{workerName}' returned empty — attempting fresh session revival");
                     if (_sessions.TryGetValue(workerName, out var deadState))
                     {
+                        // Capture the old session ID BEFORE orphaning — used to prevent
+                        // MergeSessionEntries from creating a "(previous)" phantom entry.
+                        var deadSessionId = deadState.Info.SessionId;
+
                         // Mark old state as orphaned so any lingering callbacks are no-ops
                         deadState.IsOrphaned = true;
                         try { await deadState.Session.DisposeAsync(); } catch { }
@@ -3056,11 +3119,18 @@ public partial class CopilotService
                             }
                             else
                             {
-                                // Commit SessionId only after TryUpdate succeeds — avoids
-                                // mutating shared Info on a path that might discard the state.
+                                // Commit SessionId + recovery marker only after TryUpdate succeeds.
+                                // RecoveredFromSessionId records that the new session explicitly replaced
+                                // the old one — MergeSessionEntries uses this to drop the old persisted
+                                // entry instead of renaming it "(previous)" (same-group revival case).
+                                deadState.Info.RecoveredFromSessionId ??= deadSessionId;
                                 deadState.Info.SessionId = freshSession.SessionId;
+                                // Add the old session ID to the closed set so SaveActiveSessionsToDisk's
+                                // merge logic drops it instead of creating a "(previous)" phantom entry.
+                                if (!string.IsNullOrEmpty(deadSessionId))
+                                    _closedSessionIds[deadSessionId] = 0;
                                 DisposePrematureIdleSignal(deadState);
-                                Debug($"[DISPATCH] Worker '{workerName}' revived with fresh session '{freshSession.SessionId}'");
+                                Debug($"[DISPATCH] Worker '{workerName}' revived with fresh session '{freshSession.SessionId}' (replaced '{deadSessionId}')");
                                 response = await SendPromptAndWaitAsync(workerName, workerPrompt, cancellationToken, originalPrompt: originalPrompt);
                             }
                         }
@@ -3386,40 +3456,36 @@ public partial class CopilotService
 
         if (!detected)
         {
-            // Snapshot mtime and wait briefly to detect whether CLI is still writing.
-            // Without this grace period we'd false-positive: the idle event itself just
-            // wrote to events.jsonl, making it appear "fresh" even on normal completion.
-            var mtimeBefore = GetEventsFileMtime(state.Info.SessionId);
-            try { await Task.Delay(PrematureIdleEventsGracePeriodMs, cancellationToken); }
+            // Two-phase mtime check to avoid OS mtime-flush false positives.
+            //
+            // Problem: the SDK writes assistant.turn_end to events.jsonl, then immediately emits
+            // session.idle (ephemeral, not written). TCS fires and we capture `mtimeBefore`, but
+            // the OS may not have flushed the turn_end mtime update yet (APFS can buffer for ~100ms).
+            // If we compare mtimeBefore (pre-flush) vs stableMtime (post-flush), we see a phantom
+            // change even though no new processing happened.
+            //
+            // Fix: brief settle (500ms) to let the OS flush the completing write's mtime, THEN
+            // snapshot `stableMtime` as a clean baseline. After 1500ms observation, compare against
+            // that post-settle baseline — only genuine new writes (tool rounds, etc.) trigger detection.
+            try { await Task.Delay(PrematureIdleEventsSettleMs, cancellationToken); }
             catch (OperationCanceledException) { return initialResponse; }
+            // Post-settle baseline — already includes the completing turn_end write's mtime
             stableMtime = GetEventsFileMtime(state.Info.SessionId);
-            // Mtime changed → CLI wrote new events during grace period → genuine premature idle
-            detected = stableMtime.HasValue && stableMtime.Value > (mtimeBefore ?? DateTime.MinValue);
-        }
 
-        if (!detected)
-        {
-            // Wait for PrematureIdleSignal OR poll events.jsonl for mtime changes
-            var detectStart = DateTime.UtcNow;
-            while ((DateTime.UtcNow - detectStart).TotalMilliseconds < PrematureIdleDetectionWindowMs)
+            try { await Task.Delay(PrematureIdleEventsGracePeriodMs - PrematureIdleEventsSettleMs, cancellationToken); }
+            catch (OperationCanceledException) { return initialResponse; }
+
+            var endMtime = GetEventsFileMtime(state.Info.SessionId);
+            // endMtime > stableMtime only if the CLI wrote NEW events after the settle
+            if (endMtime.HasValue && endMtime.Value > (stableMtime ?? DateTime.MinValue))
             {
-                // Wait up to 500ms on the signal (exits immediately if Set())
-                var signaled = await Task.Run(WaitForPrematureIdleSignal, cancellationToken)
-                    .ConfigureAwait(false);
-                
-                if (signaled || cancellationToken.IsCancellationRequested)
-                {
-                    detected = signaled;
-                    break;
-                }
-                
-                // Check if events.jsonl mtime advanced past the stable baseline
-                var currentMtime = GetEventsFileMtime(state.Info.SessionId);
-                if (currentMtime.HasValue && currentMtime.Value > (stableMtime ?? DateTime.MinValue))
-                {
-                    detected = true;
-                    break;
-                }
+                var eventsPath = Path.Combine(SessionStatePath, state.Info.SessionId ?? "", "events.jsonl");
+                var lastEvent = GetLastEventType(eventsPath);
+                // session.resume = reconnect write (not new processing)
+                // session.shutdown = terminal
+                detected = lastEvent != null && lastEvent != "session.resume" && lastEvent != "session.shutdown";
+                if (!detected)
+                    Debug($"[DISPATCH-RECOVER] Skipping grace-period false positive: last event={lastEvent ?? "none"} is a reconnect/terminal write, not premature idle");
             }
         }
 
@@ -4070,70 +4136,106 @@ public partial class CopilotService
             // response still streaming when workers complete and we try to send synthesis).
             await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
 
-            // Wait for the orchestrator's synthesis response so we can check for @worker blocks.
-            // Previously this was fire-and-forget, which meant the orchestrator could plan more
-            // work but nobody would dispatch it, leaving the group hung.
-            var synthesisResponse = await SendPromptAndWaitAsync(pending.OrchestratorName, synthesisPrompt, ct, originalPrompt: pending.OriginalPrompt);
-            await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
-            Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}' — response len={synthesisResponse.Length}");
-
-            // Check if the orchestrator marked the work as complete
-            if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase))
+            if (pending.IsReflect)
             {
-                Debug($"[DISPATCH] Resume synthesis response contains [[GROUP_REFLECT_COMPLETE]] — marking complete");
-                var group2 = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
-                if (group2?.ReflectionState != null)
-                {
-                    group2.ReflectionState.GoalMet = true;
-                    group2.ReflectionState.IsActive = false;
-                    group2.ReflectionState.CompletedAt = DateTime.Now;
-                    AddOrchestratorSystemMessage(pending.OrchestratorName,
-                        $"✅ {group2.ReflectionState.BuildCompletionSummary()}");
-                }
-                ClearPendingOrchestration();
-                SaveOrganization();
-                InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
-                return;
-            }
-
-            // Check if the orchestrator's response contains @worker blocks indicating more work
-            var workerNames = pending.WorkerNames;
-            var newAssignments = ParseTaskAssignments(synthesisResponse, workerNames);
-
-            if (newAssignments.Count > 0)
-            {
-                Debug($"[DISPATCH] Resume synthesis response contains {newAssignments.Count} @worker assignments — re-entering reflect loop");
-                AddOrchestratorSystemMessage(pending.OrchestratorName,
-                    $"🔄 Orchestrator dispatched {newAssignments.Count} follow-up task(s) — continuing...");
-
-                // Re-enter the full reflect loop for the group
-                var group = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
-                if (group != null && pending.IsReflect && group.ReflectionState != null)
-                {
-                    // Re-activate the reflection state so the loop can continue
-                    group.ReflectionState.IsActive = true;
-                    group.ReflectionState.LastEvaluation = "Resumed after interruption. The orchestrator's last response dispatched new worker tasks. Continue the reflect loop.";
-                    ClearPendingOrchestration();
-
-                    var members = GetMultiAgentGroupMembers(pending.GroupId);
-                    InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Planning, "Resumed"));
-                    await SendViaOrchestratorReflectAsync(pending.GroupId, members, pending.OriginalPrompt, ct);
-                    return; // reflect loop handles completion
-                }
-
-                // Non-reflect fallback: dispatch workers directly and collect results
-                ClearPendingOrchestration();
-                var deduped = DeduplicateAssignments(newAssignments);
-                var followUpTasks = deduped.Select(a => ExecuteWorkerAsync(a.WorkerName, a.Task, pending.OriginalPrompt, ct));
-                var followUpResults = await Task.WhenAll(followUpTasks);
-
-                // Send follow-up results back to orchestrator
-                var followUpSynthesis = BuildSynthesisPrompt(pending.OriginalPrompt, followUpResults.ToList());
+                // For reflect-mode groups the orchestrator's response to the synthesis may contain
+                // new @worker blocks (it wants to keep iterating rather than emit
+                // [[GROUP_REFLECT_COMPLETE]]). If we just fire-and-forget with SendPromptAsync the
+                // @worker dispatch is silently dropped and the loop stalls indefinitely.
+                // Wait for the response and, if new assignments are found, execute one more
+                // collect+synthesize round so the loop can complete or continue naturally.
+                var availableWorkers = GetMultiAgentGroupMembers(pending.GroupId)
+                    .Where(m => m != pending.OrchestratorName).ToList();
+                var orchestratorResponse = await SendPromptAndWaitAsync(
+                    pending.OrchestratorName, synthesisPrompt, ct, originalPrompt: pending.OriginalPrompt);
                 await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
-                await SendPromptAsync(pending.OrchestratorName, followUpSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
-                Debug($"[DISPATCH] Resume follow-up synthesis sent to '{pending.OrchestratorName}'");
-                InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
-                return;
+                Debug($"[DISPATCH] Resume reflect: orchestrator response received from '{pending.OrchestratorName}' — len={orchestratorResponse.Length}");
+
+                // Check if the orchestrator marked the work as complete
+                if (orchestratorResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug($"[DISPATCH] Resume reflect: response contains [[GROUP_REFLECT_COMPLETE]] — marking complete");
+                    var group2 = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
+                    if (group2?.ReflectionState != null)
+                    {
+                        group2.ReflectionState.GoalMet = true;
+                        group2.ReflectionState.IsActive = false;
+                        group2.ReflectionState.CompletedAt = DateTime.Now;
+                        AddOrchestratorSystemMessage(pending.OrchestratorName,
+                            $"✅ {group2.ReflectionState.BuildCompletionSummary()}");
+                    }
+                    ClearPendingOrchestration();
+                    SaveOrganization();
+                    InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Complete, null));
+                    return;
+                }
+
+                var resumeAssignments = ParseTaskAssignments(orchestratorResponse, availableWorkers);
+                if (resumeAssignments.Count > 0 && !ct.IsCancellationRequested)
+                {
+                    // Check if we can re-enter the full reflect loop (preferred path)
+                    var group = Organization.Groups.FirstOrDefault(g => g.Id == pending.GroupId);
+                    if (group != null && group.ReflectionState != null)
+                    {
+                        Debug($"[DISPATCH] Resume reflect: {resumeAssignments.Count} assignments — re-entering reflect loop");
+                        AddOrchestratorSystemMessage(pending.OrchestratorName,
+                            $"🔄 Resume: orchestrator dispatched {resumeAssignments.Count} worker(s) — re-entering reflect loop...");
+                        group.ReflectionState.IsActive = true;
+                        group.ReflectionState.LastEvaluation = "Resumed after interruption. The orchestrator's last response dispatched new worker tasks. Continue the reflect loop.";
+                        ClearPendingOrchestration();
+
+                        var members = GetMultiAgentGroupMembers(pending.GroupId);
+                        InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Planning, "Resumed"));
+                        await SendViaOrchestratorReflectAsync(pending.GroupId, members, pending.OriginalPrompt, ct);
+                        return; // reflect loop handles completion
+                    }
+
+                    // Fallback: execute one more collect+synthesize round
+                    Debug($"[DISPATCH] Resume reflect: orchestrator dispatched {resumeAssignments.Count} worker(s) — executing continuation");
+                    AddOrchestratorSystemMessage(pending.OrchestratorName,
+                        $"🔄 Resume: executing {resumeAssignments.Count} worker(s) dispatched by orchestrator...");
+                    InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Dispatching, "Resume iteration"));
+
+                    var workerTasks = resumeAssignments
+                        .Select(a => ExecuteWorkerAsync(a.WorkerName, a.Task, pending.OriginalPrompt, ct))
+                        .ToList();
+
+                    var allDone = Task.WhenAll(workerTasks);
+                    var timeoutTask = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+                    if (await Task.WhenAny(allDone, timeoutTask) != allDone)
+                    {
+                        Debug($"[DISPATCH] Resume reflect: collection timeout — force-completing stuck workers");
+                        foreach (var a in resumeAssignments)
+                        {
+                            if (_sessions.TryGetValue(a.WorkerName, out var ws))
+                            {
+                                if (ws.Info.IsProcessing)
+                                    await ForceCompleteProcessingAsync(a.WorkerName, ws, $"resume reflect collection timeout");
+                                else
+                                    ws.ResponseCompletion?.TrySetResult("(worker timed out)");
+                            }
+                        }
+                    }
+
+                    var resumeResults = new List<WorkerResult>();
+                    for (var i = 0; i < workerTasks.Count; i++)
+                    {
+                        var workerName = i < resumeAssignments.Count ? resumeAssignments[i].WorkerName : "unknown";
+                        try { resumeResults.Add(await workerTasks[i]); }
+                        catch (Exception ex) { resumeResults.Add(new WorkerResult(workerName, null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                    }
+
+                    InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Synthesizing, "Resume final"));
+                    var finalSynthesis = BuildSynthesisPrompt(pending.OriginalPrompt, resumeResults);
+                    await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
+                    await SendPromptAsync(pending.OrchestratorName, finalSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
+                    Debug($"[DISPATCH] Resume reflect: final synthesis sent to '{pending.OrchestratorName}'");
+                }
+            }
+            else
+            {
+                await SendPromptAsync(pending.OrchestratorName, synthesisPrompt, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
+                Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}'");
             }
         }
         catch (Exception ex)
@@ -4967,30 +5069,31 @@ public partial class CopilotService
             WorkerResult[] results;
             if (await Task.WhenAny(allDone, collectionTimeout) != allDone)
             {
-                Debug($"[DISPATCH] Reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers (iteration {reflectState.CurrentIteration})");
+                Debug($"[DISPATCH] Reflect iteration {reflectState.CurrentIteration}: collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers");
                 foreach (var a in assignments)
                 {
                     if (_sessions.TryGetValue(a.WorkerName, out var ws))
                     {
                         if (ws.Info.IsProcessing)
                         {
-                            Debug($"[DISPATCH] Force-completing stuck worker '{a.WorkerName}'");
+                            Debug($"[DISPATCH] Reflect: force-completing stuck worker '{a.WorkerName}'");
                             AddOrchestratorSystemMessage(a.WorkerName,
                                 "⚠️ Worker timed out — orchestrator is proceeding with partial results.");
                             await ForceCompleteProcessingAsync(a.WorkerName, ws, $"reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m)");
                         }
                         else if (ws.ResponseCompletion?.Task.IsCompleted == false)
                         {
-                            Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
+                            Debug($"[DISPATCH] Reflect: resolving TCS for non-processing worker '{a.WorkerName}'");
                             ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
                         }
                     }
                 }
                 var partialResults = new List<WorkerResult>();
-                foreach (var t in workerTasks)
+                for (var i = 0; i < workerTasks.Count; i++)
                 {
-                    try { partialResults.Add(await t); }
-                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                    var workerName = i < assignments.Count ? assignments[i].WorkerName : "unknown";
+                    try { partialResults.Add(await workerTasks[i]); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult(workerName, null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
                 }
                 results = partialResults.ToArray();
             }

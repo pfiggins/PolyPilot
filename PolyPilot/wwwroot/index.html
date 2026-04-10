@@ -120,6 +120,33 @@
             }
         }, true);
 
+        // File picker change handler — reads selected images and sends to Blazor.
+        // Covers the attach button on all platforms (especially mobile where
+        // paste/drag-drop aren't available).
+        document.addEventListener('change', function(e) {
+            if (e.target.type !== 'file' || !e.target.id.startsWith('file-')) return;
+            if (!window.__dashRef) return;
+            var files = e.target.files;
+            if (!files) return;
+            // Derive the input ID from the file input ID (file-X → input-X)
+            var inputId = 'input-' + e.target.id.substring(5);
+            for (var i = 0; i < files.length; i++) {
+                if (!files[i].type.startsWith('image/')) continue;
+                (function(f) {
+                    var reader = new FileReader();
+                    reader.onload = function() {
+                        var base64 = reader.result.split(',')[1];
+                        var ext = (f.name && f.name.includes('.')) ? f.name.split('.').pop() : 'png';
+                        var name = f.name || ('attached-image.' + ext);
+                        window.__dashRef.invokeMethodAsync('JsImagePasted', base64, name, ext, inputId);
+                    };
+                    reader.readAsDataURL(f);
+                })(files[i]);
+            }
+            // Reset so the same file can be re-selected
+            e.target.value = '';
+        });
+
         // Global image drop handler for chat input areas
         document.addEventListener('dragover', function(e) {
             var zone = e.target.closest && (e.target.closest('.input-area') || e.target.closest('.card-input'));
@@ -375,6 +402,8 @@
             var el = document.getElementById(elementId);
             if (el) {
                 el.value = '';
+                if (window.__liveDrafts) delete window.__liveDrafts[elementId];
+                el.__lastRestoredDraft = '';
                 el.style.height = 'auto';
                 // Remove slash command ghost overlay
                 var ghost = document.getElementById(elementId + '--slash-ghost');
@@ -761,11 +790,29 @@
             // Single rAF follow-up is sufficient — content is rendered synchronously by Blazor
             requestAnimationFrame(doScroll);
             var drafts = JSON.parse(draftsJson || '{}');
+            if (window.__liveDrafts) {
+                for (var liveId in window.__liveDrafts) {
+                    if (Object.prototype.hasOwnProperty.call(window.__liveDrafts, liveId)) {
+                        drafts[liveId] = window.__liveDrafts[liveId];
+                    }
+                }
+            }
             for (var id in drafts) {
                 var el = document.getElementById(id);
-                // Skip overwriting the focused input — the user may be actively typing
-                // and the captured value is from before their latest keystrokes.
-                if (el && document.activeElement !== el) el.value = drafts[id];
+                if (!el) continue;
+                var desired = drafts[id] || '';
+                var current = (typeof el.value === 'string') ? el.value : '';
+                var lastRestored = (typeof el.__lastRestoredDraft === 'string') ? el.__lastRestoredDraft : '';
+                var hasDivergedUserText = current.length > 0 && current !== desired && current !== lastRestored;
+                if (hasDivergedUserText) continue;
+                if (current !== desired) {
+                    el.value = desired;
+                    if (el.tagName === 'TEXTAREA' && el.closest('.input-row')) {
+                        el.style.height = 'auto';
+                        el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+                    }
+                }
+                el.__lastRestoredDraft = desired;
             }
             if (focusId) {
                 var fel = document.getElementById(focusId);

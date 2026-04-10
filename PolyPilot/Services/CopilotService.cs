@@ -61,6 +61,7 @@ public partial class CopilotService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, List<string?>> _queuedAgentModes = new();
     private readonly object _imageQueueLock = new();
     private static readonly object _diagnosticLogLock = new();
+    private static readonly DateTime _appStartedAtUtc = DateTime.UtcNow;
     // Debounce timers for disk I/O — coalesce rapid-fire saves into a single write
     private Timer? _saveSessionsDebounce;
     private Timer? _saveOrgDebounce;
@@ -225,6 +226,8 @@ public partial class CopilotService : IAsyncDisposable
             _zeroIdleCaptureDir = null;
         }
     }
+
+    internal void SetSyncContextForTesting(SynchronizationContext? syncContext) => _syncContext = syncContext;
 
     /// <summary>Builds the FallbackNotice message shown when the persistent server fails to start.</summary>
     internal static string BuildServerFallbackNotice(string? serverError, string logPath, string reason = "couldn't start", bool embeddedFallback = true)
@@ -548,6 +551,7 @@ public partial class CopilotService : IAsyncDisposable
     public event Action<string, string>? OnError; // sessionName, error
     public event Action<string, string>? OnSessionComplete; // sessionName, summary
     public event Action<string>? OnSessionClosed; // sessionName
+    public event Action<string, string>? OnSessionRenamed; // oldName, newName
     public event Action<string, string>? OnActivity; // sessionName, activity description
     public event Action<string>? OnDebug; // debug messages
 
@@ -571,6 +575,16 @@ public partial class CopilotService : IAsyncDisposable
         /// CompleteResponse combines this with CurrentResponse for the TCS result so
         /// orchestrator dispatch gets the full response text.</summary>
         public StringBuilder FlushedResponse { get; } = new();
+        /// <summary>The last response segment flushed during the current turn. Used only
+        /// for immediate same-subturn replay suppression when the SDK replays events.
+        /// Volatile: written on SDK background thread (ClearFlushedReplayDedup at tool/turn
+        /// boundaries), read on UI thread (WasResponseAlreadyFlushedThisTurn).</summary>
+        public volatile string? LastFlushedResponseSegment;
+        /// <summary>True only until a new tool/sub-turn boundary is observed. This keeps
+        /// replay dedup scoped to the just-flushed segment instead of suppressing later
+        /// identical content from a legitimate follow-up sub-turn.
+        /// Volatile: written on SDK background thread, read on UI thread.</summary>
+        public volatile bool FlushedReplayDedupArmed;
         public bool HasReceivedDeltasThisTurn { get; set; }
         public bool HasReceivedEventsSinceResume;
         public string? LastMessageId { get; set; }
@@ -716,6 +730,26 @@ public partial class CopilotService : IAsyncDisposable
         /// Cleared by SendPromptAsync at the start of each new turn.</summary>
         public volatile bool WasUserAborted;
         /// <summary>
+        /// One-shot guard for EVT-REARM. Set only by speculative auto-completion paths
+        /// (CompleteResponse) so a late AssistantTurnStartEvent can revive a turn that
+        /// was completed too early. Explicit abort/recovery paths leave this false so
+        /// stale SDK TurnStart replays do not resurrect intentionally-cleared sessions.
+        /// Cleared on each new SendPromptAsync turn.
+        /// </summary>
+        public volatile bool AllowTurnStartRearm;
+        /// <summary>
+        /// Stable identity of the most recently reported background task set (agent IDs + shell IDs).
+        /// Preserved across SendPromptAsync so the same orphaned background shells keep aging instead
+        /// of resetting the zombie timeout every time the user sends another prompt.
+        /// </summary>
+        public volatile string? DeferredBackgroundTaskFingerprint;
+        /// <summary>
+        /// UTC ticks when the current DeferredBackgroundTaskFingerprint was first observed. Unlike the
+        /// per-turn SubagentDeferStartedAtTicks, this can intentionally survive into the next prompt
+        /// so repeated reports of the SAME shell IDs still expire after the real wall-clock timeout.
+        /// </summary>
+        public long DeferredBackgroundTasksFirstSeenAtTicks;
+        /// <summary>
         /// UTC ticks when IDLE-DEFER was first entered for the current turn (first
         /// SessionIdleEvent with active background tasks). 0 = not set.
         /// Uses Interlocked for thread safety: the IDLE-DEFER section (SDK event thread) sets via
@@ -729,6 +763,70 @@ public partial class CopilotService : IAsyncDisposable
     private static void DisposePrematureIdleSignal(SessionState? state)
     {
         try { state?.PrematureIdleSignal?.Dispose(); } catch { }
+    }
+
+    private static void ClearDeferredIdleTracking(SessionState state, bool preserveCarryOver = false)
+    {
+        state.HasDeferredIdle = false;
+        Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
+
+        if (!preserveCarryOver)
+        {
+            state.DeferredBackgroundTaskFingerprint = null;
+            Interlocked.Exchange(ref state.DeferredBackgroundTasksFirstSeenAtTicks, 0L);
+        }
+    }
+
+    /// <summary>
+    /// Atomically clears ALL processing state on a session. This is the single source of truth
+    /// for what must be reset when a session stops processing. Every code path that sets
+    /// IsProcessing=false MUST call this method instead of manually clearing individual fields.
+    /// 
+    /// Historical context: 13+ PRs of fix/regression cycles were caused by 22 sites that set
+    /// IsProcessing=false but each forgot different companion fields. This method eliminates
+    /// that bug category entirely.
+    /// </summary>
+    /// <param name="state">The session state to clear.</param>
+    /// <param name="accumulateApiTime">True to accumulate API time from ProcessingStartedAt (normal completion).
+    /// False for error/abort paths where timing is not meaningful.</param>
+    private void ClearProcessingState(SessionState state, bool accumulateApiTime = true)
+    {
+        if (accumulateApiTime && state.Info.ProcessingStartedAt is { } started)
+        {
+            state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - started).TotalSeconds;
+            state.Info.PremiumRequestsUsed++;
+        }
+
+        state.CurrentResponse.Clear();
+        state.FlushedResponse.Clear();
+        ClearFlushedReplayDedup(state);
+        state.PendingReasoningMessages.Clear();
+
+        state.Info.IsProcessing = false;
+        state.Info.IsResumed = false;
+        state.Info.ProcessingStartedAt = null;
+        state.Info.ToolCallCount = 0;
+        state.Info.ProcessingPhase = 0;
+        state.Info.ClearPermissionDenials();
+        state.Info.LastUpdatedAt = DateTime.Now;
+
+        Interlocked.Exchange(ref state.SendingFlag, 0);
+        Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
+        state.HasUsedToolsThisTurn = false;
+        ClearDeferredIdleTracking(state, preserveCarryOver: true);
+        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
+        Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
+        Interlocked.Exchange(ref state.EventCountThisTurn, 0);
+        Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
+        state.IsReconnectedSend = false;
+        CancelTurnEndFallback(state);
+        CancelToolHealthCheck(state);
+        // NOTE: AllowTurnStartRearm, _consecutiveWatchdogTimeouts, and ConsecutiveStuckCount
+        // are NOT reset here. All three are cross-turn health accumulators:
+        // - AllowTurnStartRearm = true only belongs on the normal-completion path (CompleteResponse)
+        // - _consecutiveWatchdogTimeouts resets only on success (server is healthy)
+        // - ConsecutiveStuckCount resets only on success (session responded normally)
+        // Resetting them here would break accumulation across consecutive failures.
     }
 
     /// <summary>Ping interval to prevent the headless server from killing idle sessions.
@@ -840,6 +938,28 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[ABORT") || message.StartsWith("[BRIDGE") ||
             message.StartsWith("[SYNC") ||
             message.Contains("watchdog") || message.Contains("Failed to");
+    }
+
+    /// <summary>
+    /// Static logging entry point for WsBridgeServer diagnostics.
+    /// Writes directly to the event-diagnostics.log file without requiring a CopilotService instance.
+    /// </summary>
+    internal static void LogBridgeDiagnostic(string message)
+    {
+        Console.WriteLine($"[DEBUG] {message}");
+        if (ShouldPersistDiagnostic(message))
+        {
+            try
+            {
+                lock (_diagnosticLogLock)
+                {
+                    var logPath = Path.Combine(PolyPilotBaseDir, "event-diagnostics.log");
+                    File.AppendAllText(logPath,
+                        $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
+                }
+            }
+            catch { }
+        }
     }
 
     private void Debug(string message)
@@ -2370,8 +2490,47 @@ The user can also check configured servers with the /mcp command.
         var resumeModel = Models.ModelHelper.NormalizeToSlug(GetSessionModelFromDisk(sessionId) ?? model ?? DefaultModel);
         if (string.IsNullOrEmpty(resumeModel)) resumeModel = DefaultModel;
         Debug($"Resuming session '{displayName}' with model: '{resumeModel}', cwd: '{resumeWorkingDirectory}'");
-        var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions, InfiniteSessions = new InfiniteSessionConfig { Enabled = true } };
-        var copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
+        // Create state BEFORE ResumeSessionAsync so the event handler can be passed via
+        // config.OnEvent. The SDK registers OnEvent before sending the session.resume RPC,
+        // closing the race window where events arrive between resume-return and .On() call.
+        // Without this, the SDK's ProcessEventsAsync loop consumes events with an empty
+        // handler list, silently dropping content deltas while lifecycle events appear to flow.
+        var state = new SessionState { Session = null!, Info = new AgentSessionInfo { Name = displayName, SessionId = sessionId, Model = resumeModel } };
+        // Populate history BEFORE pre-publishing to _sessions so that event dedup logic
+        // (which checks state.Info.History for existing tool calls / messages) has the
+        // persisted entries to match against. Without this, replayed resume-time events
+        // can't dedup and produce duplicate entries in the UI.
+        foreach (var msg in history)
+            state.Info.History.Add(msg);
+        state.Info.MessageCount = state.Info.History.Count;
+        state.Info.LastReadMessageCount = state.Info.History.Count;
+        // Mark stale incomplete tool calls/reasoning as complete
+        foreach (var msg in state.Info.History.Where(m => m.MessageType == ChatMessageType.ToolCall && !m.IsComplete))
+            msg.IsComplete = true;
+        foreach (var msg in state.Info.History.Where(m => m.MessageType == ChatMessageType.Reasoning && !m.IsComplete))
+            msg.IsComplete = true;
+        // Publish state to _sessions BEFORE ResumeSessionAsync so that events arriving
+        // via OnEvent during the resume RPC pass the isCurrentState check in HandleSessionEvent.
+        // Without this, HandleSessionEvent sees _sessions[displayName] != state and drops events.
+        // Save the previous entry (if any) so we can restore it on failure.
+        _sessions.TryGetValue(displayName, out var previousState);
+        _sessions[displayName] = state;
+        var resumeConfig = BuildResumeSessionConfig(state, resumeWorkingDirectory, evt => HandleSessionEvent(state, evt));
+        CopilotSession copilotSession;
+        try
+        {
+            copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
+        }
+        catch
+        {
+            // Restore the previous placeholder state if resume fails, so the session
+            // doesn't disappear from the UI. If there was no previous entry, remove ours.
+            if (previousState != null)
+                _sessions[displayName] = previousState;
+            else
+                _sessions.TryRemove(displayName, out _);
+            throw;
+        }
 
         // Detect session ID mismatch: the persistent server may return a different
         // session ID than requested (e.g., if it recreated the session internally).
@@ -2381,55 +2540,44 @@ The user can also check configured servers with the /mcp command.
         if (!string.IsNullOrEmpty(actualSessionId) && actualSessionId != sessionId)
         {
             Debug($"[RESUME-REMAP] Session ID changed: requested '{sessionId}', server returned '{actualSessionId}' for '{displayName}'");
-            // Copy old events to the new session dir BEFORE registering the event handler.
-            // The SDK may start writing events to the new dir after ResumeSessionAsync returns,
-            // but our copy runs immediately and the new dir typically has no events yet.
             CopyEventsToNewSession(sessionId, actualSessionId);
             var (actualHistory, actualFromDb) = await LoadBestHistoryAsync(actualSessionId);
             if (actualHistory.Count >= history.Count)
-                history = actualHistory;
+            {
+                // Rehydrate state.Info.History with the remapped session's history.
+                // Must be synchronized with HandleSessionEvent which reads/writes History
+                // on the UI thread. InvokeOnUI serializes this with event processing.
+                var tcs = new TaskCompletionSource<bool>();
+                InvokeOnUI(() =>
+                {
+                    state.Info.History.Clear();
+                    foreach (var msg in actualHistory)
+                        state.Info.History.Add(msg);
+                    state.Info.MessageCount = state.Info.History.Count;
+                    state.Info.LastReadMessageCount = state.Info.History.Count;
+                    tcs.TrySetResult(true);
+                });
+                await tcs.Task;
+            }
             sessionId = actualSessionId;
-            if (history.Count > 0 && !actualFromDb)
-                await _chatDb.BulkInsertAsync(sessionId, history);
+            if (actualHistory.Count > 0 && !actualFromDb)
+                await _chatDb.BulkInsertAsync(sessionId, actualHistory);
         }
 
         var isStillProcessing = IsSessionStillProcessing(sessionId);
+        var resumeGitBranch = GetGitBranch(resumeWorkingDirectory);
+        string? lastTool = null;
+        string? lastContent = null;
+        var processingPhase = 0;
 
-        var info = new AgentSessionInfo
-        {
-            Name = displayName,
-            Model = resumeModel,
-            CreatedAt = DateTime.UtcNow,
-            SessionId = sessionId,
-            IsResumed = isStillProcessing,
-            WorkingDirectory = resumeWorkingDirectory
-        };
-        info.GitBranch = GetGitBranch(info.WorkingDirectory);
-
-        // Add loaded history to the session info
-        foreach (var msg in history)
-        {
-            info.History.Add(msg);
-        }
-        info.MessageCount = info.History.Count;
-        info.LastReadMessageCount = info.History.Count;
-
-        // Mark any stale incomplete tool calls as complete (from prior session)
-        foreach (var msg in info.History.Where(m => m.MessageType == ChatMessageType.ToolCall && !m.IsComplete))
-        {
-            msg.IsComplete = true;
-        }
-        // Also mark incomplete reasoning as complete
-        foreach (var msg in info.History.Where(m => m.MessageType == ChatMessageType.Reasoning && !m.IsComplete))
-        {
-            msg.IsComplete = true;
-        }
+        state.Session = copilotSession;
 
         // Add reconnection indicator with status context
         var reconnectMsg = $"🔄 Session reconnected at {DateTime.Now.ToShortTimeString()}";
         if (isStillProcessing)
         {
-            var (lastTool, lastContent) = GetLastSessionActivity(sessionId);
+            (lastTool, lastContent) = GetLastSessionActivity(sessionId);
+            processingPhase = !string.IsNullOrEmpty(lastTool) ? 3 : 2; // 3=Working, 2=Thinking
             if (!string.IsNullOrEmpty(lastTool))
                 reconnectMsg += $" — running {lastTool}";
             if (!string.IsNullOrEmpty(lastContent))
@@ -2440,23 +2588,15 @@ The user can also check configured servers with the /mcp command.
                 reconnectMsg += $"\n📝 Last message: \"{truncated}\"";
             }
         }
-        info.History.Add(ChatMessage.SystemMessage(reconnectMsg));
-
-        // Set processing state if session was mid-turn when app died
-        info.IsProcessing = isStillProcessing;
-        if (isStillProcessing)
-        {
-            // Set phase based on last event so UI shows correct status instead of "Sending"
-            var (lastTool, _) = GetLastSessionActivity(sessionId);
-            info.ProcessingPhase = !string.IsNullOrEmpty(lastTool) ? 3 : 2; // 3=Working, 2=Thinking
-            info.ProcessingStartedAt = DateTime.UtcNow;
-        }
-
-        var state = new SessionState
-        {
-            Session = copilotSession,
-            Info = info
-        };
+        await FinalizeResumedSessionUiStateAsync(
+            state,
+            sessionId,
+            resumeWorkingDirectory,
+            resumeGitBranch,
+            isStillProcessing,
+            processingPhase,
+            reconnectMsg);
+        var info = state.Info;
 
         // Cache multi-agent membership for the watchdog timeout tier.
         // Must be set BEFORE StartProcessingWatchdog — otherwise the watchdog uses the
@@ -2465,9 +2605,8 @@ The user can also check configured servers with the /mcp command.
         // by LoadOrganization() before RestorePreviousSessionsAsync runs.
         state.IsMultiAgentSession = IsSessionInMultiAgentGroup(displayName);
 
-        // Wire up event handler BEFORE starting watchdog/timeout so events
-        // arriving immediately after SDK resume are not missed.
-        copilotSession.On(evt => HandleSessionEvent(state, evt));
+        // Event handler already registered via ResumeSessionConfig.OnEvent (before RPC call)
+        // to avoid the race where events arrive between ResumeSessionAsync return and .On().
 
         // If still processing, set up ResponseCompletion so events flow properly.
         // The processing watchdog (30s resume quiescence / 120s inactivity / 600s tool timeout)
@@ -2497,10 +2636,14 @@ The user can also check configured servers with the /mcp command.
             // See StartProcessingWatchdog comment for why file-time seeding is dangerous.
             StartProcessingWatchdog(state, displayName);
         }
-        if (!_sessions.TryAdd(displayName, state))
+        // State was already pre-published to _sessions before ResumeSessionAsync.
+        // No TryAdd needed — just verify it's still our state (could have been replaced
+        // by a concurrent resume of the same session name, though that's unlikely).
+        if (!_sessions.TryGetValue(displayName, out var currentState) || !ReferenceEquals(currentState, state))
         {
+            // Another resume replaced our state — dispose the session we just created
             try { await copilotSession.DisposeAsync(); } catch { }
-            throw new InvalidOperationException($"Failed to add session '{displayName}'.");
+            throw new InvalidOperationException($"Session '{displayName}' was replaced during resume.");
         }
 
         _activeSessionName ??= displayName;
@@ -3243,7 +3386,28 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             OnStateChanged?.Invoke();
             try
             {
-                await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, cancellationToken);
+                // Encode images as base64 for bridge transmission
+                List<ImageAttachment>? imageAttachments = null;
+                if (imagePaths != null && imagePaths.Count > 0)
+                {
+                    imageAttachments = new();
+                    foreach (var path in imagePaths)
+                    {
+                        if (!File.Exists(path)) continue;
+                        try
+                        {
+                            var bytes = await File.ReadAllBytesAsync(path, cancellationToken);
+                            imageAttachments.Add(new ImageAttachment
+                            {
+                                Base64Data = Convert.ToBase64String(bytes),
+                                FileName = Path.GetFileName(path)
+                            });
+                        }
+                        catch (Exception ex) { Debug($"Failed to encode image '{path}': {ex.Message}"); }
+                    }
+                    if (imageAttachments.Count == 0) imageAttachments = null;
+                }
+                await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, imageAttachments, cancellationToken);
             }
             catch
             {
@@ -3251,6 +3415,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 if (session != null)
                 {
                     session.IsProcessing = false;
+                    session.IsResumed = false;
+                    session.ProcessingStartedAt = null;
+                    session.ToolCallCount = 0;
+                    session.ProcessingPhase = 0;
                     OnStateChanged?.Invoke();
                 }
                 throw;
@@ -3309,11 +3477,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ClearPermissionDenials();
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
-        state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
-        Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L); // Companion pair — must clear with HasDeferredIdle
+        ClearDeferredIdleTracking(state, preserveCarryOver: true); // Keep stale shell age across turns so orphaned IDs can still expire
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
         state.WasUserAborted = false; // Clear abort flag — new turn starts fresh (re-enables EVT-REARM)
         state.WatchdogKilledThisTurn = false; // Clear watchdog-kill flag — new turn starts fresh
+        state.AllowTurnStartRearm = false; // New user send is authoritative; ignore stale turn-start replays from the prior turn
         state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
@@ -3532,6 +3700,15 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                             if (kvp.Key == sessionName) continue;
                                             var otherState = kvp.Value;
                                             if (string.IsNullOrEmpty(otherState.Info.SessionId)) continue;
+                                            // Provider/virtual sessions are not backed by the SDK client that
+                                            // was just recreated. Their SessionId values are persistence keys,
+                                            // not CLI-resumable session IDs, so trying to ResumeSessionAsync
+                                            // them produces invalid-session errors and can destabilize recovery.
+                                            if (otherState.Session == null || IsProviderSession(kvp.Key))
+                                            {
+                                                Debug($"[RECONNECT] Skipping non-SDK sibling '{kvp.Key}' during client recreation");
+                                                continue;
+                                            }
                                             // INV-O14: IsProcessing siblings have dead event streams —
                                             // their CopilotSession was tied to the old client which was
                                             // just disposed. Force-abort so the orchestrator retries
@@ -3626,8 +3803,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     };
                                                     // Mirror primary reconnect: reset tool tracking for new connection
                                                     siblingState.HasUsedToolsThisTurn = false;
-                                                    siblingState.HasDeferredIdle = false;
-                                                    Interlocked.Exchange(ref siblingState.SubagentDeferStartedAtTicks, 0L);
+                                                    ClearDeferredIdleTracking(siblingState);
                                                     Interlocked.Exchange(ref siblingState.ActiveToolCallCount, 0);
                                                     Interlocked.Exchange(ref siblingState.SuccessfulToolCountThisTurn, 0);
                                                     Interlocked.Exchange(ref siblingState.ToolHealthStaleChecks, 0);
@@ -3727,6 +3903,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         {
                             Debug($"[RECONNECT] Session ID changed on resume: '{state.Info.SessionId}' → '{actualId}' for '{sessionName}'");
                             CopyEventsToNewSession(state.Info.SessionId, actualId);
+                            // Mark the old session ID as closed so the merge in SaveActiveSessionsToDisk
+                            // doesn't re-add it — otherwise a stale entry with the old ID lingers and
+                            // gets renamed to "(previous)" on the next save cycle.
+                            _closedSessionIds[state.Info.SessionId] = 0;
                             state.Info.SessionId = actualId;
                             // Persist the new session ID so restarts don't revert to the old one
                             FlushSaveActiveSessionsToDisk();
@@ -3877,8 +4057,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // Reset HasUsedToolsThisTurn so the retried turn starts with the default
                     // 120s watchdog tier instead of the inflated 600s from stale tool state.
                     state.HasUsedToolsThisTurn = false;
-                    state.HasDeferredIdle = false;
-                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
+                    ClearDeferredIdleTracking(state);
 
                     // Schedule persistence of the new session ID so it survives app restart.
                     // Without this, the debounced save captures the pre-reconnect snapshot
@@ -3944,22 +4123,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     Console.WriteLine($"[DEBUG] Reconnect+retry failed: {retryEx.Message}");
                     OnError?.Invoke(sessionName, $"Session disconnected and reconnect failed: {Models.ErrorMessageHelper.Humanize(retryEx)}");
                     CancelProcessingWatchdog(state);
-                    CancelTurnEndFallback(state);
-                    CancelToolHealthCheck(state);
                     FlushCurrentResponse(state);
                     Debug($"[ERROR] '{sessionName}' reconnect+retry failed, clearing IsProcessing");
-                    Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                    state.HasUsedToolsThisTurn = false;
-                    state.HasDeferredIdle = false;
-                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
-                    Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-                    state.Info.IsResumed = false;
-                    state.Info.IsProcessing = false;
-                    if (state.Info.ProcessingStartedAt is { } rcStarted)
-                        state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - rcStarted).TotalSeconds;
-                    state.Info.ProcessingStartedAt = null;
-                    state.Info.ToolCallCount = 0;
-                    state.Info.ProcessingPhase = 0;
+                    ClearProcessingState(state, accumulateApiTime: false); // reconnect failure — no API call consumed
                     OnStateChanged?.Invoke();
                     throw;
                 }
@@ -3968,22 +4134,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             {
                 OnError?.Invoke(sessionName, $"SendAsync failed: {Models.ErrorMessageHelper.Humanize(ex)}");
                 CancelProcessingWatchdog(state);
-                CancelTurnEndFallback(state);
-                CancelToolHealthCheck(state);
                 FlushCurrentResponse(state);
                 Debug($"[ERROR] '{sessionName}' SendAsync failed, clearing IsProcessing (error={ex.Message})");
-                Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-                state.HasUsedToolsThisTurn = false;
-                state.HasDeferredIdle = false;
-                Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
-                Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-                state.Info.IsResumed = false;
-                state.Info.IsProcessing = false;
-                if (state.Info.ProcessingStartedAt is { } saStarted)
-                    state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - saStarted).TotalSeconds;
-                state.Info.ProcessingStartedAt = null;
-                state.Info.ToolCallCount = 0;
-                state.Info.ProcessingPhase = 0;
+                ClearProcessingState(state, accumulateApiTime: false); // send failure — request may not have been consumed
                 OnStateChanged?.Invoke();
                 throw;
             }
@@ -4005,6 +4158,73 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Interlocked.Exchange(ref state.SendingFlag, 0);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Build a ResumeSessionConfig with the same MCP servers and skill directories used for
+    /// fresh sessions so resumed sessions keep their external tool surface after restart.
+    /// </summary>
+    private ResumeSessionConfig BuildResumeSessionConfig(
+        SessionState state,
+        string? workingDirectory = null,
+        SessionEventHandler? onEvent = null)
+    {
+        var settings = _currentSettings ?? ConnectionSettings.Load();
+        var mcpServers = LoadMcpServers(settings.DisabledMcpServers, settings.DisabledPlugins);
+        var skillDirs = LoadSkillDirectories(settings.DisabledPlugins);
+        return new ResumeSessionConfig
+        {
+            Model = Models.ModelHelper.NormalizeToSlug(state.Info.Model) ?? DefaultModel,
+            WorkingDirectory = workingDirectory ?? state.Info.WorkingDirectory,
+            McpServers = mcpServers,
+            SkillDirectories = skillDirs,
+            Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
+            OnPermissionRequest = AutoApprovePermissions,
+            InfiniteSessions = new InfiniteSessionConfig { Enabled = true },
+            OnEvent = onEvent,
+        };
+    }
+
+    /// <summary>
+    /// Finalize resumed-session state on the UI thread so history/count updates stay serialized
+    /// with live OnEvent callbacks that may already be replaying during resume.
+    /// </summary>
+    private Task FinalizeResumedSessionUiStateAsync(
+        SessionState state,
+        string sessionId,
+        string? workingDirectory,
+        string? gitBranch,
+        bool isStillProcessing,
+        int processingPhase,
+        string reconnectMsg)
+    {
+        return InvokeOnUIAsync(() =>
+        {
+            var info = state.Info;
+            info.CreatedAt = DateTime.UtcNow;
+            info.SessionId = sessionId;
+            info.IsResumed = isStillProcessing;
+            info.WorkingDirectory = workingDirectory;
+            info.GitBranch = gitBranch;
+
+            // Mark stale incomplete entries (may have new ones from remap) while serialized
+            // with any live event-driven history mutations.
+            foreach (var msg in info.History.Where(m => m.MessageType == ChatMessageType.ToolCall && !m.IsComplete))
+                msg.IsComplete = true;
+            foreach (var msg in info.History.Where(m => m.MessageType == ChatMessageType.Reasoning && !m.IsComplete))
+                msg.IsComplete = true;
+
+            info.MessageCount = info.History.Count;
+            info.LastReadMessageCount = info.History.Count;
+            info.History.Add(ChatMessage.SystemMessage(reconnectMsg));
+
+            info.IsProcessing = isStillProcessing;
+            if (isStillProcessing)
+            {
+                info.ProcessingPhase = processingPhase;
+                info.ProcessingStartedAt = DateTime.UtcNow;
+            }
+        });
     }
 
     /// <summary>
@@ -4139,11 +4359,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Optimistically clear processing state and queue
             if (_sessions.TryGetValue(sessionName, out var remoteState))
             {
-                remoteState.Info.IsProcessing = false;
-                remoteState.Info.IsResumed = false;
-                remoteState.Info.ProcessingStartedAt = null;
-                remoteState.Info.ToolCallCount = 0;
-                remoteState.Info.ProcessingPhase = 0;
+                ClearProcessingState(remoteState, accumulateApiTime: false);
                 remoteState.Info.MessageQueue.Clear();
                 OnStateChanged?.Invoke();
             }
@@ -4185,34 +4401,21 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.CurrentResponse.Clear();
 
         Debug($"[ABORT] '{sessionName}' user abort, clearing IsProcessing");
-        state.Info.IsProcessing = false;
-        state.WasUserAborted = true; // Suppress EVT-REARM for in-flight TurnStart events after abort
-        state.Info.IsResumed = false;
+        // Accumulate API time (the request was in-flight and consumed server resources)
+        // but don't increment PremiumRequestsUsed — user-initiated aborts shouldn't count
+        // against the premium request budget.
         if (state.Info.ProcessingStartedAt is { } abortStarted)
             state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - abortStarted).TotalSeconds;
-        state.Info.ProcessingStartedAt = null;
-        state.Info.ToolCallCount = 0;
-        state.Info.ProcessingPhase = 0;
-        Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
-        state.HasUsedToolsThisTurn = false;
-        state.HasDeferredIdle = false;
-        Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L); // INV-1: companion pair with HasDeferredIdle
-        state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on abort
-        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
-        // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
-        Interlocked.Exchange(ref state.SendingFlag, 0);
+        ClearProcessingState(state, accumulateApiTime: false);
+        state.WasUserAborted = true; // Suppress EVT-REARM for in-flight TurnStart events after abort
+        state.AllowTurnStartRearm = false; // Abort is explicit terminal intent — do not revive on late TurnStart replays
+        // Per-turn tracking fields are already cleared by ClearProcessingState.
         // Clear queued messages so they don't auto-send after abort
         state.Info.MessageQueue.Clear();
         _queuedImagePaths.TryRemove(sessionName, out _);
         _queuedAgentModes.TryRemove(sessionName, out _);
         _permissionRecoveryAttempts.TryRemove(sessionName, out _);
-        // Cancel any pending TurnEnd→Idle fallback so it doesn't fire CompleteResponse after abort
-        CancelTurnEndFallback(state);
         CancelProcessingWatchdog(state);
-        CancelToolHealthCheck(state);
-        state.FlushedResponse.Clear();
-        state.PendingReasoningMessages.Clear();
-        state.Info.ClearPermissionDenials(); // INV-1: clear on all termination paths
         // Complete TCS AFTER state cleanup (INV-O3)
         state.ResponseCompletion?.TrySetCanceled();
         // Fire completion notification so orchestrator loops are unblocked (INV-O4)
@@ -4322,8 +4525,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Debug($"[STEER-ERROR] '{sessionName}' soft steer SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
-                state.HasDeferredIdle = false;
-                Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
+                ClearDeferredIdleTracking(state);
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.IsReconnectedSend = false; // INV-1 item 8: prevent stale 35s timeout on next watchdog start
@@ -4611,8 +4813,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.Info.IsProcessing = false;
                     state.Info.IsResumed = false;
                     state.HasUsedToolsThisTurn = false;
-                    state.HasDeferredIdle = false;
-                    Interlocked.Exchange(ref state.SubagentDeferStartedAtTicks, 0L);
+                    ClearDeferredIdleTracking(state);
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     state.Info.ProcessingStartedAt = null;
@@ -4782,6 +4983,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             var remoteMeta = Organization.Sessions.FirstOrDefault(m => m.SessionName == oldName);
             if (remoteMeta != null)
                 remoteMeta.SessionName = newName;
+            OnSessionRenamed?.Invoke(oldName, newName);
             OnStateChanged?.Invoke();
             // Send to server (fire-and-forget with error logging)
             _ = _bridgeClient.RenameSessionAsync(oldName, newName)
@@ -4832,6 +5034,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Re-key usage stats tracking so TrackSessionEnd(newName) finds the entry
         _usageStats?.RenameActiveSession(oldName, newName);
 
+        OnSessionRenamed?.Invoke(oldName, newName);
         SaveActiveSessionsToDisk();
         ReconcileOrganization();
         OnStateChanged?.Invoke();
@@ -5177,6 +5380,7 @@ public class UiState
     /// <summary>Sidebar width in pixels. Default 320, range 200-600.</summary>
     public int SidebarWidth { get; set; } = 320;
     public bool SidebarRailMode { get; set; }
+    public bool HasSeenTutorialPrompt { get; set; } = true;
 }
 
 public class ActiveSessionEntry
@@ -5188,6 +5392,7 @@ public class ActiveSessionEntry
     public string? WorkingDirectory { get; set; }
     public string? LastPrompt { get; set; }
     public string? GroupId { get; set; }
+    public string? RecoveredFromSessionId { get; set; }
     // Usage stats persisted across reconnects
     public int TotalInputTokens { get; set; }
     public int TotalOutputTokens { get; set; }

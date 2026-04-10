@@ -29,7 +29,7 @@ jobs:
       should_release: ${{ steps.check.outputs.should_release }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -72,10 +72,10 @@ jobs:
           echo "Build number: ${{ github.run_number }} + $OFFSET = $BUILD"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
@@ -84,7 +84,7 @@ jobs:
         run: dotnet workload install maui-android
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'microsoft'
           java-version: '17'
@@ -108,7 +108,7 @@ jobs:
             -p:ApplicationVersion='${{ steps.build.outputs.number }}'
 
       - name: Upload AAB artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-aab
           path: PolyPilot/bin/Release/net10.0-android/publish/*-Signed.aab
@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: Download AAB artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: android-aab
           path: ./android-artifacts/
@@ -135,6 +135,312 @@ jobs:
           releaseFiles: ./android-artifacts/*-Signed.aab
           track: beta
           status: completed
+
+  # ─────────────────────────────────────────────
+  # Mac Catalyst → TestFlight
+  # ─────────────────────────────────────────────
+  build-maccatalyst:
+    name: Build Mac Catalyst PKG
+    runs-on: macos-26
+    needs: check-changes
+    if: needs.check-changes.outputs.should_release == 'true'
+
+    steps:
+      - name: Compute build number
+        id: build
+        run: |
+          OFFSET=${{ inputs.build_number_offset || vars.BUILD_NUMBER_OFFSET || '0' }}
+          BUILD=$(( ${{ github.run_number }} + OFFSET ))
+          echo "number=$BUILD" >> $GITHUB_OUTPUT
+          echo "Build number: ${{ github.run_number }} + $OFFSET = $BUILD"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Install MAUI workload
+        run: |
+          dotnet workload update
+          dotnet workload install maui
+
+      - name: Import Apple Distribution certificate
+        uses: apple-actions/import-codesign-certs@v6
+        with:
+          p12-file-base64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+
+      - name: Import Mac Installer certificate
+        uses: apple-actions/import-codesign-certs@v6
+        with:
+          p12-file-base64: ${{ secrets.MACCATALYST_INSTALLER_CERT_BASE64 }}
+          p12-password: ${{ secrets.MACCATALYST_INSTALLER_CERT_PASSWORD }}
+          keychain: installer_temp
+          create-keychain: true
+
+      - name: Fix keychain search list
+        run: |
+          # Each import-codesign-certs overwrites the search list with only its own keychain.
+          # Restore all keychains so dotnet build can find both the Distribution and Installer certs.
+          security list-keychains -d user -s signing_temp.keychain installer_temp.keychain login.keychain
+          echo "=== Keychain search list ==="
+          security list-keychains -d user
+          echo "=== Signing identities ==="
+          security find-identity -v -p codesigning
+          echo "=== All identities (including installer) ==="
+          security find-identity -v
+
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.MACCATALYST_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          PP_PATH="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PP_PATH"
+          # Decode profile using openssl (handles secrets without trailing newline)
+          printenv PROVISIONING_PROFILE_BASE64 | openssl base64 -d -A > "$RUNNER_TEMP/maccatalyst.provisionprofile"
+          # Validate the profile was decoded correctly
+          if [ ! -s "$RUNNER_TEMP/maccatalyst.provisionprofile" ]; then
+            echo "::error::Failed to decode MACCATALYST_PROVISIONING_PROFILE_BASE64"
+            exit 1
+          fi
+          # Extract UUID and install with UUID-based filename (required by MAUI SDK)
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$RUNNER_TEMP/maccatalyst.provisionprofile"))
+          cp "$RUNNER_TEMP/maccatalyst.provisionprofile" "$PP_PATH/$PROFILE_UUID.provisionprofile"
+          echo "Installed Mac Catalyst profile with UUID: $PROFILE_UUID"
+
+      - name: Publish Mac Catalyst App
+        run: |
+          dotnet publish ${{ env.MAUI_PROJECT_PATH }} \
+            -f net10.0-maccatalyst \
+            -c Release \
+            -r maccatalyst-arm64 \
+            -p:ApplicationId=nl.versluis.polypilot \
+            -p:CodesignKey="${{ secrets.IOS_CODESIGN_KEY }}" \
+            -p:CodesignProvision="${{ secrets.MACCATALYST_PROVISIONING_PROFILE_NAME }}" \
+            -p:CodesignEntitlements=Platforms/MacCatalyst/Entitlements.AppStore.plist \
+            -p:CreatePackage=false \
+            -p:EnableCodeSigning=true \
+            -p:ApplicationDisplayVersion='${{ env.APP_VERSION }}' \
+            -p:ApplicationVersion='${{ steps.build.outputs.number }}'
+
+      - name: Fix Mac Catalyst app icon
+        run: |
+          APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
+          PLIST="$APP_PATH/Contents/Info.plist"
+
+          # MAUI's resizetizer generates an incomplete icns (4 sizes, up to 128@2x).
+          # Mac App Store requires 512x512@2x. Replace with the complete pre-built icns.
+          cp PolyPilot/Resources/AppIcon/appicon.icns "$APP_PATH/Contents/Resources/appicon.icns"
+          echo "Replaced icns with complete pre-built version"
+
+          # Ensure CFBundleIconName is set
+          if ! /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" 2>/dev/null; then
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string appicon" "$PLIST"
+            echo "Added CFBundleIconName to Info.plist"
+          else
+            echo "CFBundleIconName already set: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$PLIST")"
+          fi
+
+      - name: Embed provisioning profile
+        run: |
+          APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
+          # CreatePackage=false doesn't embed the profile. TestFlight requires it.
+          cp "$RUNNER_TEMP/maccatalyst.provisionprofile" "$APP_PATH/Contents/embedded.provisionprofile"
+          echo "Embedded provisioning profile in app bundle"
+
+      - name: Inject application-identifier into entitlements
+        run: |
+          # Extract application-identifier and team-identifier from provisioning profile
+          # and add them to the entitlements file. codesign doesn't do this automatically
+          # (Xcode does). Required for TestFlight eligibility.
+          PROFILE_PLIST=$(security cms -D -i "$RUNNER_TEMP/maccatalyst.provisionprofile")
+          APP_ID=$(echo "$PROFILE_PLIST" | plutil -extract Entitlements.com\\.apple\\.application-identifier raw -o - -)
+          TEAM_ID=$(echo "$PROFILE_PLIST" | plutil -extract Entitlements.com\\.apple\\.developer\\.team-identifier raw -o - -)
+          echo "Application identifier: $APP_ID"
+          echo "Team identifier: $TEAM_ID"
+
+          ENTITLEMENTS="PolyPilot/Platforms/MacCatalyst/Entitlements.AppStore.plist"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $APP_ID" "$ENTITLEMENTS" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :com.apple.application-identifier $APP_ID" "$ENTITLEMENTS"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $TEAM_ID" "$ENTITLEMENTS" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :com.apple.developer.team-identifier $TEAM_ID" "$ENTITLEMENTS"
+          echo "Updated entitlements:"
+          cat "$ENTITLEMENTS"
+
+      - name: Re-sign app bundle (inside-out)
+        env:
+          CODESIGN_KEY: ${{ secrets.IOS_CODESIGN_KEY }}
+        run: |
+          APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
+          echo "App path: $APP_PATH"
+
+          # Sign the copilot CLI binary with minimal helper entitlements (sandbox + inherit)
+          COPILOT_BIN="$APP_PATH/Contents/MonoBundle/copilot"
+          if [ -f "$COPILOT_BIN" ]; then
+            echo "Signing bundled copilot binary..."
+            codesign --force --sign "$CODESIGN_KEY" \
+              --entitlements PolyPilot/Platforms/MacCatalyst/Entitlements.Helper.plist \
+              --options runtime --timestamp \
+              "$COPILOT_BIN"
+          else
+            echo "Warning: copilot binary not found at $COPILOT_BIN"
+          fi
+
+          # Re-sign all dylibs (inside-out)
+          find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" \) | while read f; do
+            echo "  Signing: $f"
+            codesign --force --options runtime --timestamp \
+              --sign "$CODESIGN_KEY" "$f"
+          done
+
+          # Re-sign frameworks
+          find "$APP_PATH" -type d -name "*.framework" | while read f; do
+            echo "  Signing: $f"
+            codesign --force --options runtime --timestamp \
+              --sign "$CODESIGN_KEY" "$f"
+          done
+
+          # Re-sign the top-level app bundle with full entitlements
+          codesign --force --sign "$CODESIGN_KEY" \
+            --entitlements PolyPilot/Platforms/MacCatalyst/Entitlements.AppStore.plist \
+            --options runtime --timestamp \
+            "$APP_PATH"
+
+          echo "=== Verify signature ==="
+          codesign --verify --deep --strict "$APP_PATH" 2>&1
+          echo "=== App entitlements ==="
+          codesign -d --entitlements - "$APP_PATH" 2>/dev/null | head -30
+          echo "=== Verify copilot binary ==="
+          codesign -dvv "$COPILOT_BIN" 2>&1 | head -10
+
+      - name: Create and sign PKG
+        env:
+          PKG_SIGN_KEY: ${{ secrets.MACCATALYST_INSTALLER_SIGNING_KEY }}
+        run: |
+          APP_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "PolyPilot.app" -type d | head -1)
+          PKG_DIR="PolyPilot/bin/Release/net10.0-maccatalyst"
+
+          # Create component package
+          productbuild --component "$APP_PATH" /Applications \
+            "$PKG_DIR/PolyPilot-unsigned.pkg"
+
+          # Sign the package with Mac Installer certificate
+          productsign --sign "$PKG_SIGN_KEY" \
+            "$PKG_DIR/PolyPilot-unsigned.pkg" \
+            "$PKG_DIR/PolyPilot-${{ env.APP_VERSION }}.pkg"
+
+          rm "$PKG_DIR/PolyPilot-unsigned.pkg"
+          echo "Created signed PKG"
+
+      - name: Find PKG file
+        id: find_pkg
+        run: |
+          PKG_PATH=$(find PolyPilot/bin/Release/net10.0-maccatalyst -name "*.pkg" | head -1)
+          echo "PKG_PATH=$PKG_PATH" >> $GITHUB_OUTPUT
+          echo "Found PKG at: $PKG_PATH"
+
+      - name: Upload PKG artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: maccatalyst-pkg
+          path: ${{ steps.find_pkg.outputs.PKG_PATH }}
+          retention-days: 30
+
+  deploy-maccatalyst:
+    name: Deploy Mac Catalyst to TestFlight
+    runs-on: macos-26
+    needs: build-maccatalyst
+
+    steps:
+      - name: Compute build number
+        id: build
+        run: |
+          OFFSET=${{ inputs.build_number_offset || vars.BUILD_NUMBER_OFFSET || '0' }}
+          BUILD=$(( ${{ github.run_number }} + OFFSET ))
+          echo "number=$BUILD" >> $GITHUB_OUTPUT
+
+      - name: Download PKG artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: maccatalyst-pkg
+          path: ./maccatalyst-artifacts/
+
+      - name: Find PKG file
+        id: find_pkg
+        run: |
+          PKG_PATH=$(find ./maccatalyst-artifacts -name "*.pkg" | head -1)
+          echo "PKG_PATH=$PKG_PATH" >> $GITHUB_OUTPUT
+          echo "Found PKG at: $PKG_PATH"
+
+      - name: Upload to TestFlight
+        env:
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          PKG_PATH: ${{ steps.find_pkg.outputs.PKG_PATH }}
+          APP_VERSION: ${{ env.APP_VERSION }}
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
+        run: |
+          mkdir -p private_keys
+          echo "$APPSTORE_PRIVATE_KEY" > "private_keys/AuthKey_${APPSTORE_KEY_ID}.p8"
+
+          xcrun altool --upload-package "$PKG_PATH" \
+            -t macos \
+            --apple-id "6759370598" \
+            --bundle-id "nl.versluis.polypilot" \
+            --bundle-version "$BUILD_NUMBER" \
+            --bundle-short-version-string "$APP_VERSION" \
+            --apiKey "$APPSTORE_KEY_ID" \
+            --apiIssuer "$APPSTORE_ISSUER_ID"
+
+          rm -rf private_keys
+
+      - name: Distribute to external testers (MAUI Team)
+        continue-on-error: true
+        env:
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          APP_BUNDLE_ID: 'nl.versluis.polypilot'
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
+          APP_VERSION: ${{ env.APP_VERSION }}
+          BETA_GROUP_NAME: 'MAUI Team'
+        run: |
+          set -euo pipefail
+
+          gem install fastlane --no-document
+
+          python3 -c "
+          import json, os
+          key = {
+            'key_id': os.environ['APPSTORE_KEY_ID'],
+            'issuer_id': os.environ['APPSTORE_ISSUER_ID'],
+            'key': os.environ['APPSTORE_PRIVATE_KEY']
+          }
+          with open('api_key.json', 'w') as f:
+            json.dump(key, f)
+          "
+
+          echo "Waiting for build processing before distributing..."
+          fastlane pilot distribute \
+            --api_key_path api_key.json \
+            --app_identifier "$APP_BUNDLE_ID" \
+            --app_platform "osx" \
+            --build_number "$BUILD_NUMBER" \
+            --app_version "$APP_VERSION" \
+            --groups "$BETA_GROUP_NAME" \
+            --distribute_only
+
+          rm -f api_key.json
 
   # ─────────────────────────────────────────────
   # iOS → TestFlight
@@ -155,7 +461,7 @@ jobs:
           echo "Build number: ${{ github.run_number }} + $OFFSET = $BUILD"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -163,7 +469,7 @@ jobs:
           xcode-version: '26.2'
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
@@ -174,7 +480,7 @@ jobs:
           dotnet workload install maui
 
       - name: Import signing certificate
-        uses: apple-actions/import-codesign-certs@v2
+        uses: apple-actions/import-codesign-certs@v6
         with:
           p12-file-base64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
           p12-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
@@ -206,7 +512,7 @@ jobs:
           echo "Found IPA at: $IPA_PATH"
 
       - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ios-ipa
           path: ${{ steps.find_ipa.outputs.IPA_PATH }}
@@ -227,7 +533,7 @@ jobs:
           echo "number=$BUILD" >> $GITHUB_OUTPUT
 
       - name: Download IPA artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ios-ipa
           path: ./ios-artifacts/
@@ -263,16 +569,17 @@ jobs:
           # Install fastlane
           gem install fastlane --no-document
 
-          # Write API key JSON for fastlane
-          mkdir -p private_keys
-          echo "$APPSTORE_PRIVATE_KEY" > "private_keys/AuthKey_${APPSTORE_KEY_ID}.p8"
-          cat > api_key.json <<APIEOF
-          {
-            "key_id": "${APPSTORE_KEY_ID}",
-            "issuer_id": "${APPSTORE_ISSUER_ID}",
-            "key_filepath": "private_keys/AuthKey_${APPSTORE_KEY_ID}.p8"
+          # Write API key JSON for fastlane (from_json_file requires 'key', not 'key_filepath')
+          python3 -c "
+          import json, os
+          key = {
+            'key_id': os.environ['APPSTORE_KEY_ID'],
+            'issuer_id': os.environ['APPSTORE_ISSUER_ID'],
+            'key': os.environ['APPSTORE_PRIVATE_KEY']
           }
-          APIEOF
+          with open('api_key.json', 'w') as f:
+            json.dump(key, f)
+          "
 
           echo "Waiting for build processing before distributing..."
           fastlane pilot distribute \
@@ -283,4 +590,4 @@ jobs:
             --groups "$BETA_GROUP_NAME" \
             --distribute_only
 
-          rm -rf private_keys api_key.json
+          rm -f api_key.json

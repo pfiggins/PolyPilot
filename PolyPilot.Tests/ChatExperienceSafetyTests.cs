@@ -72,6 +72,39 @@ public class ChatExperienceSafetyTests
         method.Invoke(svc, new object?[] { sessionState });
     }
 
+    /// <summary>Invokes the private FinalizeResumedSessionUiStateAsync helper via reflection.</summary>
+    private static async Task InvokeFinalizeResumedSessionUiStateAsync(
+        CopilotService svc,
+        object sessionState,
+        string sessionId,
+        string? workingDirectory,
+        string? gitBranch,
+        bool isStillProcessing,
+        int processingPhase,
+        string reconnectMsg)
+    {
+        var method = typeof(CopilotService).GetMethod("FinalizeResumedSessionUiStateAsync", NonPublic)!;
+        var task = (Task)method.Invoke(svc, new object?[]
+        {
+            sessionState,
+            sessionId,
+            workingDirectory,
+            gitBranch,
+            isStillProcessing,
+            processingPhase,
+            reconnectMsg
+        })!;
+        await task;
+    }
+
+    /// <summary>Invokes the private ClearFlushedReplayDedup helper to simulate a tool/sub-turn boundary.</summary>
+    private static void InvokeClearFlushedReplayDedup(object sessionState)
+    {
+        var method = typeof(CopilotService).GetMethod("ClearFlushedReplayDedup",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        method.Invoke(null, new[] { sessionState });
+    }
+
     /// <summary>Gets a field from SessionState by name.</summary>
     private static T GetField<T>(object state, string fieldName)
     {
@@ -184,6 +217,7 @@ public class ChatExperienceSafetyTests
 
         var successfulToolCount = GetField<int>(state, "SuccessfulToolCountThisTurn");
         Assert.Equal(0, successfulToolCount);
+        Assert.True(GetField<bool>(state, "AllowTurnStartRearm"));
     }
 
     /// <summary>
@@ -257,6 +291,37 @@ public class ChatExperienceSafetyTests
 
         // Assert: should have completed
         Assert.False(session.IsProcessing, "CompleteResponse must execute when generation matches");
+        Assert.True(GetField<bool>(state, "AllowTurnStartRearm"),
+            "Normal completion should allow one late TurnStart to recover from premature idle");
+    }
+
+    /// <summary>
+    /// Late TurnStart events should only revive sessions after speculative auto-completion.
+    /// Explicit aborts, watchdog kills, and force-complete recovery paths must not be re-armed
+    /// by stale SDK TurnStart replays.
+    /// </summary>
+    [Theory]
+    [InlineData(false, true, false, false, true,  true)]
+    [InlineData(false, true, false, false, false, false)]
+    [InlineData(false, true, false, true,  true,  false)]
+    [InlineData(false, true, true,  false, true,  false)]
+    [InlineData(true,  true, false, false, true,  false)]
+    public void TurnStartRearmGuard_OnlyAllowsSpeculativeCompletion(
+        bool isProcessing,
+        bool isCurrentState,
+        bool isOrphaned,
+        bool wasUserAborted,
+        bool allowTurnStartRearm,
+        bool expected)
+    {
+        var result = CopilotService.ShouldRearmOnTurnStart(
+            isProcessing,
+            isCurrentState,
+            isOrphaned,
+            wasUserAborted,
+            allowTurnStartRearm);
+
+        Assert.Equal(expected, result);
     }
 
     /// <summary>
@@ -319,6 +384,38 @@ public class ChatExperienceSafetyTests
     }
 
     /// <summary>
+    /// Identical assistant text across DIFFERENT turns must still be persisted.
+    /// The replay dedup guard should only suppress content already flushed in the
+    /// current turn, not a legitimate repeated reply like "Done." in a later turn.
+    /// </summary>
+    [Fact]
+    public async Task CompleteResponse_IdenticalCrossTurnReply_IsStillPersisted()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("cross-turn-complete-test");
+
+        var state = GetSessionState(svc, "cross-turn-complete-test");
+        session.IsProcessing = true;
+        SetField(state, "SendingFlag", 1);
+
+        session.History.Add(ChatMessage.AssistantMessage("Done."));
+        var historyBefore = session.History.Count;
+
+        GetCurrentResponse(state).Append("Done.");
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetResponseCompletion(state, tcs);
+
+        InvokeCompleteResponse(svc, state, null);
+
+        Assert.Equal(historyBefore + 1, session.History.Count);
+        Assert.Equal("Done.", session.History.Last().Content);
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal("Done.", tcs.Task.Result);
+    }
+
+    /// <summary>
     /// CompleteResponse must include FlushedResponse (from mid-turn flushes on TurnEnd)
     /// in the TCS result. Without this, orchestrator dispatch gets empty string.
     /// This was the root cause of "orchestrator didn't respond to worker" bugs.
@@ -353,6 +450,69 @@ public class ChatExperienceSafetyTests
         var result = tcs.Task.Result;
         Assert.Contains("First sub-turn response text", result);
         Assert.Contains("Second sub-turn continuation", result);
+    }
+
+    /// <summary>
+    /// If the SDK replays the exact text that was already flushed earlier in the SAME turn,
+    /// CompleteResponse must not duplicate it in either History or the TCS result.
+    /// </summary>
+    [Fact]
+    public async Task CompleteResponse_SameTurnReplay_DoesNotDuplicateHistoryOrTcs()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("same-turn-replay-test");
+
+        var state = GetSessionState(svc, "same-turn-replay-test");
+        session.IsProcessing = true;
+        SetField(state, "SendingFlag", 1);
+
+        GetCurrentResponse(state).Append("Already flushed content");
+        InvokeFlushCurrentResponse(svc, state);
+        var historyBefore = session.History.Count;
+
+        GetCurrentResponse(state).Append("Already flushed content");
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetResponseCompletion(state, tcs);
+
+        InvokeCompleteResponse(svc, state, null);
+
+        Assert.Equal(historyBefore, session.History.Count);
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal("Already flushed content", tcs.Task.Result);
+    }
+
+    /// <summary>
+    /// Same-turn replay dedup must still work for ordinary multi-paragraph/model-formatted
+    /// responses that contain "\n\n" inside the content body.
+    /// </summary>
+    [Fact]
+    public async Task CompleteResponse_SameTurnReplay_MultiParagraphContent_DoesNotDuplicate()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("same-turn-replay-multipara");
+
+        var state = GetSessionState(svc, "same-turn-replay-multipara");
+        session.IsProcessing = true;
+        SetField(state, "SendingFlag", 1);
+
+        const string content = "First paragraph.\n\n```csharp\nConsole.WriteLine(\"hi\");\n```\n\nFinal paragraph.";
+        GetCurrentResponse(state).Append(content);
+        InvokeFlushCurrentResponse(svc, state);
+        var historyBefore = session.History.Count;
+
+        GetCurrentResponse(state).Append(content);
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetResponseCompletion(state, tcs);
+
+        InvokeCompleteResponse(svc, state, null);
+
+        Assert.Equal(historyBefore, session.History.Count);
+        Assert.True(tcs.Task.IsCompleted);
+        Assert.Equal(content, tcs.Task.Result);
     }
 
     /// <summary>
@@ -712,8 +872,8 @@ public class ChatExperienceSafetyTests
     }
 
     /// <summary>
-    /// FlushCurrentResponse dedup guard: if the last assistant message has identical content,
-    /// the flush is skipped to prevent duplicates on session resume.
+    /// FlushCurrentResponse dedup guard: if the exact same segment was already flushed in
+    /// the CURRENT turn, the replay is skipped to prevent duplicates on resume/IDLE-DEFER.
     /// </summary>
     [Fact]
     public async Task FlushCurrentResponse_DedupGuard_SkipsDuplicate()
@@ -724,11 +884,12 @@ public class ChatExperienceSafetyTests
 
         var state = GetSessionState(svc, "dedup-test");
 
-        // Add a message that looks like it was already flushed
-        session.History.Add(ChatMessage.AssistantMessage("Already flushed content"));
+        // Simulate the current turn already flushing this exact segment once.
+        GetCurrentResponse(state).Append("Already flushed content");
+        InvokeFlushCurrentResponse(svc, state);
         var historyCountAfterFirst = session.History.Count;
 
-        // Simulate the same content appearing in CurrentResponse (SDK replay on resume)
+        // Simulate the same content appearing in CurrentResponse again (SDK replay)
         GetCurrentResponse(state).Append("Already flushed content");
 
         // Act
@@ -736,6 +897,80 @@ public class ChatExperienceSafetyTests
 
         // Assert: no duplicate added
         Assert.Equal(historyCountAfterFirst, session.History.Count);
+    }
+
+    /// <summary>
+    /// Same-turn flush dedup must treat embedded paragraph breaks as normal content, not as
+    /// separators between separately flushed segments.
+    /// </summary>
+    [Fact]
+    public async Task FlushCurrentResponse_DedupGuard_MultiParagraphContent_SkipsDuplicate()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("dedup-multipara-test");
+
+        var state = GetSessionState(svc, "dedup-multipara-test");
+
+        const string content = "Overview:\n\n- first item\n- second item\n\nDone.";
+        GetCurrentResponse(state).Append(content);
+        InvokeFlushCurrentResponse(svc, state);
+        var historyCountAfterFirst = session.History.Count;
+
+        GetCurrentResponse(state).Append(content);
+
+        InvokeFlushCurrentResponse(svc, state);
+
+        Assert.Equal(historyCountAfterFirst, session.History.Count);
+    }
+
+    /// <summary>
+    /// A brand-new turn that happens to produce the same assistant text as the prior turn
+    /// must still be preserved. Dedup is same-turn only.
+    /// </summary>
+    [Fact]
+    public async Task FlushCurrentResponse_IdenticalCrossTurnReply_IsStillPersisted()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("cross-turn-flush-test");
+
+        var state = GetSessionState(svc, "cross-turn-flush-test");
+        session.History.Add(ChatMessage.AssistantMessage("Done."));
+        var historyBefore = session.History.Count;
+
+        GetCurrentResponse(state).Append("Done.");
+        InvokeFlushCurrentResponse(svc, state);
+
+        Assert.Equal(historyBefore + 1, session.History.Count);
+        Assert.Equal("Done.", session.History.Last().Content);
+    }
+
+    /// <summary>
+    /// A later same-turn sub-turn may legitimately produce the same short text again after a
+    /// tool/sub-turn boundary. That follow-up response must not be mistaken for an SDK replay.
+    /// </summary>
+    [Fact]
+    public async Task FlushCurrentResponse_IdenticalSameTurnAfterBoundary_IsStillPersisted()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("same-turn-after-boundary");
+
+        var state = GetSessionState(svc, "same-turn-after-boundary");
+
+        GetCurrentResponse(state).Append("Done.");
+        InvokeFlushCurrentResponse(svc, state);
+        var historyAfterFirst = session.History.Count;
+
+        // Simulate a tool/sub-turn boundary before the assistant emits the same text again.
+        InvokeClearFlushedReplayDedup(state);
+
+        GetCurrentResponse(state).Append("Done.");
+        InvokeFlushCurrentResponse(svc, state);
+
+        Assert.Equal(historyAfterFirst + 1, session.History.Count);
+        Assert.Equal("Done.", session.History.Last().Content);
     }
 
     /// <summary>
@@ -841,20 +1076,57 @@ public class ChatExperienceSafetyTests
         var crIdx = source.IndexOf("private void CompleteResponse(", StringComparison.Ordinal);
         Assert.True(crIdx > 0);
 
-        // Within CompleteResponse, SendingFlag must be cleared (may be 80+ lines into method)
-        var afterCR = source.Substring(crIdx, Math.Min(6000, source.Length - crIdx));
-        Assert.Contains("SendingFlag", afterCR);
+        // CompleteResponse must call ClearProcessingState (which clears SendingFlag along with all other fields)
+        var afterCR = source.Substring(crIdx, Math.Min(10000, source.Length - crIdx));
+        Assert.Contains("ClearProcessingState", afterCR);
     }
 
     /// <summary>
-    /// The "Session not found" reconnect path must include McpServers and SkillDirectories
-    /// in the fresh session config (PR #330 regression guard).
+    /// The UI must suppress the live streaming bubble once that exact assistant text has
+    /// already been flushed into History. Otherwise IDLE-DEFER sessions render the same
+    /// answer twice until the next prompt clears the streaming cache.
     /// </summary>
     [Fact]
-    public void ReconnectPath_IncludesMcpServersAndSkills()
+    public void ChatMessageList_Source_SuppressesStreamingDuplicateAfterFlush()
+    {
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Components", "ChatMessageList.razor"));
+
+        Assert.Contains("private bool ShouldShowStreamingContent()", source);
+        Assert.Contains("NormalizeStreamingText(lastAssistant?.Content)", source);
+        Assert.Contains("NormalizeStreamingText(StreamingContent)", source);
+    }
+
+    /// <summary>
+    /// Draft restore must not clobber newer user typing with a stale cached draft during
+    /// normal render cycles. The browser keeps a live draft map and restore logic skips
+    /// overwriting text that diverged from the last restored value.
+    /// </summary>
+    [Fact]
+    public void DraftRestore_Source_PreservesLiveTyping()
+    {
+        var indexHtml = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "wwwroot", "index.html"));
+        var dashboard = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Components", "Pages", "Dashboard.razor"));
+
+        Assert.Contains("window.__liveDrafts", dashboard);
+        Assert.Contains("hasDivergedUserText", indexHtml);
+        Assert.Contains("current !== desired && current !== lastRestored", indexHtml);
+        Assert.Contains("delete window.__liveDrafts[elementId]", indexHtml);
+    }
+
+    /// <summary>
+    /// Fresh create + lazy/explicit resume paths must all preserve MCP servers and skill
+    /// directories so restarted sessions do not silently lose tool availability.
+    /// </summary>
+    [Fact]
+    public void ResumeAndReconnectPaths_IncludeMcpServersAndSkills()
     {
         var source = File.ReadAllText(
             Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+        var persistence = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
 
         // After extraction to BuildFreshSessionConfig, verify the reconnect path calls the helper
         var sessionNotFoundIdx = source.IndexOf("resumeEx.Message.Contains(\"Session not found\"", StringComparison.Ordinal);
@@ -868,6 +1140,79 @@ public class ChatExperienceSafetyTests
         var helperBlock = source.Substring(helperIdx, Math.Min(2000, source.Length - helperIdx));
         Assert.Contains("McpServers", helperBlock);
         Assert.Contains("SkillDirectories", helperBlock);
+
+        var resumeHelperIdx = source.IndexOf("private ResumeSessionConfig BuildResumeSessionConfig", StringComparison.Ordinal);
+        Assert.True(resumeHelperIdx > 0);
+        var resumeHelperBlock = source.Substring(resumeHelperIdx, Math.Min(2000, source.Length - resumeHelperIdx));
+        Assert.Contains("McpServers", resumeHelperBlock);
+        Assert.Contains("SkillDirectories", resumeHelperBlock);
+        Assert.Contains("BuildResumeSessionConfig(state, resumeWorkingDirectory", source);
+        Assert.Contains("BuildResumeSessionConfig(state, resumeWorkDir", persistence);
+    }
+
+    /// <summary>
+    /// Finalizing resumed session state should complete stale entries and append the reconnect
+    /// message through the dedicated UI-thread helper instead of mutating History inline.
+    /// </summary>
+    [Fact]
+    public async Task FinalizeResumedSessionUiState_CompletesStaleEntriesAndAppendsReconnectMessage()
+    {
+        var svc = CreateService();
+        await svc.ReconnectAsync(new ConnectionSettings { Mode = ConnectionMode.Demo });
+        var session = await svc.CreateSessionAsync("resume-ui-finalize");
+        var state = GetSessionState(svc, "resume-ui-finalize");
+
+        var staleTool = ChatMessage.ToolCallMessage("bash", "call-1", "echo hi");
+        staleTool.IsComplete = false;
+        var staleReasoning = ChatMessage.ReasoningMessage("reason-1");
+        staleReasoning.Content = "thinking...";
+        staleReasoning.IsComplete = false;
+        session.History.Add(ChatMessage.UserMessage("resume me"));
+        session.History.Add(staleTool);
+        session.History.Add(staleReasoning);
+
+        await InvokeFinalizeResumedSessionUiStateAsync(
+            svc,
+            state,
+            Guid.NewGuid().ToString(),
+            "/tmp/worktree",
+            "main",
+            isStillProcessing: true,
+            processingPhase: 3,
+            reconnectMsg: "🔄 Session reconnected at 12:34 — running bash");
+
+        Assert.True(staleTool.IsComplete);
+        Assert.True(staleReasoning.IsComplete);
+        Assert.True(session.IsProcessing);
+        Assert.Equal(3, session.ProcessingPhase);
+        Assert.Equal("/tmp/worktree", session.WorkingDirectory);
+        Assert.Equal("main", session.GitBranch);
+        Assert.Contains(session.History, m => m.Content?.Contains("Session reconnected", StringComparison.Ordinal) == true);
+    }
+
+    /// <summary>
+    /// The lazy-resume fallback path (session not found / corrupt / process error)
+    /// must attach an event handler on the fresh session so it is not deaf.
+    /// When the old post-resume .On() was removed in favor of ResumeSessionConfig.OnEvent,
+    /// the fallback branch that creates a fresh SessionConfig must still call .On() explicitly.
+    /// </summary>
+    [Fact]
+    public void LazyResumeFallback_AttachesEventHandler()
+    {
+        var persistence = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
+
+        // Find the fallback create path ("Lazy-resume failed" → CreateSessionAsync)
+        var fallbackIdx = persistence.IndexOf("Lazy-resume failed for", StringComparison.Ordinal);
+        Assert.True(fallbackIdx > 0, "Could not find the lazy-resume fallback path");
+
+        // Grab the block from the fallback through the next FlushSaveActiveSessionsToDisk
+        var afterFallback = persistence.Substring(fallbackIdx, Math.Min(800, persistence.Length - fallbackIdx));
+        Assert.Contains("CreateSessionAsync", afterFallback);
+
+        // The critical invariant: .On(evt => HandleSessionEvent(...)) must appear
+        // between CreateSessionAsync and the end of this catch block
+        Assert.Contains("copilotSession.On(evt => HandleSessionEvent(state, evt))", afterFallback);
     }
 
     // =========================================================================
@@ -1000,5 +1345,146 @@ public class ChatExperienceSafetyTests
         var lastDbMsg = _chatDb.AddedMessages.Last();
         Assert.Equal("test-db-session-id", lastDbMsg.SessionId);
         Assert.Contains("Content for database", lastDbMsg.Message.Content);
+    }
+
+    /// <summary>
+    /// PR #531 review finding: ClearProcessingState must NOT set AllowTurnStartRearm=true.
+    /// Only CompleteResponse (normal-completion path) should allow EVT-REARM.
+    /// Error/abort paths must not have a race window where a background TurnStart event
+    /// reads AllowTurnStartRearm=true before the caller can set it back to false.
+    /// </summary>
+    [Fact]
+    public void ClearProcessingState_DoesNotSetAllowTurnStartRearm()
+    {
+        // Structural: ClearProcessingState method body must NOT contain AllowTurnStartRearm = true
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("private void ClearProcessingState(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ClearProcessingState must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Strip comment lines before checking — comments may document the invariant using
+        // the very string we're guarding against appearing in actual code.
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+
+        Assert.False(codeOnly.Contains("AllowTurnStartRearm = true", StringComparison.Ordinal),
+            "ClearProcessingState must NOT set AllowTurnStartRearm=true — only CompleteResponse should, " +
+            "to avoid a race where error/abort paths get it briefly set before they can override to false.");
+    }
+
+    /// <summary>
+    /// PR #531 review finding: _consecutiveWatchdogTimeouts reset must NOT be in
+    /// ClearProcessingState. It is a success-only signal (healthy server) — resetting it
+    /// on error/abort paths defeats the server-recovery detection threshold.
+    /// </summary>
+    [Fact]
+    public void ClearProcessingState_DoesNotResetConsecutiveWatchdogTimeouts()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("private void ClearProcessingState(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ClearProcessingState must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Strip comment lines — comments may reference the counter by name while documenting why it's excluded.
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+
+        Assert.False(codeOnly.Contains("_consecutiveWatchdogTimeouts", StringComparison.Ordinal),
+            "ClearProcessingState must NOT reset _consecutiveWatchdogTimeouts — only CompleteResponse " +
+            "(success path) should, since resetting on error/abort paths defeats server-recovery detection.");
+
+        Assert.False(codeOnly.Contains("ConsecutiveStuckCount", StringComparison.Ordinal),
+            "ClearProcessingState must NOT reset ConsecutiveStuckCount — only CompleteResponse " +
+            "(success path) should, since resetting on watchdog/error paths breaks the >= 3 " +
+            "threshold that stops system message accumulation in repeatedly-stuck sessions.");
+    }
+
+    /// <summary>
+    /// PR #531 review finding: CompleteResponse must set AllowTurnStartRearm=true,
+    /// reset _consecutiveWatchdogTimeouts, and reset ConsecutiveStuckCount after ClearProcessingState.
+    /// </summary>
+    [Fact]
+    public void CompleteResponse_SetsAllowTurnStartRearmAndResetsWatchdogCounter()
+    {
+        var eventsPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Events.cs");
+        var source = File.ReadAllText(eventsPath);
+
+        var methodIdx = source.IndexOf("private void CompleteResponse(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "CompleteResponse must exist");
+        // Use 10000 chars — the method is ~112 lines before AllowTurnStartRearm, ~6400 chars in.
+        var methodBody = source.Substring(methodIdx, Math.Min(10000, source.Length - methodIdx));
+
+        Assert.True(methodBody.Contains("AllowTurnStartRearm = true", StringComparison.Ordinal),
+            "CompleteResponse must explicitly set AllowTurnStartRearm=true after ClearProcessingState");
+        Assert.True(methodBody.Contains("_consecutiveWatchdogTimeouts", StringComparison.Ordinal),
+            "CompleteResponse must reset _consecutiveWatchdogTimeouts on successful completion");
+        Assert.True(methodBody.Contains("ConsecutiveStuckCount = 0", StringComparison.Ordinal),
+            "CompleteResponse must reset ConsecutiveStuckCount on successful completion");
+    }
+
+    /// <summary>
+    /// PR #531 re-review finding: AbortSessionAsync must NOT increment PremiumRequestsUsed.
+    /// User-initiated aborts consumed server resources (API time) but shouldn't count against
+    /// the premium request budget. The call must use accumulateApiTime: false and manually
+    /// accumulate TotalApiTimeSeconds before ClearProcessingState.
+    /// </summary>
+    [Fact]
+    public void AbortSessionAsync_DoesNotIncrementPremiumRequestsViaAccumulateApiTime()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        var methodIdx = source.IndexOf("public async Task AbortSessionAsync(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "AbortSessionAsync must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // The abort path must call ClearProcessingState with accumulateApiTime: false
+        Assert.True(methodBody.Contains("accumulateApiTime: false", StringComparison.Ordinal),
+            "AbortSessionAsync must call ClearProcessingState with accumulateApiTime: false — " +
+            "user aborts should not increment PremiumRequestsUsed");
+
+        // It must also manually accumulate TotalApiTimeSeconds (request was consumed)
+        Assert.True(methodBody.Contains("TotalApiTimeSeconds", StringComparison.Ordinal),
+            "AbortSessionAsync must manually accumulate TotalApiTimeSeconds before ClearProcessingState — " +
+            "the request consumed server resources even though the user aborted");
+    }
+
+    /// <summary>
+    /// The ResumeSessionAsync method must pass the event handler via ResumeSessionConfig.OnEvent
+    /// instead of calling .On() after the resume returns. The SDK registers OnEvent before
+    /// sending the session.resume RPC, closing the race window where events arrive between
+    /// resume-return and .On() call — which causes silently dropped content events (empty responses).
+    /// </summary>
+    [Fact]
+    public void ResumeSessionAsync_UsesOnEventInConfig_NotPostResumeOn()
+    {
+        var svcPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs");
+        var source = File.ReadAllText(svcPath);
+
+        // Find the ResumeSessionAsync method (the one that resumes sessions on startup)
+        var methodIdx = source.IndexOf("public async Task<AgentSessionInfo> ResumeSessionAsync(", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "ResumeSessionAsync must exist");
+        var methodEnd = source.IndexOf("\n    }", methodIdx + 1, StringComparison.Ordinal);
+        var methodBody = source.Substring(methodIdx, methodEnd - methodIdx);
+
+        // Must use OnEvent in the config — this registers BEFORE the RPC call
+        Assert.True(methodBody.Contains("OnEvent", StringComparison.Ordinal),
+            "ResumeSessionAsync must pass event handler via ResumeSessionConfig.OnEvent " +
+            "to avoid the race where events are dropped between resume-return and .On() call");
+
+        // Must NOT have a post-resume .On() call (which would be the race-prone pattern)
+        // Strip comment lines first
+        var codeOnly = string.Join("\n", methodBody.Split('\n')
+            .Where(l => !l.TrimStart().StartsWith("//")));
+        Assert.False(codeOnly.Contains("copilotSession.On(evt", StringComparison.Ordinal),
+            "ResumeSessionAsync must NOT call copilotSession.On() after resume — " +
+            "use OnEvent in config instead to prevent the event delivery race");
     }
 }

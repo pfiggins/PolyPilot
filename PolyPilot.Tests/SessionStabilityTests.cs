@@ -79,27 +79,21 @@ public class SessionStabilityTests
         var source = File.ReadAllText(TestPaths.OrganizationCs);
         var method = ExtractMethod(source, "Task ForceCompleteProcessingAsync");
 
-        // Every INV-1 field must be cleared
-        var requiredClears = new[]
+        // ForceCompleteProcessingAsync must call ClearProcessingState (which atomically
+        // clears all INV-1 fields) and the other required operations
+        var requiredPatterns = new[]
         {
-            "ActiveToolCallCount",      // INV-1 field 3
-            "HasUsedToolsThisTurn",     // INV-1 field 2
-            "SendingFlag",              // INV-1 field 7
-            "IsResumed",                // INV-1 field 1
-            "ProcessingStartedAt",      // INV-1 field 4
-            "ToolCallCount",            // INV-1 field 5
-            "ProcessingPhase",          // INV-1 field 6
-            "ClearPermissionDenials",   // INV-1 field 8
-            "FlushCurrentResponse",     // INV-1 field 9
-            "IsProcessing",             // The flag itself
-            "OnSessionComplete",        // INV-1 field 10
-            "TrySetResult",             // Resolves the worker TCS
+            "ClearProcessingState(state",  // Atomic INV-1 field clearing
+            "FlushCurrentResponse",         // INV-1 field 9
+            "OnSessionComplete",            // INV-1 field 10
+            "TrySetResult",                 // Resolves the worker TCS
+            "AllowTurnStartRearm = false",  // Explicit recovery terminal
         };
 
-        foreach (var field in requiredClears)
+        foreach (var field in requiredPatterns)
         {
             Assert.True(method.Contains(field, StringComparison.Ordinal),
-                $"ForceCompleteProcessingAsync must clear '{field}' (INV-1 compliance)");
+                $"ForceCompleteProcessingAsync must contain '{field}'");
         }
     }
 
@@ -126,6 +120,39 @@ public class SessionStabilityTests
 
         // Must early-return if already not processing (idempotent)
         Assert.Contains("!state.Info.IsProcessing", method);
+    }
+
+    [Fact]
+    public void ForceCompleteProcessing_BoundsAbortAsyncTimeout()
+    {
+        var source = File.ReadAllText(TestPaths.OrganizationCs);
+        var method = ExtractMethod(source, "Task ForceCompleteProcessingAsync");
+
+        Assert.Contains("ForceCompleteAbortTimeoutSeconds", source);
+        Assert.Contains("new CancellationTokenSource(TimeSpan.FromSeconds(ForceCompleteAbortTimeoutSeconds))", method);
+        Assert.Contains("await session.AbortAsync(abortCts.Token);", method);
+        Assert.Contains("OperationCanceledException", method);
+    }
+
+    [Fact]
+    public void ForceCompleteProcessing_UsesClearProcessingState()
+    {
+        // ForceCompleteProcessingAsync must delegate to ClearProcessingState rather than
+        // manually clearing fields. ClearProcessingState calls ClearDeferredIdleTracking
+        // with preserveCarryOver: true so stale shell fingerprints survive across turns.
+        var source = File.ReadAllText(TestPaths.OrganizationCs);
+        var method = ExtractMethod(source, "Task ForceCompleteProcessingAsync");
+
+        Assert.Contains("ClearProcessingState(state", method);
+    }
+
+    [Fact]
+    public void OrchestratorTimeout_ResultCollection_PreservesWorkerNames()
+    {
+        var source = File.ReadAllText(TestPaths.OrganizationCs);
+
+        Assert.Contains("var workerName = i < assignments.Count ? assignments[i].WorkerName : \"unknown\";", source);
+        Assert.DoesNotContain("new WorkerResult(\"unknown\", null, false", source);
     }
 
     // ─── Mixed Worker Success/Failure Synthesis Tests ───
@@ -273,20 +300,13 @@ public class SessionStabilityTests
         var source = File.ReadAllText(TestPaths.EventsCs);
         var watchdogMethod = ExtractMethod(source, "RunProcessingWatchdogAsync");
 
-        // The crash recovery block (Case C kill) must clear companion fields
-        var companionFields = new[]
-        {
-            "IsProcessing = false",
-            "ProcessingPhase",
-            "ProcessingStartedAt",
-            "ToolCallCount",
-        };
-
-        foreach (var field in companionFields)
-        {
-            Assert.True(watchdogMethod.Contains(field, StringComparison.Ordinal),
-                $"Watchdog crash recovery must clear '{field}'");
-        }
+        // The crash recovery block must call ClearProcessingState (which atomically
+        // clears IsProcessing, ProcessingPhase, ProcessingStartedAt, ToolCallCount, etc.)
+        Assert.True(watchdogMethod.Contains("ClearProcessingState(state", StringComparison.Ordinal),
+            "Watchdog crash recovery must call ClearProcessingState to atomically clear all companion fields");
+        // Must also set AllowTurnStartRearm = false (terminal forced stop)
+        Assert.True(watchdogMethod.Contains("AllowTurnStartRearm = false", StringComparison.Ordinal),
+            "Watchdog crash recovery must set AllowTurnStartRearm = false");
     }
 
     // ─── Multi-Agent Fix Prompt Enhancement ───

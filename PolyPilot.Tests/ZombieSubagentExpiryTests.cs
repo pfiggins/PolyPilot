@@ -122,13 +122,13 @@ public class ZombieSubagentExpiryTests
             idle, TicksAgo(CopilotService.SubagentZombieTimeoutMinutes)));
     }
 
-    // --- Shells are never expired ---
+    // --- Shells get a longer zombie timeout than agents ---
 
     [Fact]
-    public void ZombieThresholdExceeded_WithShells_ReturnsTrue()
+    public void AfterAgentThreshold_MixedShellsStillKeepSessionActive()
     {
-        // Even if all background agents are expired, an active shell keeps IDLE-DEFER alive.
-        // Shells are managed at the OS level — PolyPilot never force-expires them.
+        // At 30 minutes, agents should have expired but shells should still keep the
+        // session deferred. This protects legitimate long-running build/test shells.
         var idle = new SessionIdleEvent
         {
             Data = new SessionIdleData
@@ -152,15 +152,17 @@ public class ZombieSubagentExpiryTests
                 }
             }
         };
-        Assert.True(CopilotService.HasActiveBackgroundTasks(idle, TicksAgo(30)));
+        Assert.True(CopilotService.HasActiveBackgroundTasks(
+            idle, TicksAgo(CopilotService.SubagentZombieTimeoutMinutes + 10)));
     }
 
     [Fact]
-    public void ZombieThresholdExceeded_ShellsOnly_ReturnsTrue()
+    public void ZombieThresholdExceeded_ShellsOnly_ReturnsFalse()
     {
-        // Shells alone always block completion — they are never zombie-expired.
+        // Shells alone should eventually expire too — just with a longer threshold than agents.
         var idle = MakeIdleWithShells();
-        Assert.True(CopilotService.HasActiveBackgroundTasks(idle, TicksAgo(60)));
+        Assert.False(CopilotService.HasActiveBackgroundTasks(
+            idle, TicksAgo(CopilotService.ShellZombieTimeoutMinutes + 1)));
     }
 
     [Fact]
@@ -168,6 +170,122 @@ public class ZombieSubagentExpiryTests
     {
         var idle = MakeIdleWithShells();
         Assert.True(CopilotService.HasActiveBackgroundTasks(idle, TicksAgo(1)));
+    }
+
+    [Fact]
+    public void AfterAgentThreshold_ShellsOnly_StillReturnsTrue()
+    {
+        // Shells should survive past the 20-minute agent timeout so legitimate long-running
+        // commands do not get truncated just because they're shell-backed instead of subagents.
+        var idle = MakeIdleWithShells();
+        Assert.True(CopilotService.HasActiveBackgroundTasks(
+            idle, TicksAgo(CopilotService.SubagentZombieTimeoutMinutes + 5)));
+    }
+
+    [Fact]
+    public void SameShellFingerprint_PreservesOriginalAgeAcrossTurns()
+    {
+        // The same orphaned shell IDs can be reported again on later prompts. Their zombie age
+        // must continue from the first time we saw them — otherwise every new prompt resets the
+        // timer and the session can stay "busy" forever.
+        var idle = MakeIdleWithShells(shellCount: 2);
+        var snapshot = CopilotService.GetBackgroundTaskSnapshot(idle.Data?.BackgroundTasks);
+        var staleTicks = TicksAgo(CopilotService.ShellZombieTimeoutMinutes + 5);
+
+        var preservedTicks = CopilotService.GetBackgroundTaskFirstSeenTicks(
+            idle.Data?.BackgroundTasks,
+            snapshot.Fingerprint,
+            staleTicks,
+            DateTime.UtcNow);
+
+        Assert.Equal(staleTicks, preservedTicks);
+        Assert.False(CopilotService.HasActiveBackgroundTasks(idle, preservedTicks));
+    }
+
+    [Fact]
+    public void DifferentShellFingerprint_RefreshesAgeForNewBackgroundWork()
+    {
+        var newShells = new SessionIdleDataBackgroundTasks
+        {
+            Agents = Array.Empty<SessionIdleDataBackgroundTasksAgentsItem>(),
+            Shells = new[]
+            {
+                new SessionIdleDataBackgroundTasksShellsItem
+                {
+                    ShellId = "shell-new",
+                    Description = "fresh build"
+                }
+            }
+        };
+        var staleTicks = TicksAgo(CopilotService.ShellZombieTimeoutMinutes + 5);
+        var before = DateTime.UtcNow;
+
+        var refreshedTicks = CopilotService.GetBackgroundTaskFirstSeenTicks(
+            newShells,
+            "shell:shell-old",
+            staleTicks,
+            before);
+
+        Assert.Equal(before.Ticks, refreshedTicks);
+        Assert.True(CopilotService.HasActiveBackgroundTasks(
+            new SessionIdleEvent { Data = new SessionIdleData { BackgroundTasks = newShells } },
+            refreshedTicks));
+    }
+
+    [Fact]
+    public void CarryOverShellOnlyTasks_FromPriorTurn_ShouldNotBlockNewTurn()
+    {
+        var idle = MakeIdleWithShells(shellCount: 2);
+        var snapshot = CopilotService.GetBackgroundTaskSnapshot(idle.Data?.BackgroundTasks);
+
+        Assert.True(CopilotService.ShouldIgnoreCarryOverShellOnlyTasks(
+            snapshot,
+            TicksAgo(3),
+            DateTime.UtcNow.AddMinutes(-1)));
+    }
+
+    [Fact]
+    public void CarryOverShellOnlyTasks_DoNotApplyToCurrentTurnOrActiveAgents()
+    {
+        var shellsOnly = MakeIdleWithShells(shellCount: 1);
+        var shellSnapshot = CopilotService.GetBackgroundTaskSnapshot(shellsOnly.Data?.BackgroundTasks);
+
+        Assert.False(CopilotService.ShouldIgnoreCarryOverShellOnlyTasks(
+            shellSnapshot,
+            TicksAgo(1),
+            DateTime.UtcNow.AddMinutes(-3)));
+
+        var withAgents = new SessionIdleEvent
+        {
+            Data = new SessionIdleData
+            {
+                BackgroundTasks = new SessionIdleDataBackgroundTasks
+                {
+                    Agents = new[]
+                    {
+                        new SessionIdleDataBackgroundTasksAgentsItem
+                        {
+                            AgentId = "agent-1",
+                            AgentType = "copilot",
+                            Description = "worker"
+                        }
+                    },
+                    Shells = new[]
+                    {
+                        new SessionIdleDataBackgroundTasksShellsItem
+                        {
+                            ShellId = "shell-1",
+                            Description = "tail -f"
+                        }
+                    }
+                }
+            }
+        };
+        var mixedSnapshot = CopilotService.GetBackgroundTaskSnapshot(withAgents.Data?.BackgroundTasks);
+        Assert.False(CopilotService.ShouldIgnoreCarryOverShellOnlyTasks(
+            mixedSnapshot,
+            TicksAgo(10),
+            DateTime.UtcNow.AddMinutes(-1)));
     }
 
     // --- Cross-turn stale timestamp: the critical lifecycle bug this PR fixes ---

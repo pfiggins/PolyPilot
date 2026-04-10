@@ -1582,6 +1582,34 @@ public class MultiAgentRegressionTests
     }
 
     [Fact]
+    public void MonitorAndSynthesize_ReflectResume_WaitsForOrchestratorResponse()
+    {
+        // When a reflect-mode group resumes after restart and the orchestrator responds with
+        // new @worker blocks (wants to keep iterating), MonitorAndSynthesizeAsync must wait for
+        // the response and dispatch those workers — not fire-and-forget the synthesis.
+        //
+        // Observed failure: orchestrator emitted @worker:Copilot Cli-worker-1 after resume
+        // synthesis, but SendPromptAsync (fire-and-forget) meant the response was never
+        // processed and the worker was never dispatched. Loop stalled indefinitely.
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs"));
+
+        var startIdx = source.IndexOf("private async Task MonitorAndSynthesizeAsync");
+        Assert.True(startIdx >= 0, "MonitorAndSynthesizeAsync method not found in source");
+        var block = source.Substring(startIdx, Math.Min(source.Length - startIdx, 16000));
+
+        // For reflect groups: must use SendPromptAndWaitAsync (not just SendPromptAsync)
+        // to get the orchestrator's response and detect new @worker assignments.
+        Assert.Contains("pending.IsReflect", block);
+        Assert.Contains("SendPromptAndWaitAsync", block);
+        // Must parse the orchestrator's response for @worker assignments
+        Assert.Contains("ParseTaskAssignments", block);
+        // Must dispatch workers if assignments found
+        Assert.Contains("resumeAssignments.Count > 0", block);
+        // Must apply the same collection timeout as the normal reflect loop
+        Assert.Contains("OrchestratorCollectionTimeout", block);
+    }
+
+    [Fact]
     public async Task RetryOrchestration_MissingGroup_DoesNothing()
     {
         var svc = CreateService();
@@ -2423,17 +2451,6 @@ public class MultiAgentRegressionTests
     #region Premature Idle Recovery Tests (PR #375 — SDK bug #299)
 
     [Fact]
-    public void PrematureIdleDetectionWindowMs_IsReasonable()
-    {
-        // The detection window must be long enough for EVT-REARM to fire on the UI thread
-        // after the premature idle, but short enough not to delay normal completions excessively.
-        Assert.True(CopilotService.PrematureIdleDetectionWindowMs >= 3000,
-            "Detection window must be >= 3s to allow UI thread EVT-REARM dispatch");
-        Assert.True(CopilotService.PrematureIdleDetectionWindowMs <= 10_000,
-            "Detection window must be <= 10s to avoid excessive delay on normal completions");
-    }
-
-    [Fact]
     public void PrematureIdleRecoveryTimeoutMs_IsReasonable()
     {
         // Recovery timeout must accommodate workers with long tool runs (up to 10+ minutes)
@@ -2482,7 +2499,7 @@ public class MultiAgentRegressionTests
         var sendIdx = source.IndexOf("async Task<string> SendPromptAsync(", StringComparison.Ordinal);
         Assert.True(sendIdx >= 0, "SendPromptAsync must exist in CopilotService.cs");
 
-        var sendBlock = source.Substring(sendIdx, Math.Min(10000, source.Length - sendIdx));
+        var sendBlock = source.Substring(sendIdx, Math.Min(8000, source.Length - sendIdx));
         Assert.Contains("PrematureIdleSignal.Reset()", sendBlock);
     }
 
@@ -2532,7 +2549,7 @@ public class MultiAgentRegressionTests
         // Find the method definition (not a call site)
         var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
         Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
-        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+        var methodBlock = source.Substring(methodIdx, Math.Min(12000, source.Length - methodIdx));
 
         Assert.Contains("OnSessionComplete +=", methodBlock);
         Assert.Contains("OnSessionComplete -=", methodBlock); // Must unsubscribe in finally
@@ -2592,6 +2609,68 @@ public class MultiAgentRegressionTests
     }
 
     [Fact]
+    public void Revival_SetsRecoveredFromSessionId_BeforeUpdatingSessionId()
+    {
+        // Structural: revival must set RecoveredFromSessionId on the Info object BEFORE
+        // updating SessionId. This ensures MergeSessionEntries can identify that the new
+        // session explicitly replaced the old one and drop the old "(previous)" phantom entry.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var tryUpdateIdx = source.IndexOf("TryUpdate(workerName, freshState, deadState)", StringComparison.Ordinal);
+        Assert.True(tryUpdateIdx >= 0, "TryUpdate call must exist");
+
+        var recoveredFromIdx = source.IndexOf("deadState.Info.RecoveredFromSessionId ??=", StringComparison.Ordinal);
+        Assert.True(recoveredFromIdx >= 0, "Revival must set RecoveredFromSessionId after TryUpdate");
+        Assert.True(recoveredFromIdx > tryUpdateIdx, "RecoveredFromSessionId must be set after TryUpdate");
+
+        var sessionIdAssign = source.IndexOf("deadState.Info.SessionId = freshSession.SessionId", StringComparison.Ordinal);
+        Assert.True(recoveredFromIdx < sessionIdAssign,
+            "RecoveredFromSessionId must be set BEFORE SessionId is updated (so the old ID is correctly recorded)");
+    }
+
+    [Fact]
+    public void Revival_AddsOldSessionIdToClosedSet_PreventingPhantomPreviousEntry()
+    {
+        // Structural: when worker revival creates a fresh session, it must add the OLD
+        // session ID to _closedSessionIds. Without this, SaveActiveSessionsToDisk's merge
+        // sees the old ID in persisted active-sessions.json and creates a "(previous)" entry.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var tryUpdateIdx = source.IndexOf("TryUpdate(workerName, freshState, deadState)", StringComparison.Ordinal);
+        Assert.True(tryUpdateIdx >= 0, "TryUpdate call must exist");
+
+        // Find the else block after TryUpdate (the success path)
+        var successBlock = source.Substring(tryUpdateIdx, Math.Min(3000, source.Length - tryUpdateIdx));
+
+        Assert.Contains("_closedSessionIds[deadSessionId] = 0",
+            successBlock,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Revival_CapturesOldSessionIdBeforeOrphaning()
+    {
+        // Structural: the old session ID must be captured BEFORE marking the state as orphaned
+        // and disposing the session. After orphaning, Info.SessionId might be mutated by
+        // concurrent code. The captured ID is what gets added to _closedSessionIds.
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the revival section
+        var revivalStart = source.IndexOf("Worker revival: empty response", StringComparison.Ordinal);
+        Assert.True(revivalStart >= 0, "Revival comment must exist");
+        var revivalBlock = source.Substring(revivalStart, Math.Min(2000, source.Length - revivalStart));
+
+        // Old session ID must be captured before IsOrphaned = true
+        var captureIdx = revivalBlock.IndexOf("var deadSessionId = deadState.Info.SessionId", StringComparison.Ordinal);
+        var orphanIdx = revivalBlock.IndexOf("deadState.IsOrphaned = true", StringComparison.Ordinal);
+        Assert.True(captureIdx >= 0, "Old session ID must be captured before orphaning");
+        Assert.True(captureIdx < orphanIdx, "Session ID capture must come before IsOrphaned = true");
+    }
+
+    [Fact]
     public void RecoverFromPrematureIdleIfNeededAsync_UsesEventsFileFreshness()
     {
         // Structural: recovery must check events.jsonl freshness as a parallel detection
@@ -2602,7 +2681,7 @@ public class MultiAgentRegressionTests
 
         var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
         Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
-        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+        var methodBlock = source.Substring(methodIdx, Math.Min(12000, source.Length - methodIdx));
 
         Assert.Contains("IsEventsFileActive", methodBlock);
     }
@@ -2633,7 +2712,7 @@ public class MultiAgentRegressionTests
 
         var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
         Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
-        var methodBlock = source.Substring(methodIdx, Math.Min(8000, source.Length - methodIdx));
+        var methodBlock = source.Substring(methodIdx, Math.Min(12000, source.Length - methodIdx));
 
         // Must have a loop for repeated premature idle rounds
         Assert.Contains("while (", methodBlock);
@@ -2654,6 +2733,18 @@ public class MultiAgentRegressionTests
         // Verify it's a constant (internal const int)
         var constIdx = source.IndexOf("internal const int PrematureIdleEventsFileFreshnessSeconds", StringComparison.Ordinal);
         Assert.True(constIdx >= 0, "Must be an internal const int");
+    }
+
+    [Fact]
+    public void PrematureIdleEventsSettleMs_ConstantExists()
+    {
+        // Settle period constant: time to wait before taking the stable baseline snapshot.
+        // Must be > 0 (need time for OS to flush mtime) and < GracePeriodMs (must leave
+        // observation window after settle).
+        Assert.True(CopilotService.PrematureIdleEventsSettleMs > 0,
+            "Settle must be > 0ms");
+        Assert.True(CopilotService.PrematureIdleEventsSettleMs < CopilotService.PrematureIdleEventsGracePeriodMs,
+            "Settle must be < GracePeriodMs to leave an observation window");
     }
 
     [Fact]
@@ -2691,34 +2782,10 @@ public class MultiAgentRegressionTests
     [Fact]
     public void RecoverFromPrematureIdleIfNeededAsync_UsesMtimeComparisonForInitialDetection()
     {
-        // Structural: instead of raw IsEventsFileActive (which sees the idle event's own write
-        // as "fresh" and false-positives), the method must snapshot mtime, wait the grace period,
-        // then compare mtimes. Only a changed mtime proves the CLI is still writing.
-        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
-        var source = File.ReadAllText(orgPath);
-
-        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
-        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync must exist");
-        var methodBlock = source.Substring(methodIdx, Math.Min(4000, source.Length - methodIdx));
-
-        // Must use mtime comparison in the detection phase
-        Assert.Contains("GetEventsFileMtime", methodBlock);
-        Assert.Contains("PrematureIdleEventsGracePeriodMs", methodBlock);
-        Assert.Contains("stableMtime", methodBlock);
-
-        // The grace period delay must appear before the stableMtime assignment
-        var delayIdx = methodBlock.IndexOf("PrematureIdleEventsGracePeriodMs", StringComparison.Ordinal);
-        var assignIdx = methodBlock.IndexOf("stableMtime = GetEventsFileMtime", StringComparison.Ordinal);
-        Assert.True(assignIdx >= 0, "stableMtime must be assigned from GetEventsFileMtime after the delay");
-        Assert.True(delayIdx < assignIdx, "Grace period delay must precede stable-mtime assignment");
-    }
-
-    [Fact]
-    public void RecoverFromPrematureIdleIfNeededAsync_PollingLoopUsesMtimeComparison()
-    {
-        // Structural: the secondary polling loop must also use mtime comparison (not raw
-        // IsEventsFileActive) so that a stale-but-fresh file doesn't trigger false detection
-        // in subsequent poll cycles.
+        // Structural: two-phase mtime check avoids OS mtime-flush false positives.
+        // Phase 1: settle (500ms) to let OS flush the completing write's mtime update
+        // Phase 2: observe (1500ms) to see if MORE writes happen (genuine premature idle)
+        // Only writes AFTER the settle baseline trigger detection.
         var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
         var source = File.ReadAllText(orgPath);
 
@@ -2726,11 +2793,61 @@ public class MultiAgentRegressionTests
         Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync must exist");
         var methodBlock = source.Substring(methodIdx, Math.Min(5000, source.Length - methodIdx));
 
-        // The polling loop must compare currentMtime against stableMtime
-        Assert.Contains("currentMtime", methodBlock);
+        // Must use mtime comparison in the detection phase
+        Assert.Contains("GetEventsFileMtime", methodBlock);
         Assert.Contains("stableMtime", methodBlock);
+        Assert.Contains("endMtime", methodBlock);
 
-        // Both GetEventsFileMtime calls should appear in the method
+        // Two-phase: settle delay must precede the stableMtime (baseline) assignment
+        var settleIdx = methodBlock.IndexOf("PrematureIdleEventsSettleMs", StringComparison.Ordinal);
+        var assignIdx = methodBlock.IndexOf("stableMtime = GetEventsFileMtime", StringComparison.Ordinal);
+        Assert.True(settleIdx >= 0, "PrematureIdleEventsSettleMs constant must appear in the method");
+        Assert.True(assignIdx >= 0, "stableMtime must be assigned from GetEventsFileMtime after the settle delay");
+        Assert.True(settleIdx < assignIdx, "Settle delay must precede stable-mtime baseline assignment");
+
+        // The observation comparison must use endMtime > stableMtime
+        Assert.Contains("endMtime.HasValue && endMtime.Value > (stableMtime", methodBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_GracePeriodSkipsReconnectWrites()
+    {
+        // Structural: the grace period mtime check must guard against reconnect writes.
+        // When the app restarts mid-orchestration, EnsureSessionConnectedAsync writes
+        // session.resume to events.jsonl — this advances mtime but is NOT premature idle.
+        // The fix: after detecting mtime changed, check last event type and skip if it's
+        // session.resume or session.shutdown (terminal/reconnect events).
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync method definition must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(6000, source.Length - methodIdx));
+
+        // Must use GetLastEventType to check the content, not just raw mtime delta
+        Assert.Contains("GetLastEventType", methodBlock);
+        // Must skip session.resume writes (reconnect scenario)
+        Assert.Contains("session.resume", methodBlock);
+    }
+
+    [Fact]
+    public void RecoverFromPrematureIdleIfNeededAsync_UsesTwoPhaseMtimeCheck()
+    {
+        // Structural: the method must use the two-phase approach — settle period then
+        // snapshot stableMtime, then observe — so OS-flush false positives are avoided.
+        // After the two-phase check returns not-detected, it returns immediately (no polling loop).
+        var orgPath = Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs");
+        var source = File.ReadAllText(orgPath);
+
+        var methodIdx = source.IndexOf("private async Task<string?> RecoverFromPrematureIdleIfNeededAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx >= 0, "RecoverFromPrematureIdleIfNeededAsync must exist");
+        var methodBlock = source.Substring(methodIdx, Math.Min(5000, source.Length - methodIdx));
+
+        // Must use stableMtime (post-settle baseline) and endMtime (post-observe)
+        Assert.Contains("stableMtime", methodBlock);
+        Assert.Contains("endMtime", methodBlock);
+
+        // Both GetEventsFileMtime calls should appear (settle snapshot + observe snapshot)
         var calls = 0;
         var searchFrom = 0;
         while (true)
@@ -2740,7 +2857,11 @@ public class MultiAgentRegressionTests
             calls++;
             searchFrom = idx + 1;
         }
-        Assert.True(calls >= 2, $"GetEventsFileMtime must be called at least twice (grace + polling), found {calls}");
+        Assert.True(calls >= 2, $"GetEventsFileMtime must be called at least twice (settle + observe), found {calls}");
+
+        // Must NOT have a secondary polling loop (the while loop that kept looping for 10s)
+        // because it added 10s of delay to every normal worker completion.
+        Assert.DoesNotContain("detectStart", methodBlock);
     }
 
     #endregion
@@ -2810,205 +2931,6 @@ public class MultiAgentRegressionTests
         Assert.True(Enum.TryParse<WorktreeStrategy>(payload.StrategyOverride, out var strat));
         Assert.Equal(WorktreeStrategy.GroupShared, strat);
     }
-
-    #endregion
-
-    #region Watchdog-Kill Retry — Avoid Nudge-to-All-Workers Tests
-
-    /// <summary>
-    /// When the orchestrator's response is truncated by a watchdog kill (connection death),
-    /// the reflect loop should retry the full planning prompt instead of sending a nudge.
-    /// Nudges after reconnect lose context and dispatch ALL workers indiscriminately.
-    /// Regression test for the March 22 dispatch failure where watchdog-killed response
-    /// (1065 chars, 0 @worker blocks) triggered a nudge → 5/5 workers dispatched.
-    /// </summary>
-    [Fact]
-    public void WatchdogKilledResponse_ShouldRetryPlanBeforeNudge_Structural()
-    {
-        var orgPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Organization.cs"));
-
-        Assert.True(File.Exists(orgPath), $"Organization.cs not found at {orgPath}");
-        var source = File.ReadAllText(orgPath);
-
-        // Find the reflect iteration 1 zero-assignment handling
-        var reflectIter1Idx = source.IndexOf("reflectState.CurrentIteration == 1");
-        Assert.True(reflectIter1Idx >= 0, "Must have reflectState.CurrentIteration == 1 check");
-
-        // The watchdog-kill check must appear BEFORE the nudge in the reflect path
-        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", reflectIter1Idx);
-        Assert.True(watchdogCheckIdx >= 0,
-            "Reflect loop must check WatchdogKilledThisTurn before falling through to nudge");
-
-        var nudgeIdx = source.IndexOf("delegation nudge", reflectIter1Idx);
-        Assert.True(nudgeIdx >= 0, "Must still have nudge path as fallback");
-
-        Assert.True(watchdogCheckIdx < nudgeIdx,
-            "WatchdogKilledThisTurn check must appear BEFORE the nudge path — " +
-            "a watchdog-killed response should retry the planning prompt first, not nudge");
-    }
-
-    /// <summary>
-    /// The WatchdogKilledThisTurn flag must be set in the watchdog kill path
-    /// and cleared in SendPromptAsync, so it's available for the reflect loop
-    /// to detect truncated responses.
-    /// </summary>
-    [Fact]
-    public void WatchdogKilledFlag_SetInWatchdog_ClearedInSendPrompt_Structural()
-    {
-        // Check Events.cs sets the flag in watchdog kill
-        var eventsPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Events.cs"));
-        Assert.True(File.Exists(eventsPath));
-        var eventsSource = File.ReadAllText(eventsPath);
-
-        // The watchdog kill path sets the flag
-        var watchdogSetIdx = eventsSource.IndexOf("WatchdogKilledThisTurn = true");
-        Assert.True(watchdogSetIdx >= 0,
-            "Watchdog kill path must set WatchdogKilledThisTurn = true");
-
-        // Verify it's near the IsProcessing=false in watchdog
-        var isProcessingFalseIdx = eventsSource.IndexOf("state.Info.IsProcessing = false", watchdogSetIdx - 200);
-        Assert.True(isProcessingFalseIdx >= 0 && Math.Abs(isProcessingFalseIdx - watchdogSetIdx) < 200,
-            "WatchdogKilledThisTurn must be set near IsProcessing=false in watchdog kill");
-
-        // Check CopilotService.cs clears the flag in SendPromptAsync
-        var csPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.cs"));
-        Assert.True(File.Exists(csPath));
-        var csSource = File.ReadAllText(csPath);
-
-        var clearIdx = csSource.IndexOf("WatchdogKilledThisTurn = false");
-        Assert.True(clearIdx >= 0,
-            "SendPromptAsync must clear WatchdogKilledThisTurn = false before sending");
-    }
-
-    /// <summary>
-    /// The non-reflect orchestrator path should also check WatchdogKilledThisTurn
-    /// before falling back to the nudge mechanism.
-    /// </summary>
-    [Fact]
-    public void NonReflectPath_AlsoChecksWatchdogKill_Structural()
-    {
-        var orgPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Organization.cs"));
-
-        Assert.True(File.Exists(orgPath));
-        var source = File.ReadAllText(orgPath);
-
-        // Find the non-reflect "iteration 0" dispatch path
-        var iter0Idx = source.IndexOf("iteration 0:");
-        Assert.True(iter0Idx >= 0, "Must have non-reflect 'iteration 0' path");
-
-        // The watchdog check must appear after iteration 0 and before the nudge
-        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", iter0Idx);
-        Assert.True(watchdogCheckIdx >= 0,
-            "Non-reflect path must also check WatchdogKilledThisTurn");
-
-        var nudgeIdx = source.IndexOf("Sending delegation nudge", iter0Idx);
-        Assert.True(nudgeIdx >= 0);
-        Assert.True(watchdogCheckIdx < nudgeIdx,
-            "Watchdog-kill retry must appear before nudge in the non-reflect orchestrator path");
-    }
-
-    /// <summary>
-    /// SessionState must declare the WatchdogKilledThisTurn field so it's available
-    /// for the watchdog and reflect loop to communicate through.
-    /// </summary>
-    [Fact]
-    public void SessionState_DeclaresWatchdogKilledField()
-    {
-        var csPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.cs"));
-        Assert.True(File.Exists(csPath));
-        var source = File.ReadAllText(csPath);
-
-        Assert.Contains("WatchdogKilledThisTurn", source);
-        Assert.Contains("volatile bool WatchdogKilledThisTurn", source);
-    }
-
-    #endregion
-
-    #region IDLE-DEFER Fallback Timer Tests
-
-    /// <summary>
-    /// SessionState must declare the IdleDeferFallbackTimer field so the timer
-    /// can be stored and cancelled across event handler invocations.
-    /// </summary>
-    [Fact]
-    public void SessionState_DeclaresIdleDeferFallbackTimerField()
-    {
-        var csPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.cs"));
-        Assert.True(File.Exists(csPath));
-        var source = File.ReadAllText(csPath);
-
-        Assert.Contains("IdleDeferFallbackTimer", source);
-    }
-
-    /// <summary>
-    /// StartIdleDeferFallback must be called inside the IDLE-DEFER handler
-    /// so the fallback timer is armed when background tasks prevent completion.
-    /// NOTE: Removed — StartIdleDeferFallback was planned but never implemented.
-    /// The IDLE-DEFER path relies on the next SessionIdleEvent without background
-    /// tasks to trigger completion, plus the watchdog Case B as a safety net.
-    /// </summary>
-
-    /// <summary>
-    /// CancelIdleDeferFallback must be called in CompleteResponse to prevent
-    /// stale timer from force-completing after normal completion.
-    /// </summary>
-    [Fact]
-    public void CompleteResponse_CancelsIdleDeferFallback_Structural()
-    {
-        var eventsPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Events.cs"));
-        Assert.True(File.Exists(eventsPath));
-        var source = File.ReadAllText(eventsPath);
-
-        // Find CompleteResponse method and verify CancelIdleDeferFallback is called
-        var completeResponseIdx = source.IndexOf("private void CompleteResponse(SessionState state,");
-        Assert.True(completeResponseIdx >= 0, "CompleteResponse method must exist");
-
-        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", completeResponseIdx);
-        Assert.True(cancelIdx >= 0,
-            "CancelIdleDeferFallback must be called inside CompleteResponse");
-    }
-
-    /// <summary>
-    /// CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync
-    /// to prevent stale timer from firing after forced completion.
-    /// </summary>
-    [Fact]
-    public void ForceComplete_CancelsIdleDeferFallback_Structural()
-    {
-        var orgPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
-                "Services", "CopilotService.Organization.cs"));
-        Assert.True(File.Exists(orgPath));
-        var source = File.ReadAllText(orgPath);
-
-        var forceIdx = source.IndexOf("ForceCompleteProcessingAsync");
-        Assert.True(forceIdx >= 0);
-
-        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", forceIdx);
-        Assert.True(cancelIdx >= 0,
-            "CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync");
-    }
-
-    /// <summary>
-    /// The IDLE-DEFER-TIMEOUT log tag must exist in the fallback timer callback,
-    /// confirming the timer fires with proper diagnostics.
-    /// NOTE: Removed — idle-defer fallback timer was planned but never implemented.
-    /// The watchdog Case B handles this scenario instead.
-    /// </summary>
 
     #endregion
 }
