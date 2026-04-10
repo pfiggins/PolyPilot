@@ -457,18 +457,16 @@ public class WsBridgeServer : IDisposable
         {
             await _copilot!.InvokeOnUIAsync(async () =>
             {
-                // Check if session is ANY member of an orchestrator group (not just the orchestrator).
-                // This prevents blast-dispatch when the mobile client sends the same message to
-                // all group members individually instead of routing through the orchestrator.
+                // Check if session belongs to an orchestrator group.
                 var (orchGroupId, orchName) = _copilot.GetOrchestratorGroupIdForMember(sessionName);
-                if (orchGroupId != null)
+                if (orchGroupId != null && sessionName == orchName)
                 {
+                    // Target IS the orchestrator — route through orchestration pipeline.
                     // Deduplicate: if ANY message was dispatched to this group recently, drop it.
                     // The phone's remote-mode orchestration loop sends different messages per worker
                     // (task assignments), so exact-message matching is insufficient. Use time-only
                     // dedup: after the first dispatch to a group, block ALL further dispatches for
-                    // the dedup window. This is safe because the server's orchestration engine
-                    // handles all worker dispatch — the phone should never send to workers directly.
+                    // the dedup window.
                     var now = DateTime.UtcNow.Ticks;
                     if (_recentGroupDispatches.TryGetValue(orchGroupId, out var recent)
                         && (now - recent.Ticks) < GroupDispatchDedupeWindowTicks)
@@ -479,10 +477,6 @@ public class WsBridgeServer : IDisposable
 
                     // State-aware dedup: if orchestration is already active for this group
                     // (Planning, Dispatching, or WaitingForWorkers), drop the bridge message.
-                    // This catches delayed duplicates from the phone's local orchestration loop
-                    // that arrive outside the time-based dedup window. The server already started
-                    // orchestrating from the first bridge message — a second dispatch would queue
-                    // and cause a duplicate orchestration cycle after the first completes.
                     if (_copilot.IsGroupOrchestrationActive(orchGroupId))
                     {
                         Console.WriteLine($"[WsBridge] Dropping duplicate bridge message for group '{orchGroupId}' via '{sessionName}' — orchestration already active");
@@ -491,10 +485,7 @@ public class WsBridgeServer : IDisposable
 
                     _recentGroupDispatches[orchGroupId] = (message, now);
 
-                    if (sessionName != orchName)
-                        Console.WriteLine($"[WsBridge] Redirecting worker '{sessionName}' message through orchestrator '{orchName}' (group={orchGroupId})");
-                    else
-                        Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
+                    Console.WriteLine($"[WsBridge] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
 
                     var orchGroup = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == orchGroupId);
                     if (orchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
@@ -504,6 +495,9 @@ public class WsBridgeServer : IDisposable
                 }
                 else
                 {
+                    // Target is a worker or non-group session — send directly (like desktop does).
+                    // Workers should receive messages directly; only orchestrator-targeted messages
+                    // trigger the full orchestration pipeline.
                     await _copilot.SendPromptAsync(sessionName, message, imagePaths, cancellationToken: ct, agentMode: agentMode);
                 }
             });
@@ -517,16 +511,17 @@ public class WsBridgeServer : IDisposable
             await _copilot!.InvokeOnUIAsync(() =>
             {
                 var (orchGroupId, orchName) = _copilot.GetOrchestratorGroupIdForMember(sessionName);
-                if (orchGroupId != null)
+                if (orchGroupId != null && sessionName == orchName)
                 {
-                    // Orchestrated sessions route through SendToMultiAgentGroupAsync which has
-                    // its own busy handling; blindly queuing would bypass the orchestration pipeline.
+                    // Orchestrator is busy — orchestration has its own busy handling;
+                    // blindly queuing would bypass the orchestration pipeline.
                     BridgeLog($"[BRIDGE] Orchestrator '{sessionName}' busy, dropping mobile message (retry manually)");
                     Broadcast(BridgeMessage.Create(BridgeMessageTypes.ErrorEvent,
                         new ErrorPayload { SessionName = sessionName, Error = "Session is busy processing a request. Please retry when the current turn completes." }));
                 }
                 else
                 {
+                    // Worker or non-group session is busy — queue for next turn (like desktop).
                     BridgeLog($"[BRIDGE] '{sessionName}' busy, queuing mobile message for next turn");
                     _copilot.EnqueueMessage(sessionName, message, agentMode: agentMode);
                 }

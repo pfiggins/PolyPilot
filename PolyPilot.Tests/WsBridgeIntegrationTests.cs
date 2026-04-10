@@ -1166,11 +1166,11 @@ public class WsBridgeIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task SendMessage_ToWorkerSession_RoutesViaOrchestration()
+    public async Task SendMessage_ToWorkerSession_DoesNotRouteViaOrchestration()
     {
-        // After the blast-dispatch fix, messages sent to any group member via bridge
-        // are redirected through orchestration (SendToMultiAgentGroupAsync) to prevent
-        // the phone from bypassing the orchestration pipeline.
+        // Messages targeted at a specific worker should go directly to that worker,
+        // not be re-routed through orchestration. Only orchestrator-targeted messages
+        // trigger the full orchestration pipeline.
         await InitDemoMode();
 
         await _copilot.CreateSessionAsync("orch-noroute", "gpt-4.1");
@@ -1187,16 +1187,19 @@ public class WsBridgeIntegrationTests : IDisposable
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var client = await ConnectClientAsync(cts.Token);
 
-        // Send message to worker via bridge — should be redirected through orchestrator
+        // Send message directly to worker via bridge — should go direct, not through orchestration
         await client.SendMessageAsync("worker-noroute", "Direct worker task", ct: cts.Token);
 
-        // Orchestrator SHOULD have received the message (routed via SendToMultiAgentGroupAsync)
-        var orchSession = _copilot.GetSession("orch-noroute");
-        Assert.NotNull(orchSession);
+        var workerSession = _copilot.GetSession("worker-noroute");
+        Assert.NotNull(workerSession);
         await WaitForAsync(
-            () => orchSession!.History.Any(m => m.Content?.Contains("Direct worker task") == true),
+            () => workerSession!.History.Any(m => m.Content?.Contains("Direct worker task") == true),
             cts.Token);
-        Assert.Contains(orchSession!.History, m => m.Content?.Contains("Direct worker task") == true);
+        Assert.Contains(workerSession!.History, m => m.Content?.Contains("Direct worker task") == true);
+
+        // Orchestrator should NOT have received the message
+        var orchSession = _copilot.GetSession("orch-noroute");
+        Assert.DoesNotContain(orchSession!.History, m => m.Content?.Contains("Direct worker task") == true);
         client.Stop();
     }
 
