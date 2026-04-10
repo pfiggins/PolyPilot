@@ -493,11 +493,16 @@ public class WsBridgeServer : IDisposable
                     BridgeLog($"[BRIDGE] Routing '{sessionName}' through orchestration pipeline (group={orchGroupId})");
                     await _copilot.SendToMultiAgentGroupAsync(orchGroupId, message, ct);
                 }
+                else if (orchGroupId != null && sessionName != orchName)
+                {
+                    // Target is a WORKER in an orchestrator group — the phone sent individual
+                    // send_message per member instead of using MultiAgentBroadcast. Drop these
+                    // to prevent blast-dispatch; the orchestrator path above handles routing.
+                    BridgeLog($"[BRIDGE] Dropping worker-targeted message for '{sessionName}' (orchestrator group '{orchGroupId}' — use orchestrator)");
+                }
                 else
                 {
-                    // Target is a worker or non-group session — send directly (like desktop does).
-                    // Workers should receive messages directly; only orchestrator-targeted messages
-                    // trigger the full orchestration pipeline.
+                    // Target is a non-group session — send directly (like desktop does).
                     await _copilot.SendPromptAsync(sessionName, message, imagePaths, cancellationToken: ct, agentMode: agentMode);
                 }
             });
@@ -519,9 +524,14 @@ public class WsBridgeServer : IDisposable
                     Broadcast(BridgeMessage.Create(BridgeMessageTypes.ErrorEvent,
                         new ErrorPayload { SessionName = sessionName, Error = "Session is busy processing a request. Please retry when the current turn completes." }));
                 }
+                else if (orchGroupId != null && sessionName != orchName)
+                {
+                    // Worker in an orchestrator group — drop (orchestrator handles dispatch).
+                    BridgeLog($"[BRIDGE] Dropping busy worker-targeted message for '{sessionName}' (orchestrator group)");
+                }
                 else
                 {
-                    // Worker or non-group session is busy — queue for next turn (like desktop).
+                    // Non-group session is busy — queue for next turn (like desktop).
                     BridgeLog($"[BRIDGE] '{sessionName}' busy, queuing mobile message for next turn");
                     _copilot.EnqueueMessage(sessionName, message, agentMode: agentMode);
                 }
