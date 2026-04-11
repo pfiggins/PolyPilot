@@ -1934,7 +1934,7 @@
                     {
                         CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
                         session.History.Add(ChatMessage.SystemMessage(
-                            "📋 Orchestrator is busy — your message will be included in the current iteration's synthesis."));
+                            "⚡ Message received — delivering to orchestrator now."));
                     }
                     else if (queueImagePaths is null or { Count: 0 } && CopilotService.ForceQueueForReflectLoop(sessionName, finalPrompt))
                     {
@@ -1942,7 +1942,7 @@
                         // this IS a reflect orchestrator — queue for the next drain opportunity.
                         CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_FORCE", null, null, null, true);
                         session.History.Add(ChatMessage.SystemMessage(
-                            "📋 Orchestrator is busy — your message has been queued and will be included when the next synthesis phase begins."));
+                            "⚡ Message received — will be delivered to orchestrator when workers start."));
                     }
                     else
                     {

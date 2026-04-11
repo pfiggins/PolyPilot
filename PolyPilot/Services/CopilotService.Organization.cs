@@ -116,6 +116,11 @@ public partial class CopilotService
     // so the model sees them in its conversation context.
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _reflectQueuedPrompts = new();
 
+    // Per-group steering signal: completed when a steering message arrives during
+    // WaitingForWorkers phase. The collection loop awaits this alongside worker tasks
+    // so steering messages are delivered to the orchestrator in real-time.
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _steeringSignals = new();
+
     // Per-group queued user prompts for non-reflect Orchestrator mode.
     // When a user sends a message while an orchestrator dispatch is running,
     // the message is queued here and drained after the current dispatch completes.
@@ -1847,6 +1852,7 @@ public partial class CopilotService
             return true; // Still "handled" — don't fall through to other dispatch paths
         }
         Debug($"[DISPATCH] TryQueueForActiveReflectLoop: queued prompt for '{sessionName}' (len={prompt.Length})");
+        SignalSteering(groupId);
         return true;
     }
 
@@ -1874,7 +1880,30 @@ public partial class CopilotService
         }
         SaveQueuedPrompts();
         Debug($"[DISPATCH] ForceQueueForReflectLoop: queued prompt for '{sessionName}' (len={prompt.Length})");
+        SignalSteering(groupId);
         return true;
+    }
+
+    /// <summary>
+    /// Signal the collection loop that a steering message is available.
+    /// Safe to call multiple times — only the first signal wakes the loop;
+    /// subsequent signals are consumed when the loop resets the TCS.
+    /// </summary>
+    private void SignalSteering(string groupId)
+    {
+        if (_steeringSignals.TryGetValue(groupId, out var tcs))
+            tcs.TrySetResult(true);
+    }
+
+    /// <summary>
+    /// Create a fresh steering signal for the collection loop to await.
+    /// Returns the Task to await alongside worker tasks.
+    /// </summary>
+    private Task ResetSteeringSignal(string groupId)
+    {
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _steeringSignals[groupId] = tcs;
+        return tcs.Task;
     }
 
     /// <summary>
@@ -2371,17 +2400,31 @@ public partial class CopilotService
                     await Task.Delay(1000, cancellationToken);
             }
 
-            // Bounded wait: if any worker is stuck, proceed with partial results
-            // rather than blocking the entire orchestrator group indefinitely.
+            // Bounded wait with live steering: listen for worker completion, timeout,
+            // AND steering messages from the user.
             var allDone = Task.WhenAll(workerTasks);
-            // Use CancellationToken.None for the timeout delay — if the caller's token
-            // is cancelled, Task.WhenAny returns the cancelled allDone (not timeout),
-            // and OperationCanceledException propagates cleanly without entering the
-            // force-complete branch.
             var timeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            var steeringTask = ResetSteeringSignal(groupId);
             WorkerResult[] results;
-            if (await Task.WhenAny(allDone, timeout) != allDone)
+
+            while (true)
             {
+                var winner = await Task.WhenAny(allDone, timeout, steeringTask);
+
+                if (winner == steeringTask && !allDone.IsCompleted)
+                {
+                    await HandleLiveSteeringAsync(orchestratorName, groupId, assignments, cancellationToken);
+                    steeringTask = ResetSteeringSignal(groupId);
+                    continue;
+                }
+
+                if (winner == allDone || allDone.IsCompleted)
+                {
+                    results = await allDone;
+                    break;
+                }
+
+                // Collection timeout
                 Debug($"[DISPATCH] Orchestrator collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers");
                 foreach (var a in assignments)
                 {
@@ -2396,15 +2439,11 @@ public partial class CopilotService
                         }
                         else if (ws.ResponseCompletion?.Task.IsCompleted == false)
                         {
-                            // Worker hasn't started processing yet (e.g., stuck in SendAsync).
-                            // Resolve the TCS so ExecuteWorkerAsync unblocks.
                             Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
                             ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
                         }
                     }
                 }
-                // Collect results — all tasks should now be completed (force-completed or already done).
-                // Use try/catch since force-completed tasks may fault.
                 var partialResults = new List<WorkerResult>();
                 for (var i = 0; i < workerTasks.Count; i++)
                 {
@@ -2413,11 +2452,9 @@ public partial class CopilotService
                     catch (Exception ex) { partialResults.Add(new WorkerResult(workerName, null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
                 }
                 results = partialResults.ToArray();
+                break;
             }
-            else
-            {
-                results = await allDone;
-            }
+            _steeringSignals.TryRemove(groupId, out _);
 
             var spSuccessCount = results.Count(r => r.Success);
             AddOrchestratorSystemMessage(orchestratorName,
@@ -3755,6 +3792,98 @@ public partial class CopilotService
         return workerName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
             ? workerName[prefix.Length..]
             : workerName;
+    }
+
+    /// <summary>
+    /// Handle a live steering message during worker execution. Drains queued steering
+    /// messages and sends them directly to the orchestrator for real-time evaluation.
+    /// The orchestrator decides whether to act (e.g., redirect workers) or defer to synthesis.
+    /// </summary>
+    private async Task HandleLiveSteeringAsync(
+        string orchestratorName, string groupId,
+        List<TaskAssignment> assignments, CancellationToken ct)
+    {
+        // Drain all pending steering messages
+        var messages = new List<string>();
+        if (_reflectQueuedPrompts.TryGetValue(groupId, out var queue))
+        {
+            while (queue.TryDequeue(out var msg))
+                messages.Add(msg);
+            if (messages.Count > 0)
+                SaveQueuedPrompts();
+        }
+
+        if (messages.Count == 0) return;
+
+        Debug($"[LIVE-STEER] Delivering {messages.Count} message(s) to orchestrator '{orchestratorName}'");
+
+        // Build a summary of currently-running workers for context
+        var workerStatusLines = new List<string>();
+        foreach (var a in assignments)
+        {
+            var isRunning = _sessions.TryGetValue(a.WorkerName, out var ws) && ws.Info.IsProcessing;
+            var status = isRunning ? "🔄 Running" : "✅ Complete";
+            workerStatusLines.Add($"- **{a.WorkerName}** ({status}): {Truncate(a.Task, 120)}");
+        }
+
+        var steeringPrompt = BuildLiveSteeringPrompt(messages, workerStatusLines);
+
+        // Wait for orchestrator to be idle (it should be, but guard against edge cases)
+        await WaitForSessionIdleAsync(orchestratorName, ct);
+
+        try
+        {
+            AddOrchestratorSystemMessage(orchestratorName,
+                $"⚡ Live steering — delivering your message to the orchestrator now...");
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning,
+                "Processing live steering"));
+
+            var response = await SendPromptAndWaitAsync(orchestratorName, steeringPrompt, ct);
+            Debug($"[LIVE-STEER] Orchestrator response: {Truncate(response, 200)}");
+
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.WaitingForWorkers,
+                "Workers running"));
+        }
+        catch (Exception ex)
+        {
+            Debug($"[LIVE-STEER] Failed to deliver steering to orchestrator: {ex.Message}");
+            // Re-queue the messages so they're picked up at synthesis time
+            var requeue = _reflectQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+            foreach (var msg in messages)
+                requeue.Enqueue(msg);
+            SaveQueuedPrompts();
+
+            AddOrchestratorSystemMessage(orchestratorName,
+                "⚠️ Could not deliver live steering — message will be included in synthesis instead.");
+
+            InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.WaitingForWorkers,
+                "Workers running"));
+        }
+    }
+
+    private static string BuildLiveSteeringPrompt(List<string> messages, List<string> workerStatusLines)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("## ⚡ Live Steering Message from User");
+        sb.AppendLine();
+        sb.AppendLine("The user sent the following message(s) while workers are executing:");
+        foreach (var msg in messages)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"> {msg}");
+        }
+        sb.AppendLine();
+        sb.AppendLine("### Currently dispatched workers:");
+        foreach (var line in workerStatusLines)
+            sb.AppendLine(line);
+        sb.AppendLine();
+        sb.AppendLine("**Respond with your assessment.** You can:");
+        sb.AppendLine("- Acknowledge the information and explain how it affects the current work");
+        sb.AppendLine("- Note if this changes the direction of the current iteration");
+        sb.AppendLine("- Indicate if any running workers should be redirected in the next iteration");
+        sb.AppendLine();
+        sb.AppendLine("Your response will be visible to the user immediately. Workers will continue running — you'll synthesize their results when they complete.");
+        return sb.ToString();
     }
 
     /// <summary>
@@ -5102,14 +5231,35 @@ public partial class CopilotService
                     await Task.Delay(1000, ct);
             }
 
-            // Bounded wait: if any worker is stuck, proceed with partial results
-            // rather than blocking the reflect loop indefinitely. Uses CancellationToken.None
-            // so the caller's token doesn't interfere with the timeout detection.
+            // Bounded wait with live steering: listen for worker completion, timeout,
+            // AND steering messages. When a steering message arrives, send it directly to
+            // the orchestrator so it can decide whether to act immediately or defer.
             var allDone = Task.WhenAll(workerTasks);
             var collectionTimeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            var steeringTask = ResetSteeringSignal(groupId);
             WorkerResult[] results;
-            if (await Task.WhenAny(allDone, collectionTimeout) != allDone)
+
+            while (true)
             {
+                var winner = await Task.WhenAny(allDone, collectionTimeout, steeringTask);
+
+                if (winner == steeringTask && !allDone.IsCompleted)
+                {
+                    // Steering message arrived while workers are still running.
+                    // Send it to the orchestrator in real-time.
+                    await HandleLiveSteeringAsync(orchestratorName, groupId, assignments, ct);
+                    // Reset signal for the next steering message
+                    steeringTask = ResetSteeringSignal(groupId);
+                    continue;
+                }
+
+                if (winner == allDone || allDone.IsCompleted)
+                {
+                    results = await allDone;
+                    break;
+                }
+
+                // Collection timeout — force-complete stuck workers
                 Debug($"[DISPATCH] Reflect iteration {reflectState.CurrentIteration}: collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers");
                 foreach (var a in assignments)
                 {
@@ -5137,11 +5287,10 @@ public partial class CopilotService
                     catch (Exception ex) { partialResults.Add(new WorkerResult(workerName, null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
                 }
                 results = partialResults.ToArray();
+                break;
             }
-            else
-            {
-                results = await allDone;
-            }
+            // Clean up steering signal
+            _steeringSignals.TryRemove(groupId, out _);
 
             // Track both attempted and successful workers across all iterations
             foreach (var a in assignments)
