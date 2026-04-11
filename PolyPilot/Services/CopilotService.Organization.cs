@@ -3022,7 +3022,7 @@ public partial class CopilotService
 
         var workerPrompt = BuildWorkerPrompt(identity, worktreeNote, sharedPrefix, originalPrompt, task);
 
-        const int maxRetries = 2;
+        const int maxRetries = 3;
         var dispatchTime = DateTime.Now;
 
         // Pre-dispatch: if worker state is orphaned (e.g., from a failed reconnect),
@@ -3061,6 +3061,24 @@ public partial class CopilotService
             {
                 Debug($"[DISPATCH] Worker '{workerName}' became idle after {(DateTime.UtcNow - waitStart).TotalSeconds:F1}s — proceeding with dispatch");
             }
+        }
+
+        // Pre-dispatch: if client is dead, try to re-initialize before entering the retry loop.
+        // This prevents wasting the first attempt on a guaranteed failure.
+        if (!IsInitialized || _client == null)
+        {
+            Debug($"[DISPATCH] Worker '{workerName}': client dead before dispatch — attempting pre-dispatch re-init");
+            await _clientReconnectLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (!IsInitialized || _client == null)
+                    await InitializeAsync(cancellationToken);
+            }
+            catch (Exception reinitEx)
+            {
+                Debug($"[DISPATCH] Worker '{workerName}': pre-dispatch re-init failed: {reinitEx.Message}");
+            }
+            finally { _clientReconnectLock.Release(); }
         }
 
         for (int attempt = 1; attempt <= maxRetries; attempt++)
@@ -3229,14 +3247,37 @@ public partial class CopilotService
             }
             catch (Exception ex) when (attempt < maxRetries && (IsConnectionError(ex) || IsInitializationError(ex)))
             {
-                Debug($"[DISPATCH] Worker '{workerName}' attempt {attempt} failed with {ex.GetType().Name} — retrying in 2s");
+                Debug($"[DISPATCH] Worker '{workerName}' attempt {attempt} failed with {ex.GetType().Name}: {ex.Message} — retrying");
                 // If the service became uninitialized (e.g., a concurrent worker's connection
                 // error set IsInitialized=false), attempt lazy re-init before the next try.
+                // Serialize via _clientReconnectLock to prevent 17 workers from all calling
+                // InitializeAsync concurrently (thundering herd → leaked CopilotClient instances).
                 if (!IsInitialized || _client == null)
                 {
-                    Debug($"[DISPATCH] Worker '{workerName}': service uninitialized — attempting lazy re-init before retry");
-                    try { await InitializeAsync(cancellationToken); }
-                    catch (Exception reinitEx) { Debug($"[DISPATCH] Worker '{workerName}': lazy re-init failed: {reinitEx.Message}"); }
+                    Debug($"[DISPATCH] Worker '{workerName}': service uninitialized — acquiring reconnect lock for lazy re-init");
+                    await _clientReconnectLock.WaitAsync(cancellationToken);
+                    try
+                    {
+                        // Double-check after acquiring lock — another worker may have re-initialized
+                        if (!IsInitialized || _client == null)
+                        {
+                            Debug($"[DISPATCH] Worker '{workerName}': attempting lazy re-init");
+                            await InitializeAsync(cancellationToken);
+                            Debug($"[DISPATCH] Worker '{workerName}': lazy re-init succeeded");
+                        }
+                        else
+                        {
+                            Debug($"[DISPATCH] Worker '{workerName}': client already re-initialized by another worker");
+                        }
+                    }
+                    catch (Exception reinitEx)
+                    {
+                        Debug($"[DISPATCH] Worker '{workerName}': lazy re-init failed: {reinitEx.Message}");
+                    }
+                    finally
+                    {
+                        _clientReconnectLock.Release();
+                    }
                 }
                 await Task.Delay(2000, cancellationToken);
                 continue;

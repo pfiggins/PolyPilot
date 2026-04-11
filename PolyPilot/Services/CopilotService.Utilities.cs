@@ -564,7 +564,9 @@ public partial class CopilotService
     /// multi-agent worker dispatch with a lazy re-init attempt before the next retry.
     /// </summary>
     internal static bool IsInitializationError(Exception ex) =>
-        ex is InvalidOperationException && ex.Message.Contains("not initialized", StringComparison.OrdinalIgnoreCase);
+        ex is InvalidOperationException &&
+        (ex.Message.Contains("not initialized", StringComparison.OrdinalIgnoreCase)
+         || ex.Message.Contains("not connected yet", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Returns true if the exception indicates the CLI server process is dead
