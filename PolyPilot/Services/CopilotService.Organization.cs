@@ -2224,7 +2224,8 @@ public partial class CopilotService
         // Enable early dispatch for the non-reflect orchestrator flow too
         if (_sessions.TryGetValue(orchestratorName, out var orchPlanning))
             orchPlanning.EarlyDispatchOnWorkerBlocks = true;
-        var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+        AddOrchestratorSystemMessage(orchestratorName, $"📋 New request: {prompt}");
+        var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
 
         // Dead connection detection (non-reflect path)
         if (_sessions.TryGetValue(orchestratorName, out var nrDeadConn)
@@ -2239,7 +2240,7 @@ public partial class CopilotService
             {
                 if (_sessions.TryGetValue(orchestratorName, out var freshNr))
                     freshNr.EarlyDispatchOnWorkerBlocks = true;
-                planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+                planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
             }
         }
 
@@ -2283,7 +2284,7 @@ public partial class CopilotService
                     "⚠️ Orchestrator response was interrupted (connection timeout). Retrying planning...");
                 if (_sessions.TryGetValue(orchestratorName, out var retryState))
                     retryState.EarlyDispatchOnWorkerBlocks = true;
-                var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+                var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
                 await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
                 if (_sessions.TryGetValue(orchestratorName, out var retryPostIdle))
                 {
@@ -2301,7 +2302,7 @@ public partial class CopilotService
             // First pass produced nothing — send a single nudge (format failure recovery)
             Debug($"[DISPATCH] No assignments parsed. Sending delegation nudge.");
             var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
-            var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, cancellationToken, originalPrompt: prompt);
+            var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
             iterAssignments = DeduplicateAssignments(ParseTaskAssignments(nudgeResponse, workerNames), dispatchedWorkers);
             Debug($"[DISPATCH] Nudge parsed: {iterAssignments.Count} assignments.");
 
@@ -2316,7 +2317,7 @@ public partial class CopilotService
                         "🔄 Orchestrator responses were disrupted (possible reconnect). Retrying planning...");
                     if (_sessions.TryGetValue(orchestratorName, out var reconnRetryState))
                         reconnRetryState.EarlyDispatchOnWorkerBlocks = true;
-                    var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
+                    var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
                     await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
                     if (_sessions.TryGetValue(orchestratorName, out var reconnRetryPostIdle))
                     {
@@ -2337,7 +2338,7 @@ public partial class CopilotService
                     // Still nothing after nudge/retry — force a second nudge reminding it MUST delegate
                     Debug($"[DISPATCH] No assignments after nudge. Sending final delegation reminder.");
                     var finalNudge = "You MUST delegate this task to at least one worker using @worker:name...@end blocks. You cannot do it yourself. Pick the most relevant worker and assign the task now.";
-                    var finalResponse = await SendPromptAndWaitAsync(orchestratorName, finalNudge, cancellationToken, originalPrompt: prompt);
+                    var finalResponse = await SendPromptAndWaitAsync(orchestratorName, finalNudge, cancellationToken, originalPrompt: prompt, skipHistoryMessage: true);
                     iterAssignments = DeduplicateAssignments(ParseTaskAssignments(finalResponse, workerNames), dispatchedWorkers);
                     Debug($"[DISPATCH] Final nudge parsed: {iterAssignments.Count} assignments.");
 
@@ -3415,7 +3416,7 @@ public partial class CopilotService
         }
     }
 
-    private async Task<string> SendPromptAndWaitAsync(string sessionName, string prompt, CancellationToken cancellationToken, string? originalPrompt = null)
+    private async Task<string> SendPromptAndWaitAsync(string sessionName, string prompt, CancellationToken cancellationToken, string? originalPrompt = null, bool skipHistoryMessage = false)
     {
         // Use SendPromptAsync directly — it already awaits ResponseCompletion internally.
         // Do NOT capture state and await its TCS separately: reconnection replaces the state
@@ -3440,7 +3441,7 @@ public partial class CopilotService
             {
                 if (recoveryAttempt == 0)
                 {
-                    return await SendPromptAsync(sessionName, prompt, cancellationToken: cts.Token, originalPrompt: originalPrompt);
+                    return await SendPromptAsync(sessionName, prompt, cancellationToken: cts.Token, originalPrompt: originalPrompt, skipHistoryMessage: skipHistoryMessage);
                 }
                 else
                 {
@@ -3838,7 +3839,7 @@ public partial class CopilotService
             InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Planning,
                 "Processing live steering"));
 
-            var response = await SendPromptAndWaitAsync(orchestratorName, steeringPrompt, ct);
+            var response = await SendPromptAndWaitAsync(orchestratorName, steeringPrompt, ct, skipHistoryMessage: true);
             Debug($"[LIVE-STEER] Orchestrator response: {Truncate(response, 200)}");
 
             InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.WaitingForWorkers,
@@ -4317,7 +4318,7 @@ public partial class CopilotService
                 var availableWorkers = GetMultiAgentGroupMembers(pending.GroupId)
                     .Where(m => m != pending.OrchestratorName).ToList();
                 var orchestratorResponse = await SendPromptAndWaitAsync(
-                    pending.OrchestratorName, synthesisPrompt, ct, originalPrompt: pending.OriginalPrompt);
+                    pending.OrchestratorName, synthesisPrompt, ct, originalPrompt: pending.OriginalPrompt, skipHistoryMessage: true);
                 await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
                 Debug($"[DISPATCH] Resume reflect: orchestrator response received from '{pending.OrchestratorName}' — len={orchestratorResponse.Length}");
 
@@ -5005,7 +5006,12 @@ public partial class CopilotService
             if (_sessions.TryGetValue(orchestratorName, out var orchState))
                 orchState.EarlyDispatchOnWorkerBlocks = true;
 
-            var planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+            if (reflectState.CurrentIteration == 1)
+                AddOrchestratorSystemMessage(orchestratorName, $"📋 New request: {prompt}");
+            else
+                AddOrchestratorSystemMessage(orchestratorName, $"🔄 Re-planning — {iterDetail}");
+
+            var planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
 
             // Dead connection detection: watchdog killed with 0 SDK events means the
             // server-side session is broken (common after user abort). ResumeSessionAsync
@@ -5025,7 +5031,7 @@ public partial class CopilotService
                     // Re-enable early dispatch on the fresh session
                     if (_sessions.TryGetValue(orchestratorName, out var freshState))
                         freshState.EarlyDispatchOnWorkerBlocks = true;
-                    planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                    planResponseRaw = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                 }
             }
 
@@ -5068,7 +5074,7 @@ public partial class CopilotService
                         // Re-enable early dispatch for the retry
                         if (_sessions.TryGetValue(orchestratorName, out var retryState))
                             retryState.EarlyDispatchOnWorkerBlocks = true;
-                        var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                        var retryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                         // Post-idle re-read for the retry too
                         await WaitForSessionIdleAsync(orchestratorName, ct);
                         if (_sessions.TryGetValue(orchestratorName, out var retryPostIdle))
@@ -5101,7 +5107,7 @@ public partial class CopilotService
                         // Re-enable early dispatch for the nudge attempt too
                         if (_sessions.TryGetValue(orchestratorName, out var nudgeState))
                             nudgeState.EarlyDispatchOnWorkerBlocks = true;
-                        var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt);
+                        var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                         var nudgeAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
                         Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {nudgeAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
                         if (nudgeAssignments.Count > 0)
@@ -5120,7 +5126,7 @@ public partial class CopilotService
                                 "🔄 Orchestrator responses were disrupted (possible reconnect). Retrying planning...");
                             if (_sessions.TryGetValue(orchestratorName, out var reconnRetryState))
                                 reconnRetryState.EarlyDispatchOnWorkerBlocks = true;
-                            var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
+                            var reconnRetryResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                             await WaitForSessionIdleAsync(orchestratorName, ct);
                             if (_sessions.TryGetValue(orchestratorName, out var reconnRetryPostIdle))
                             {
@@ -5328,7 +5334,7 @@ public partial class CopilotService
                         "This was not an actionable task — it was a behavioral directive or correction. " +
                         "Summarize what was acknowledged and confirm receipt. Do NOT re-dispatch workers.\n\n" +
                         "[[GROUP_REFLECT_COMPLETE]]";
-                    await SendPromptAndWaitAsync(orchestratorName, massFailSynth, ct, originalPrompt: prompt);
+                    await SendPromptAndWaitAsync(orchestratorName, massFailSynth, ct, originalPrompt: prompt, skipHistoryMessage: true);
 
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
@@ -5393,11 +5399,12 @@ public partial class CopilotService
             // Use dedicated evaluator session if configured, otherwise orchestrator self-evaluates
             string evaluatorName = reflectState.EvaluatorSessionName ?? orchestratorName;
             string synthesisResponse;
+            AddOrchestratorSystemMessage(orchestratorName, "📊 Synthesizing worker results...");
             if (reflectState.EvaluatorSessionName != null && reflectState.EvaluatorSessionName != orchestratorName)
             {
                 // Send results to orchestrator for synthesis
                 var synthOnlyPrompt = BuildSynthesisOnlyPrompt(prompt, results.ToList());
-                synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt);
+                synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
 
                 // Dead connection recovery for synthesis (dedicated evaluator path)
                 if (string.IsNullOrEmpty(synthesisResponse)
@@ -5407,14 +5414,14 @@ public partial class CopilotService
                 {
                     Debug($"[DEAD-CONN] '{orchestratorName}' dead connection during synthesis (evaluator path)");
                     if (await TryRecoverWithFreshSessionAsync(orchestratorName, ct))
-                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt);
+                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthOnlyPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                 }
 
                 // Send to evaluator for independent scoring
                 InvokeOnUI(() => FireOrchestratorPhaseChanged(groupId, OrchestratorPhase.Synthesizing,
                     $"Evaluating quality — {iterDetail}"));
                 var evalOnlyPrompt = BuildEvaluatorPrompt(prompt, synthesisResponse, reflectState);
-                var evalResponse = await SendPromptAndWaitAsync(evaluatorName, evalOnlyPrompt, ct, originalPrompt: prompt);
+                var evalResponse = await SendPromptAndWaitAsync(evaluatorName, evalOnlyPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
 
                 // Parse score from evaluator
                 var (score, rationale) = ParseEvaluationScore(evalResponse);
@@ -5466,7 +5473,7 @@ public partial class CopilotService
             }
             else
             {
-                synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt);
+                synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
 
                 // Dead connection recovery for synthesis phase — same pattern as planning.
                 // The orchestrator MUST see worker results, so a dead connection here is critical.
@@ -5479,7 +5486,7 @@ public partial class CopilotService
                     AddOrchestratorSystemMessage(orchestratorName,
                         "🔄 Connection lost during synthesis — reconnecting...");
                     if (await TryRecoverWithFreshSessionAsync(orchestratorName, ct))
-                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt);
+                        synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt, skipHistoryMessage: true);
                 }
 
                 // Check completion sentinel
