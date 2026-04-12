@@ -11,15 +11,82 @@
     else
     {
         var _seenFirstUserOriginal = false;
-        @foreach (var msg in Messages.ToList())
+        var messageList = Messages.ToList();
+        var groups = GroupMessages(messageList);
+        @foreach (var group in groups)
         {
-            var collapseOrig = false;
-            if (msg.MessageType == ChatMessageType.User && !string.IsNullOrEmpty(msg.OriginalContent))
+            @if (group.IsActivityGroup)
             {
-                collapseOrig = _seenFirstUserOriginal;
-                _seenFirstUserOriginal = true;
+                @if (Compact)
+                {
+                    @* In compact mode, show a single summary line for activity groups *@
+                    var toolCount = group.Messages.Count(m => m.MessageType == ChatMessageType.ToolCall);
+                    var thinkCount = group.Messages.Count(m => m.MessageType == ChatMessageType.Reasoning);
+                    var parts = new List<string>();
+                    if (toolCount > 0) parts.Add($"{toolCount} tool call{(toolCount != 1 ? "s" : "")}");
+                    if (thinkCount > 0) parts.Add($"{thinkCount} thought{(thinkCount != 1 ? "s" : "")}");
+                    <div class="chat-msg tool">
+                        <span class="chat-msg-role">🔧</span>
+                        <span class="chat-msg-text">@string.Join(", ", parts)</span>
+                    </div>
+                }
+                else
+                {
+                    var isLastGroup = group == groups.Last(g => g.IsActivityGroup);
+                    var toolCount = group.Messages.Count(m => m.MessageType == ChatMessageType.ToolCall);
+                    var thinkCount = group.Messages.Count(m => m.MessageType == ChatMessageType.Reasoning);
+                    var otherCount = group.Messages.Count - toolCount - thinkCount;
+                    var summaryParts = new List<string>();
+                    if (toolCount > 0) summaryParts.Add($"{toolCount} tool call{(toolCount != 1 ? "s" : "")}");
+                    if (thinkCount > 0) summaryParts.Add($"{thinkCount} thought{(thinkCount != 1 ? "s" : "")}");
+                    if (otherCount > 0) summaryParts.Add($"{otherCount} output{(otherCount != 1 ? "s" : "")}");
+                    var summaryText = summaryParts.Count > 0 ? string.Join(", ", summaryParts) : $"{group.Messages.Count} activit{(group.Messages.Count != 1 ? "ies" : "y")}";
+
+                    @if (isLastGroup)
+                    {
+                        <details class="activity-group" open>
+                            <summary class="activity-group-summary">
+                                <span class="activity-group-chevron"></span>
+                                <span class="activity-group-label">@summaryText</span>
+                            </summary>
+                            <div class="activity-group-content">
+                                @foreach (var msg in group.Messages)
+                                {
+                                    <ChatMessageItem @key="msg" Message="msg" Compact="Compact" CollapseOriginalContent="false" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
+                                }
+                            </div>
+                        </details>
+                    }
+                    else
+                    {
+                        <details class="activity-group">
+                            <summary class="activity-group-summary">
+                                <span class="activity-group-chevron"></span>
+                                <span class="activity-group-label">@summaryText</span>
+                            </summary>
+                            <div class="activity-group-content">
+                                @foreach (var msg in group.Messages)
+                                {
+                                    <ChatMessageItem @key="msg" Message="msg" Compact="Compact" CollapseOriginalContent="false" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
+                                }
+                            </div>
+                        </details>
+                    }
+                }
             }
-            <ChatMessageItem @key="msg" Message="msg" Compact="Compact" CollapseOriginalContent="collapseOrig" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
+            else
+            {
+                @foreach (var msg in group.Messages)
+                {
+                    var collapseOrig = false;
+                    if (msg.MessageType == ChatMessageType.User && !string.IsNullOrEmpty(msg.OriginalContent))
+                    {
+                        collapseOrig = _seenFirstUserOriginal;
+                        _seenFirstUserOriginal = true;
+                    }
+                    <ChatMessageItem @key="msg" Message="msg" Compact="Compact" CollapseOriginalContent="collapseOrig" UserAvatarUrl="@UserAvatarUrl" RepoUrl="@RepoUrl" />
+                }
+            }
         }
 
         @* Current turn tool activity feed — skip activities already in history *@
@@ -193,6 +260,48 @@
         ChatStyle.Minimal => "style-minimal",
         _ => ""
     };
+
+    private static bool IsActivityMessage(ChatMessage msg) =>
+        msg.MessageType is ChatMessageType.ToolCall or ChatMessageType.Reasoning
+                        or ChatMessageType.ShellOutput or ChatMessageType.Diff;
+
+    private sealed class MessageGroup
+    {
+        public List<ChatMessage> Messages { get; } = new();
+        public bool IsActivityGroup { get; set; }
+    }
+
+    /// <summary>
+    /// Groups consecutive activity messages (ToolCall, Reasoning, ShellOutput, Diff) together.
+    /// Content messages (User, Assistant, System, etc.) stay in their own single-message groups.
+    /// </summary>
+    private static List<MessageGroup> GroupMessages(List<ChatMessage> messages)
+    {
+        var groups = new List<MessageGroup>();
+        MessageGroup? currentActivity = null;
+
+        foreach (var msg in messages)
+        {
+            if (IsActivityMessage(msg))
+            {
+                if (currentActivity == null)
+                {
+                    currentActivity = new MessageGroup { IsActivityGroup = true };
+                    groups.Add(currentActivity);
+                }
+                currentActivity.Messages.Add(msg);
+            }
+            else
+            {
+                currentActivity = null;
+                var content = new MessageGroup { IsActivityGroup = false };
+                content.Messages.Add(msg);
+                groups.Add(content);
+            }
+        }
+
+        return groups;
+    }
 
     private IEnumerable<ToolActivity> GetNewActivities()
     {

@@ -1431,3 +1431,69 @@
         opacity: 0.78;
     }
 }
+
+/* === Activity Group (collapsible panel for tool calls/reasoning) === */
+
+::deep .activity-group {
+    margin: 0.1rem 0;
+    border-left: 2px solid color-mix(in srgb, var(--text-muted) 25%, transparent);
+    border-radius: 0 4px 4px 0;
+}
+
+::deep .activity-group[open] {
+    border-left-color: color-mix(in srgb, var(--text-muted) 40%, transparent);
+}
+
+::deep .activity-group-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.6rem;
+    cursor: pointer;
+    user-select: none;
+    font-size: var(--type-callout);
+    color: var(--text-muted);
+    list-style: none;
+    transition: color 0.15s ease;
+}
+
+::deep .activity-group-summary::-webkit-details-marker {
+    display: none;
+}
+
+::deep .activity-group-summary:hover {
+    color: var(--text-primary);
+}
+
+::deep .activity-group-chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.85rem;
+    height: 0.85rem;
+    flex-shrink: 0;
+    transition: transform 0.18s ease;
+}
+
+::deep .activity-group-chevron::before {
+    content: "";
+    width: 0.35rem;
+    height: 0.35rem;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 0.18s ease;
+}
+
+::deep .activity-group[open] > .activity-group-summary .activity-group-chevron::before {
+    transform: rotate(45deg);
+}
+
+::deep .activity-group-label {
+    font-weight: 500;
+    letter-spacing: 0.01em;
+}
+
+::deep .activity-group-content {
+    padding: 0;
+}
