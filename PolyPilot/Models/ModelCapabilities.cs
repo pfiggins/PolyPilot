@@ -199,6 +199,13 @@ public record GroupPreset(string Name, string Description, string Emoji, MultiAg
     /// </summary>
     public bool[]? WorkerUseWorktree { get; init; }
 
+    /// <summary>
+    /// Per-worker reasoning effort overrides, indexed to match WorkerModels.
+    /// Values: "low", "medium", "high", "xhigh", or null for model default.
+    /// Parsed from optional 4th column (Reasoning) in team.md.
+    /// </summary>
+    public string?[]? WorkerReasoningEfforts { get; init; }
+
     internal const string WorkerReviewPrompt = """
         You are a PR reviewer. When assigned a PR, do a thorough multi-model code review.
 

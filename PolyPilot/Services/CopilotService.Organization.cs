@@ -4802,18 +4802,22 @@ public partial class CopilotService
         if (session == null) return;
 
         var currentSlug = Models.ModelHelper.NormalizeToSlug(session.Model);
-        if (currentSlug == meta.PreferredModel) return;
+        var currentEffort = session.ReasoningEffort;
+        var targetEffort = meta.ReasoningEffort;
+        if (currentSlug == meta.PreferredModel && currentEffort == targetEffort) return;
 
         var semaphore = _modelSwitchLocks.GetOrAdd(sessionName, _ => new SemaphoreSlim(1, 1));
         await semaphore.WaitAsync(ct);
         try
         {
             // Re-check after acquiring lock — another dispatch may have already switched
-            currentSlug = Models.ModelHelper.NormalizeToSlug(GetSession(sessionName)?.Model ?? "");
-            if (currentSlug == meta.PreferredModel) return;
+            var s = GetSession(sessionName);
+            currentSlug = Models.ModelHelper.NormalizeToSlug(s?.Model ?? "");
+            currentEffort = s?.ReasoningEffort;
+            if (currentSlug == meta.PreferredModel && currentEffort == targetEffort) return;
 
-            await ChangeModelAsync(sessionName, meta.PreferredModel, cancellationToken: ct);
-            Debug($"Switched '{sessionName}' model to '{meta.PreferredModel}' for multi-agent dispatch");
+            await ChangeModelAsync(sessionName, meta.PreferredModel, reasoningEffort: targetEffort, cancellationToken: ct);
+            Debug($"Switched '{sessionName}' model to '{meta.PreferredModel}' (reasoning={targetEffort ?? "default"}) for multi-agent dispatch");
         }
         catch (Exception ex)
         {
@@ -6053,6 +6057,8 @@ public partial class CopilotService
             SetSessionPreferredModel(workers[i].SessionName, preset.WorkerModels[i]);
             if (preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length)
                 workers[i].SystemPrompt = preset.WorkerSystemPrompts[i];
+            workers[i].ReasoningEffort = preset.WorkerReasoningEfforts != null && i < preset.WorkerReasoningEfforts.Length
+                ? preset.WorkerReasoningEfforts[i] : null;
         }
 
         // Create new worker sessions if the preset has more workers than exist in the group
@@ -6118,6 +6124,8 @@ public partial class CopilotService
                 {
                     meta.WorktreeId = workerWtId ?? orchWtId;
                     if (systemPrompt != null) meta.SystemPrompt = systemPrompt;
+                    meta.ReasoningEffort = preset.WorkerReasoningEfforts != null && i < preset.WorkerReasoningEfforts.Length
+                        ? preset.WorkerReasoningEfforts[i] : null;
                 }
                 if ((workerWtId ?? orchWtId) != null && _sessions.TryGetValue(workerName, out var workerState))
                     workerState.Info.WorktreeId = workerWtId ?? orchWtId;
@@ -6164,6 +6172,8 @@ public partial class CopilotService
             SetSessionPreferredModel(workers[i].SessionName, preset.WorkerModels[i]);
             if (preset.WorkerSystemPrompts != null && i < preset.WorkerSystemPrompts.Length)
                 workers[i].SystemPrompt = preset.WorkerSystemPrompts[i];
+            workers[i].ReasoningEffort = preset.WorkerReasoningEfforts != null && i < preset.WorkerReasoningEfforts.Length
+                ? preset.WorkerReasoningEfforts[i] : null;
         }
 
         SaveOrganization();

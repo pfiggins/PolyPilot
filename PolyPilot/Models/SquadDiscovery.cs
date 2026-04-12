@@ -228,6 +228,7 @@ public static class SquadDiscovery
     internal static Dictionary<string, string> ParseRosterModels(string teamContent)
     {
         var models = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Match 3 or 4 column tables (4th column is optional Reasoning)
         var tableRegex = new Regex(@"^\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|", RegexOptions.Multiline);
         foreach (Match m in tableRegex.Matches(teamContent))
         {
@@ -243,6 +244,32 @@ public static class SquadDiscovery
                 models[name] = model;
         }
         return models;
+    }
+
+    /// <summary>
+    /// Parse per-agent reasoning effort from team.md table rows.
+    /// Looks for a 4-column table: | Member | Role | Model | Reasoning |
+    /// Returns a dictionary mapping agent name to reasoning effort string (e.g. "high").
+    /// Returns empty dict if no Reasoning column is present.
+    /// </summary>
+    internal static Dictionary<string, string> ParseRosterReasoningEfforts(string teamContent)
+    {
+        var efforts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var tableRegex = new Regex(@"^\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|\s*([^\|]+?)\s*\|\s*([^\|]*?)\s*\|", RegexOptions.Multiline);
+        foreach (Match m in tableRegex.Matches(teamContent))
+        {
+            var name = m.Groups[1].Value.Trim();
+            var reasoning = m.Groups[4].Value.Trim();
+            if (name == "---" || name.All(c => c == '-')
+                || name.Equals("Member", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Name", StringComparison.OrdinalIgnoreCase)
+                || reasoning == "---" || reasoning.All(c => c == '-')
+                || reasoning.Equals("Reasoning", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(reasoning))
+                efforts[name] = reasoning.ToLowerInvariant();
+        }
+        return efforts;
     }
 
     private static string? ReadOptionalFile(string path, int maxLength)
@@ -309,12 +336,19 @@ public static class SquadDiscovery
         var teamContent = File.Exists(teamFile) ? File.ReadAllText(teamFile) : "";
         var rosterModels = ParseRosterModels(teamContent);
         var rosterRoles = ParseRosterRoles(teamContent);
+        var rosterReasoningEfforts = ParseRosterReasoningEfforts(teamContent);
 
         var workerModels = agents.Select(a =>
             rosterModels.TryGetValue(a.Name, out var m) ? m : defaultModel).ToArray();
         var systemPrompts = agents.Select(a => a.Charter).ToArray();
         var displayNames = agents.Select(a => a.Name).ToArray();
         
+        // Build WorkerReasoningEfforts array: null for agents without override
+        var workerReasoningEfforts = agents.Select(a =>
+            rosterReasoningEfforts.TryGetValue(a.Name, out var e) ? e : (string?)null).ToArray();
+        // Only keep the array if at least one agent has a reasoning override
+        var hasAnyReasoning = workerReasoningEfforts.Any(e => e != null);
+
         // Build WorkerUseWorktree array: non-developer roles share orchestrator's worktree
         var workerUseWorktree = agents.Select(a =>
         {
@@ -341,6 +375,7 @@ public static class SquadDiscovery
             // so parallel workers don't cause git conflicts.
             DefaultWorktreeStrategy = worktreeStrategy ?? WorktreeStrategy.FullyIsolated,
             WorkerUseWorktree = workerUseWorktree,
+            WorkerReasoningEfforts = hasAnyReasoning ? workerReasoningEfforts : null,
         };
     }
 

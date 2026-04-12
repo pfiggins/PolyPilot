@@ -218,6 +218,12 @@ public class SessionMeta
     /// Example: "You are a security auditor. Focus on vulnerabilities, input validation, and auth flaws."
     /// </summary>
     public string? SystemPrompt { get; set; }
+
+    /// <summary>
+    /// Reasoning effort level for this session (e.g. "low", "medium", "high", "xhigh").
+    /// Null = use model default. Applied at dispatch time via EnsureSessionModelAsync.
+    /// </summary>
+    public string? ReasoningEffort { get; set; }
 }
 
 [JsonConverter(typeof(TolerantEnumConverter<SessionSortMode>))]
