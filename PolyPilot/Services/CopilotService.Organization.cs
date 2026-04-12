@@ -939,7 +939,7 @@ public partial class CopilotService
     /// </summary>
     public IReadOnlyList<AgentSessionInfo> GetFocusSessions()
     {
-        var metas = SnapshotSessionMetas().ToDictionary(m => m.SessionName);
+        var metas = SnapshotSessionMetas().GroupBy(m => m.SessionName).ToDictionary(g => g.Key, g => g.First());
         var allSessions = GetAllSessions();
 
         bool IsWorkerSession(AgentSessionInfo s)
@@ -972,7 +972,7 @@ public partial class CopilotService
     /// <summary>Adds a session to the bottom of the Focus list, if not already present and not a worker.</summary>
     public void AddToFocus(string sessionName)
     {
-        var metas = SnapshotSessionMetas().ToDictionary(m => m.SessionName);
+        var metas = SnapshotSessionMetas().GroupBy(m => m.SessionName).ToDictionary(g => g.Key, g => g.First());
         if (metas.TryGetValue(sessionName, out var meta) && meta.Role == MultiAgentRole.Worker) return;
         if (WorkerNamePattern.IsMatch(sessionName)) return;
 
@@ -1308,7 +1308,7 @@ public partial class CopilotService
         if (_organizedSessionsCache != null && key == _organizedSessionsCacheKey)
             return _organizedSessionsCache;
 
-        var metas = Organization.Sessions.ToDictionary(m => m.SessionName);
+        var metas = Organization.Sessions.GroupBy(m => m.SessionName).ToDictionary(g => g.Key, g => g.First());
         var allSessions = GetAllSessions().ToList();
         var result = new List<(SessionGroup Group, List<AgentSessionInfo> Sessions)>();
 
