@@ -5762,9 +5762,10 @@ public partial class CopilotService
             var missing = allWorkers.Where(w => !dispatchedWorkers.Contains(w)).ToList();
             if (missing.Count > 0)
             {
-                sb.AppendLine("### ⚠️ Worker Participation");
-                sb.AppendLine($"The following workers have NOT yet been dispatched: **{string.Join(", ", missing)}**");
-                sb.AppendLine("You MUST include `[[NEEDS_ITERATION]]` and dispatch to them before marking complete.");
+                sb.AppendLine("### Worker Participation");
+                sb.AppendLine($"The following workers have not been dispatched this cycle: **{string.Join(", ", missing)}**");
+                sb.AppendLine("If their skills are needed for the current goal, dispatch to them in the next iteration.");
+                sb.AppendLine("If the goal can be fully met without them (e.g., only a subset of specialists is relevant), this is fine — you may mark complete.");
                 sb.AppendLine();
             }
         }
