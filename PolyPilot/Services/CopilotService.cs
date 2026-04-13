@@ -3348,7 +3348,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
     }
 
-    public async Task<string> SendPromptAsync(string sessionName, string prompt, List<string>? imagePaths = null, CancellationToken cancellationToken = default, bool skipHistoryMessage = false, string? agentMode = null, string? originalPrompt = null)
+    public async Task<string> SendPromptAsync(string sessionName, string prompt, List<string>? imagePaths = null, CancellationToken cancellationToken = default, bool skipHistoryMessage = false, string? agentMode = null, string? originalPrompt = null, bool suppressResponse = false)
     {
         // Provider sessions route through their own messaging
         if (IsProviderSession(sessionName))
@@ -3540,11 +3540,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
         else
         {
-            // When the prompt is suppressed from history, also suppress the response.
-            // Internal orchestrator prompts (planning, synthesis, evaluation) produce
-            // responses containing [[GROUP_REFLECT_COMPLETE]], @worker blocks, and
-            // evaluation text that should not appear in the user-facing chat window.
-            state.SuppressResponseFromHistory = true;
+            // When suppressResponse is explicitly requested, also suppress the assistant
+            // response from History. This is used for truly internal prompts (planning,
+            // nudging, evaluation, steering) whose responses should never be user-visible.
+            // NOTE: skipHistoryMessage alone does NOT suppress the response — synthesis
+            // prompts use skipHistoryMessage to hide the internal prompt while still
+            // showing the user-facing synthesis response.
+            if (suppressResponse)
+                state.SuppressResponseFromHistory = true;
         }
         OnStateChanged?.Invoke();
 

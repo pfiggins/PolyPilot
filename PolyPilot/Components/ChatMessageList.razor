@@ -350,6 +350,8 @@
     internal static string RenderMarkdown(string content, string? repoUrl = null)
     {
         if (string.IsNullOrEmpty(content)) return "";
+        // Strip internal orchestrator markers that may leak into visible synthesis responses
+        content = content.Replace("[[GROUP_REFLECT_COMPLETE]]", "").Replace("[[NEEDS_ITERATION]]", "");
         var cacheKey = repoUrl != null ? $"{repoUrl}\0{content}" : content;
         if (_markdownCache.TryGetValue(cacheKey, out var cached)) return cached;
         try
