@@ -3811,8 +3811,9 @@
         var limit = expandedMessageCounts.TryGetValue(sessionName, out var c) ? c : DefaultMessageWindow;
         try
         {
-            if (history.Count <= limit) return history.ToList();
-            return history.Skip(history.Count - limit).ToList();
+            var snapshot = history.ToArray();
+            if (snapshot.Length <= limit) return snapshot.ToList();
+            return snapshot.Skip(snapshot.Length - limit).ToList();
         }
         catch (InvalidOperationException)
         {
@@ -3825,8 +3826,9 @@
         var limit = cardMessageCounts.TryGetValue(sessionName, out var c) ? c : DefaultCardMessageWindow;
         try
         {
-            if (history.Count <= limit) return history.ToList();
-            return history.Skip(history.Count - limit).ToList();
+            var snapshot = history.ToArray();
+            if (snapshot.Length <= limit) return snapshot.ToList();
+            return snapshot.Skip(snapshot.Length - limit).ToList();
         }
         catch (InvalidOperationException)
         {

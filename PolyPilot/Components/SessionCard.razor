@@ -171,11 +171,11 @@
     <div class="card-messages">
         @{
             var cardMsgs = GetCardMessages(Session.Name, Session.History);
-            var hasMoreCard = Session.History.Count > cardMsgs.Count;
+            var hasMoreCard = Session.MessageCount > cardMsgs.Count;
         }
         @if (hasMoreCard)
         {
-            <button class="load-more-btn" @onclick="LoadMoreMessages">▲ Load earlier messages (@(Session.History.Count - cardMsgs.Count) more)</button>
+            <button class="load-more-btn" @onclick="LoadMoreMessages">▲ Load earlier messages (@(Session.MessageCount - cardMsgs.Count) more)</button>
         }
         <ChatMessageList Messages="cardMsgs"
                          StreamingContent="@StreamingContent"
@@ -341,10 +341,10 @@
 
     private List<ChatMessage> GetCardMessages(string sessionName, List<ChatMessage> history)
     {
-        // Logic from Dashboard.razor
-        // Take last N messages
-        if (history.Count <= MessageCount) return history.ToList();
-        return history.Skip(history.Count - MessageCount).ToList();
+        ChatMessage[] snapshot;
+        lock (Session.HistoryLock) { snapshot = history.ToArray(); }
+        if (snapshot.Length <= MessageCount) return snapshot.ToList();
+        return snapshot.Skip(snapshot.Length - MessageCount).ToList();
     }
 
     private string ShortenPath(string path)

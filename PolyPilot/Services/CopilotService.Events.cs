@@ -1523,7 +1523,7 @@ public partial class CopilotService
         if (!state.SuppressResponseFromHistory)
         {
             var msg = new ChatMessage("assistant", text, DateTime.Now) { Model = state.Info.Model };
-            state.Info.History.Add(msg);
+            lock (state.Info.HistoryLock) { state.Info.History.Add(msg); }
             state.Info.MessageCount = state.Info.History.Count;
 
             if (!string.IsNullOrEmpty(state.Info.SessionId))
@@ -1645,7 +1645,7 @@ public partial class CopilotService
             if (!responseAlreadyFlushedThisTurn && !suppressFromHistory)
             {
                 var msg = new ChatMessage("assistant", response, DateTime.Now) { Model = state.Info.Model };
-                state.Info.History.Add(msg);
+                lock (state.Info.HistoryLock) { state.Info.History.Add(msg); }
                 state.Info.MessageCount = state.Info.History.Count;
                 // If user is viewing this session, keep it read
                 if (state.Info.Name == _activeSessionName)

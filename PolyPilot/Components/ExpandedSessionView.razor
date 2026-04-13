@@ -193,7 +193,7 @@
     }
 
     <div class="messages expanded-messages">
-        @{ var expandedMessages = GetWindowedMessages(); }
+        @{ var expandedMessages = GetWindowedMessages(); var totalHistoryCount = Session.MessageCount; }
         @if (IsLoadingHistory)
         {
             <div class="loading-history-indicator">
@@ -209,10 +209,10 @@
                     ⬆️ Load rest of conversation
                 </button>
             }
-            else if (Session.History.Count > expandedMessages.Count)
+            else if (totalHistoryCount > expandedMessages.Count)
             {
                 <button class="load-more-btn" @onclick="LoadMore">
-                    ⬆️ Load more (@(Session.History.Count - expandedMessages.Count) remaining)
+                    ⬆️ Load more (@(totalHistoryCount - expandedMessages.Count) remaining)
                 </button>
             }
         }
