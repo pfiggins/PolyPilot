@@ -160,6 +160,17 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Returns true if the session's current response is being suppressed from History
+    /// (internal orchestrator synthesis, reflect-loop evaluation, etc.). The bridge uses
+    /// this to also suppress content_delta streaming so mobile clients don't build a
+    /// message locally that will vanish on the next history sync.
+    /// </summary>
+    public bool IsResponseSuppressed(string sessionName)
+    {
+        return _sessions.TryGetValue(sessionName, out var state) && state.SuppressResponseFromHistory;
+    }
+
+    /// <summary>
     /// Returns true if orchestration is currently active for the given group (Planning,
     /// Dispatching, or WaitingForWorkers). Used by the bridge to drop duplicate dispatches
     /// from the phone's local orchestration loop that arrive after the server has already

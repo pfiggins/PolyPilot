@@ -339,8 +339,13 @@
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private static readonly System.Text.RegularExpressions.Regex WorkerBlockRegex = new(
-        @"@worker:([^\n]+?)\s*\n([\s\S]*?)(?:@end|(?=@worker:)|$)",
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+        @"^@worker:([^\n]+?)\s*\n([\s\S]*?)(?:@end|(?=^@worker:))",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.Multiline);
+
+    // Regex to match fenced code blocks (```...```) and inline code (`...`)
+    private static readonly System.Text.RegularExpressions.Regex CodeBlockRegex = new(
+        @"```[\s\S]*?```|`[^`\n]+`",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     internal static string RenderMarkdown(string content, string? repoUrl = null)
     {
@@ -353,9 +358,18 @@
             // Extract them before markdown rendering, replace with placeholders, then restore.
             // Placeholders use alphanumeric-only names to avoid markdown interpretation
             // (e.g., __X__ would become <strong>X</strong>).
+            //
+            // To avoid matching @worker: inside code blocks or inline code spans,
+            // we first blank out code regions, run the regex on the blanked copy to
+            // find match positions, then apply replacements to the original content.
             var workerBlocks = new Dictionary<string, string>();
-            var processed = WorkerBlockRegex.Replace(content, match =>
+            var blanked = CodeBlockRegex.Replace(content, m => new string(' ', m.Length));
+            var matches = WorkerBlockRegex.Matches(blanked);
+            var processed = content;
+            // Apply replacements in reverse order to preserve indices
+            for (int i = matches.Count - 1; i >= 0; i--)
             {
+                var match = matches[i];
                 var workerName = match.Groups[1].Value.Trim();
                 var taskBody = match.Groups[2].Value.Trim();
                 var id = $"PPWORKERBLK{workerBlocks.Count}ENDBLK";
@@ -363,8 +377,8 @@
                 workerBlocks[id] = $"<details class=\"worker-dispatch-details\">" +
                     $"<summary>📤 Task → <strong>{System.Net.WebUtility.HtmlEncode(workerName)}</strong></summary>" +
                     $"<div class=\"worker-dispatch-content\">{bodyHtml}</div></details>";
-                return $"\n{id}\n";
-            });
+                processed = processed[..match.Index] + $"\n{id}\n" + processed[(match.Index + match.Length)..];
+            }
 
             var html = MarkdownRenderer.ToHtml(processed);
 
@@ -487,6 +501,9 @@
 
     // Section headers characteristic of orchestrator-generated prompts.
     // Any single match is sufficient — normal user messages never contain these headers.
+    // NOTE: @worker: and [[GROUP_REFLECT_COMPLETE]] are NOT included here because they
+    // can appear inside backtick/code spans in regular discussion text (e.g., "the
+    // `@worker:` blocks"). The ## headers are reliable orchestrator-only markers.
     private static readonly string[] OrchestratorMarkers = new[]
     {
         "## Work Routing",
@@ -498,8 +515,6 @@
         "## Previous Iteration",
         "## User Request",
         "## Additional Orchestration Instructions",
-        "@worker:",
-        "[[GROUP_REFLECT_COMPLETE]]",
     };
 
     /// <summary>

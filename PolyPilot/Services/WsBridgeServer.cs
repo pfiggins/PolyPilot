@@ -314,6 +314,11 @@ public class WsBridgeServer : IDisposable
             // Only synthesis responses are interesting on mobile — @worker blocks are unreadable.
             if (IsBridgeFiltered(ChatMessageType.OrchestratorDispatch) && _copilot.IsOrchestratorInDispatchPhase(session))
                 return;
+            // Suppress content_delta for responses that won't appear in History
+            // (internal orchestrator synthesis, reflect-loop evaluation). Without this,
+            // mobile would build a message locally that vanishes on the next history sync.
+            if (_copilot.IsResponseSuppressed(session))
+                return;
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.ContentDelta,
                 new ContentDeltaPayload { SessionName = session, Content = content }));
         };
