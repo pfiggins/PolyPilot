@@ -758,6 +758,14 @@ public partial class CopilotService : IAsyncDisposable
         /// clears HasDeferredIdle — the two fields are an inseparable companion pair.
         /// </summary>
         public long SubagentDeferStartedAtTicks;
+        /// <summary>
+        /// When true, CompleteResponse and FlushCurrentResponse skip adding the response to
+        /// History (and the chat DB) while still resolving the TCS. Used by orchestrator
+        /// synthesis prompts whose responses are internal (evaluation text, [[GROUP_REFLECT_COMPLETE]],
+        /// @worker blocks) and should not appear in the user-facing chat window.
+        /// Automatically cleared after CompleteResponse fires.
+        /// </summary>
+        public volatile bool SuppressResponseFromHistory;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)
@@ -3529,6 +3537,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Write-through to DB
             if (!string.IsNullOrEmpty(state.Info.SessionId))
                 SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, state.Info.History.Last()), "AddMessageAsync");
+        }
+        else
+        {
+            // When the prompt is suppressed from history, also suppress the response.
+            // Internal orchestrator prompts (planning, synthesis, evaluation) produce
+            // responses containing [[GROUP_REFLECT_COMPLETE]], @worker blocks, and
+            // evaluation text that should not appear in the user-facing chat window.
+            state.SuppressResponseFromHistory = true;
         }
         OnStateChanged?.Invoke();
 

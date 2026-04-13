@@ -4427,13 +4427,13 @@ public partial class CopilotService
                     InvokeOnUI(() => FireOrchestratorPhaseChanged(pending.GroupId, OrchestratorPhase.Synthesizing, "Resume final"));
                     var finalSynthesis = BuildSynthesisPrompt(pending.OriginalPrompt, resumeResults);
                     await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
-                    await SendPromptAsync(pending.OrchestratorName, finalSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
+                    await SendPromptAsync(pending.OrchestratorName, finalSynthesis, cancellationToken: ct, originalPrompt: pending.OriginalPrompt, skipHistoryMessage: true);
                     Debug($"[DISPATCH] Resume reflect: final synthesis sent to '{pending.OrchestratorName}'");
                 }
             }
             else
             {
-                await SendPromptAsync(pending.OrchestratorName, synthesisPrompt, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
+                await SendPromptAsync(pending.OrchestratorName, synthesisPrompt, cancellationToken: ct, originalPrompt: pending.OriginalPrompt, skipHistoryMessage: true);
                 Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}'");
             }
         }

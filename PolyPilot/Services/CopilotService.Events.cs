@@ -1519,15 +1519,23 @@ public partial class CopilotService
             return;
         }
 
-        var msg = new ChatMessage("assistant", text, DateTime.Now) { Model = state.Info.Model };
-        state.Info.History.Add(msg);
-        state.Info.MessageCount = state.Info.History.Count;
+        // When suppressing, still accumulate for TCS but skip History + DB
+        if (!state.SuppressResponseFromHistory)
+        {
+            var msg = new ChatMessage("assistant", text, DateTime.Now) { Model = state.Info.Model };
+            state.Info.History.Add(msg);
+            state.Info.MessageCount = state.Info.History.Count;
 
-        if (!string.IsNullOrEmpty(state.Info.SessionId))
-            SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, msg), "AddMessageAsync");
+            if (!string.IsNullOrEmpty(state.Info.SessionId))
+                SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, msg), "AddMessageAsync");
 
-        // Track code suggestions from accumulated response segment
-        _usageStats?.TrackCodeSuggestion(text);
+            // Track code suggestions from accumulated response segment
+            _usageStats?.TrackCodeSuggestion(text);
+        }
+        else
+        {
+            Debug($"[SUPPRESS] FlushCurrentResponse suppressed from history ({text.Length} chars) for '{state.Info.Name}'");
+        }
 
         // Accumulate flushed text so CompleteResponse can include it in the TCS result.
         // Without this, orchestrator dispatch gets "" because TurnEnd flush clears
@@ -1627,12 +1635,14 @@ public partial class CopilotService
         // are cleared by ClearProcessingState below. No need to clear them early.
         var response = state.CurrentResponse.ToString();
         var responseAlreadyFlushedThisTurn = WasResponseAlreadyFlushedThisTurn(state, response);
+        var suppressFromHistory = state.SuppressResponseFromHistory;
+        state.SuppressResponseFromHistory = false; // one-shot — always clear
         if (!string.IsNullOrWhiteSpace(response))
         {
             // Dedup only within the current turn. FlushCurrentResponse may have already
             // committed this exact segment when SessionIdle replays after IDLE-DEFER, but
             // identical assistant replies on different turns are legitimate and must persist.
-            if (!responseAlreadyFlushedThisTurn)
+            if (!responseAlreadyFlushedThisTurn && !suppressFromHistory)
             {
                 var msg = new ChatMessage("assistant", response, DateTime.Now) { Model = state.Info.Model };
                 state.Info.History.Add(msg);
@@ -1647,6 +1657,10 @@ public partial class CopilotService
 
                 // Track code suggestions from final response segment
                 _usageStats?.TrackCodeSuggestion(response);
+            }
+            else if (suppressFromHistory)
+            {
+                Debug($"[SUPPRESS] CompleteResponse suppressed from history ({response.Length} chars) for '{state.Info.Name}'");
             }
             else
             {
