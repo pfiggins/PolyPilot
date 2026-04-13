@@ -4079,6 +4079,34 @@ public partial class CopilotService
             return;
         }
 
+        // Guard: if the dispatch lock is held, an orchestration is actively running for this
+        // group (the reflect loop or a non-reflect dispatch). The pending-orchestration.json
+        // was written BY that active dispatch — resuming it would create a parallel synthesis
+        // race. This commonly happens during reconnection: the connection drops while workers
+        // are processing, ReconnectAsync fires, and this method picks up the file left by the
+        // still-running reflect loop. Skip the resume and let the active loop handle completion.
+        if (_groupDispatchLocks.TryGetValue(group.Id, out var dispatchLock) && dispatchLock.CurrentCount == 0)
+        {
+            Debug($"[DISPATCH] Skipping pending orchestration resume — dispatch lock held for group '{group.Name}' (active orchestration in progress)");
+            return;
+        }
+
+        // Guard: if the group has an active reflection state, the reflect loop is still
+        // running and will handle its own synthesis + ClearPendingOrchestration.
+        if (group.ReflectionState?.IsActive == true)
+        {
+            Debug($"[DISPATCH] Skipping pending orchestration resume — reflect loop active for group '{group.Name}'");
+            return;
+        }
+
+        // Guard: if the orchestrator phase is not Complete, orchestration is in flight
+        if (_orchestratorPhases.TryGetValue(group.Id, out var phase)
+            && phase is not OrchestratorPhase.Complete)
+        {
+            Debug($"[DISPATCH] Skipping pending orchestration resume — orchestrator phase is {phase} for group '{group.Name}'");
+            return;
+        }
+
         Debug($"[DISPATCH] Resuming pending orchestration for group '{group.Name}' " +
               $"(orchestrator={pending.OrchestratorName}, workers={string.Join(",", pending.WorkerNames)})");
 
