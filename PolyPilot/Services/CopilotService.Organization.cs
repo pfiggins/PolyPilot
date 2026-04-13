@@ -1989,8 +1989,9 @@ public partial class CopilotService
                 SaveQueuedPrompts();
                 if (orchestratorName != null)
                 {
+                    var safePrompt = Truncate(prompt, 120).Replace("`", "'");
                     AddOrchestratorSystemMessage(orchestratorName,
-                        $"📨 New message queued (will be processed as a new request after current iteration cycle completes): {prompt}");
+                        $"📨 New message queued (will be processed after current iteration completes): `{safePrompt}`");
                 }
                 return;
             }
